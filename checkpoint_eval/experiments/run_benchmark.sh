@@ -47,26 +47,32 @@ echo ""
 # 实验 3: 大型模型测试 (高负载)
 # ============================================================================
 echo "=========================================="
-echo "🧪 实验 3: 大型模型 (d=1024, 12 layers)"
+echo "🧪 实验 3: 大型模型 (~5GB checkpoint)"
 echo "=========================================="
+echo "模型配置: d_model=1536, num_layers=17, dim_feedforward=3072"
+echo "总参数量: 352.48M"
+echo "检查点大小: 5.25 GB (包含 param, grad, exp_avg, exp_avg_sq)"
+echo ""
 
 python benchmark_comparison.py \
-    --d-model 1024 \
-    --num-layers 12 \
+    --d-model 1536 \
+    --num-layers 18 \
+    --dim-feedforward 3072 \
     --num-samples 1000 \
     --num-steps 100 \
-    --batch-size 8 \
+    --batch-size 4 \
     --checkpoint-freq 30 \
-    --num-threads 16 \
-    --max-async 8 \
-    --methods traditional original layerwise \
+    --num-threads 8 \
+    --max-async 3 \
+    --num-layer-groups 6 \
+    --methods multistream \
     --output-dir $OUTPUT_DIR/large_model \
     --device cuda
 
 echo ""
 echo "✅ 实验 3 完成"
 echo ""
-
+ # traditional original 
 # ============================================================================
 # 实验 4: 不同检查点频率对比
 # ============================================================================

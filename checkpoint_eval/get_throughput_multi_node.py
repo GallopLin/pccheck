@@ -35,7 +35,7 @@ def create_files(ip1, ip2):
 
 def run(ip1):
     os.makedirs("opt_27", exist_ok=True)
-    run cfreq
+    # # run cfreq
     print("Run for CheckFreq")
     for cf in cfreqs:
         print(f"Checkpoint Frequency {cf}")

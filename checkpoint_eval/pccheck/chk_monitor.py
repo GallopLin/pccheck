@@ -1,7 +1,16 @@
 import torch
 import time
+import os
 from checkpoint_eval.pccheck.chk_checkpoint_pipeline import Checkpoint
 from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock, Barrier
+
+# 🔧 FIX: 尝试设置 spawn 启动方式以避免 CUDA fork 问题
+# 这确保子进程有干净的 CUDA 上下文
+try:
+    set_start_method('spawn', force=True)
+except RuntimeError:
+    # 如果已经设置过，忽略错误
+    pass
 
 
 class Chk_monitor:
@@ -88,7 +97,7 @@ class Chk_monitor:
         return False
 
     def save(self):
-        print(f"******************** CALL SAVE ********************")
+        # print(f"******************** CALL SAVE ********************")  # 减少输出
 
         while True:
             with self.lock:

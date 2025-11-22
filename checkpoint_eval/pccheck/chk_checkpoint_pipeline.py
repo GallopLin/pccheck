@@ -13,7 +13,7 @@ class Writer(object):
     def __init__(self, fname, lib_path, max_async, bsize, num_cpu_batches, is_distributed, rank, world_size):
         # attribute
         self.lib = cdll.LoadLibrary(lib_path)
-        print(bsize, num_cpu_batches, is_distributed)
+        # print(bsize, num_cpu_batches, is_distributed)  # 减少输出
         self.writer_obj = self.lib.writer(
             fname, max_async, c_size_t(bsize), num_cpu_batches, is_distributed, rank, world_size
         )
@@ -22,7 +22,7 @@ class Writer(object):
         ct_arr = np.ctypeslib.as_ctypes(x)
         self.lib.savenvm(self.writer_obj, ct_arr, c_ulong(sz), num_threads)
 
-    def finish(self):
+    def finish(self): # 没有使用到
         self.lib.finish()
 
     def register(self):
@@ -97,7 +97,7 @@ class Checkpoint:
         self.max_async = max_async
         self.lib_path = lib_path
         self.memory_saving = memory_saving
-        self.ratio = ratio
+        self.ratio = ratio  # 表示预分配的 CPU 缓冲区大小是单次检查点数据的多少倍
         self.is_distributed = is_distributed
         self.rank = rank
         self.world_size = world_size
@@ -113,11 +113,11 @@ class Checkpoint:
         else:
             self.bsize = bsize
 
-        print(f"At checkpoint, bsize is {self.bsize}")
+        # print(f"At checkpoint, bsize is {self.bsize}")  # 减少输出
 
         self.chk_times = []
 
-    def write_array(self, x, sz, num_threads):
+    def write_array(self, x, sz, num_threads): # 没有使用过
         print("Write checkpoint of size ", sz)
         start = time.time()
         self.writer.write_array(x, sz, num_threads)
@@ -163,7 +163,7 @@ class Checkpoint:
 
         cpu_ar_new.copy_(gpu_ar_new)
         gpu_copy_end = time.time()
-        print(f"GPU copy took {(gpu_copy_end-gpu_copy_start)*1000} ms")
+        # print(f"GPU copy took {(gpu_copy_end-gpu_copy_start)*1000} ms")  # 减少输出
 
         if next_barrier is not None:
             next_barrier.wait()
@@ -186,13 +186,13 @@ class Checkpoint:
         )
 
         cpu_copy_end = time.time()
-        print(f"CPU copy took {(cpu_copy_end-cpu_copy_start)*1000} ms")
+        # print(f"CPU copy took {(cpu_copy_end-cpu_copy_start)*1000} ms")  # 减少输出
 
     def write_pipelined(self, cpu_ar, num_threads, sz, bsize, lock, cp_in_progress):
 
         num_batches = int(sz / bsize)
         chk_ret = self.writer.register()
-        print(f"************** New checkpoint at position {chk_ret}")
+        # print(f"************** New checkpoint at position {chk_ret}")  # 减少输出
         start = time.time()
 
         barriers = [Barrier(2) for _ in range(num_batches)]
@@ -242,9 +242,9 @@ class Checkpoint:
 
         total_time = time.time() - start
         self.chk_times.append(total_time)
-        print(
-            f"---------------------- [PERF] Single Checkpoint time is {time.time()-start} sec, average is {np.median(self.chk_times)}"
-        )
+        # print(
+        #     f"---------------------- [PERF] Single Checkpoint time is {time.time()-start} sec, average is {np.median(self.chk_times)}"
+        # )  # 减少输出
 
     def convert_1d(self, gpu_ar, checkpoint_dict, idx):
         for name, obj in checkpoint_dict.items():

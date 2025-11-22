@@ -17,8 +17,24 @@ public:
         //  TODO: is num the number of batches, and size the batch size (in floats)?
         // size_t total_element = size + 2*sizeof (int);
 
+        // 🔧 FIX: 在子进程中重新初始化 CUDA 上下文
+        // 这对于 multiprocessing fork 模式是必需的
+        cudaError_t init_err = cudaSetDevice(0);
+        if (init_err != cudaSuccess) {
+            fprintf(stderr, "cudaSetDevice failed: %s (error code %d)\n", 
+                    cudaGetErrorString(init_err), init_err);
+            fprintf(stderr, "Attempting to continue anyway...\n");
+        }
+        
+        // 确保 CUDA 已完全初始化
+        cudaFree(0);
+
         cudaError_t err = cudaMallocHost((void **)&array, num * size * 4);
-        assert(err == cudaSuccess);
+        // assert(err == cudaSuccess);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cudaMallocHost failed: %s (error code %d)\n", cudaGetErrorString(err), err);
+            exit(EXIT_FAILURE);
+        }
     }
 
     // insert all free elements to the queue

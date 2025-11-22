@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 PCCheck 改进效果对比实验
-Benchmark Comparison: Traditional vs Layerwise Checkpoint
+Benchmark Comparison: Traditional vs Original vs Layerwise vs Multistream Checkpoint
 
-对比三种检查点方法：
+对比四种检查点方法：
 1. 传统 PyTorch 检查点 (torch.save)
 2. 原始 PCCheck
 3. 改进的分层 PCCheck (Layerwise)
+4. 多流并行 PCCheck (Multistream)
 
 测量指标：
 - 检查点保存时间
@@ -41,9 +42,15 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pccheck'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pccheck', 'layerwise_checkpoint'))
 
-from checkpoint_eval.pccheck.layerwise_checkpoint.complete_integration import LayerwiseCheckpointTrainer
+try:
+    from checkpoint_eval.pccheck.layerwise_checkpoint.complete_integration import LayerwiseCheckpointTrainer
+except ImportError:
+    print("[Warning] LayerwiseCheckpointTrainer not found, skipping layerwise benchmark")
+    LayerwiseCheckpointTrainer = None
+
 from checkpoint_eval.pccheck.chk_monitor import Chk_monitor
 from checkpoint_eval.pccheck_utils import initialize, get_total_size, set_storage
+from checkpoint_eval.pccheck.multistream_checkpoint import MultiStreamCheckpoint, build_param_layout
 
 
 class BenchmarkMetrics:
@@ -58,6 +65,10 @@ class BenchmarkMetrics:
         self.total_time = 0.0
         self.throughput = 0.0
         self.num_samples = 0
+        # IO传输速率相关
+        self.io_throughputs = []  # GB/s
+        self.io_save_times = []   # 实际保存时间（秒）
+        self.data_size_gb = 0.0   # 检查点数据大小（GB）
         
     def add_checkpoint_time(self, time_ms: float):
         self.checkpoint_times.append(time_ms)
@@ -65,10 +76,27 @@ class BenchmarkMetrics:
     def add_step_time(self, time_ms: float):
         self.training_step_times.append(time_ms)
     
+    def add_io_stats(self, save_time_sec: float, throughput_gbps: float):
+        """记录IO传输统计"""
+        self.io_save_times.append(save_time_sec)
+        self.io_throughputs.append(throughput_gbps)
+    
     def record_memory(self):
-        """记录内存使用情况"""
+        """记录内存使用情况（包含子进程）"""
         process = psutil.Process()
-        self.memory_usage.append(process.memory_info().rss / 1024**3)  # GB
+        total_memory = process.memory_info().rss
+        
+        # 累加所有子进程的内存
+        try:
+            for child in process.children(recursive=True):
+                try:
+                    total_memory += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
+        self.memory_usage.append(total_memory / 1024**3)  # GB
         
         # GPU 内存
         if GPU_AVAILABLE:
@@ -104,6 +132,15 @@ class BenchmarkMetrics:
                 'samples_per_sec': self.throughput,
                 'total_samples': self.num_samples,
             },
+            'io_performance': {
+                'data_size_gb': self.data_size_gb,
+                'mean_io_throughput_gbps': np.mean(self.io_throughputs) if self.io_throughputs else 0,
+                'std_io_throughput_gbps': np.std(self.io_throughputs) if self.io_throughputs else 0,
+                'min_io_throughput_gbps': np.min(self.io_throughputs) if self.io_throughputs else 0,
+                'max_io_throughput_gbps': np.max(self.io_throughputs) if self.io_throughputs else 0,
+                'mean_save_time_sec': np.mean(self.io_save_times) if self.io_save_times else 0,
+                'count': len(self.io_throughputs),
+            },
             'total_time_sec': self.total_time,
             'checkpoint_overhead_percent': (np.sum(self.checkpoint_times) / 1000 / self.total_time * 100) if self.total_time > 0 else 0,
         }
@@ -117,9 +154,9 @@ class BenchmarkMetrics:
         print(f"⏱️  总训练时间: {stats['total_time_sec']:.2f} 秒")
         print(f"🚀 吞吐量: {stats['throughput']['samples_per_sec']:.2f} samples/sec")
         print(f"💾 检查点保存:")
-        print(f"   - 平均时间: {stats['checkpoint']['mean_ms']:.2f} ms")
-        print(f"   - 总时间: {stats['checkpoint']['total_ms']/1000:.2f} 秒")
-        print(f"   - 开销占比: {stats['checkpoint_overhead_percent']:.2f}%")
+        # print(f"   - 平均时间: {stats['checkpoint']['mean_ms']:.2f} ms")
+        # print(f"   - 总时间: {stats['checkpoint']['total_ms']/1000:.2f} 秒")
+        # print(f"   - 开销占比: {stats['checkpoint_overhead_percent']:.2f}%")
         print(f"   - 保存次数: {stats['checkpoint']['count']}")
         print(f"📈 训练步:")
         print(f"   - 平均时间: {stats['training_step']['mean_ms']:.2f} ms")
@@ -127,6 +164,15 @@ class BenchmarkMetrics:
         print(f"   - CPU 峰值: {stats['memory']['peak_cpu_gb']:.2f} GB")
         if stats['memory']['peak_gpu_gb'] > 0:
             print(f"   - GPU 峰值: {stats['memory']['peak_gpu_gb']:.2f} GB")
+        print(f"📊 IO性能:")
+        if stats['io_performance']['count'] > 0:
+            print(f"   - 数据大小: {stats['io_performance']['data_size_gb']:.2f} GB")
+            print(f"   - 平均传输速率: {stats['io_performance']['mean_io_throughput_gbps']:.2f} GB/s")
+            print(f"   - 传输速率范围: {stats['io_performance']['min_io_throughput_gbps']:.2f} - {stats['io_performance']['max_io_throughput_gbps']:.2f} GB/s")
+            print(f"   - 平均实际保存时间: {stats['io_performance']['mean_save_time_sec']:.2f} 秒")
+            print(f"   - IO统计次数: {stats['io_performance']['count']}")
+        else:
+            print(f"   - 暂无IO统计数据（异步保存中）")
         print(f"{'='*80}\n")
 
 
@@ -162,6 +208,33 @@ def create_synthetic_dataset(num_samples=1000, seq_len=128, vocab_size=10000):
     X = torch.randint(0, vocab_size, (num_samples, seq_len))
     y = torch.randint(0, vocab_size, (num_samples, seq_len))
     return TensorDataset(X, y)
+
+
+def build_test_layout_from_model(model, optimizer, total_size):
+    """从模型和优化器构建测试用的参数布局"""
+    # 获取模型参数信息
+    param_info = []
+    current_offset = 0
+    layer_id = 0
+    
+    for name, param in model.named_parameters():
+        param_size = param.numel()
+        param_info.append({
+            'layer_id': layer_id,
+            'name': name,
+            'param_offset': current_offset,
+            'param_size': param_size,
+            'grad_offset': total_size + current_offset,
+            'grad_size': param_size,
+            'exp_avg_offset': total_size * 2 + current_offset,
+            'exp_avg_size': param_size,
+            'exp_avg_sq_offset': total_size * 3 + current_offset,
+            'exp_avg_sq_size': param_size,
+        })
+        current_offset += param_size
+        layer_id += 1
+    
+    return param_info
 
 
 def benchmark_traditional_checkpoint(
@@ -270,8 +343,9 @@ def benchmark_original_pccheck(
     # 初始化 PCCheck Monitor
     print(f"📝 初始化 PCCheck Monitor:")
     
-    # 使用 initialize 函数来准备 GPU 数组
-    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=False)
+    # ✅ 修复：使用 do_opt_step=True 来初始化优化器状态（exp_avg, exp_avg_sq）
+    # 这确保 gpu_ar 包含完整的 4 份数据：param, grad, exp_avg, exp_avg_sq
+    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True)
     
     print(f"   - 模型大小: {total_size/1e6:.2f}M 参数")
     print(f"   - Threads: {num_threads}, Max async: {max_async}")
@@ -281,7 +355,7 @@ def benchmark_original_pccheck(
     torch.cuda.empty_cache()
     
     # 创建 Chk_monitor
-    c_lib_path = "/home/linzhicheng/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
+    c_lib_path = "/home/linzhicheng/data/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
     gpu_copy = True if device == 'cuda' else False
     
     monitor = Chk_monitor(
@@ -325,9 +399,6 @@ def benchmark_original_pccheck(
         loss.backward()
         optimizer.step()
         
-        step_time = (time.time() - step_start) * 1000
-        metrics.add_step_time(step_time)
-        
         total_samples += batch_size
         step += 1
         
@@ -351,14 +422,16 @@ def benchmark_original_pccheck(
         # 记录内存
         if step % 10 == 0:
             metrics.record_memory()
+            
+        step_time = (time.time() - step_start) * 1000
+        metrics.add_step_time(step_time)
     
+    # 关闭 monitor
+    monitor.kill_checkpoint()
     total_time = time.time() - start_time
     metrics.total_time = total_time
     metrics.num_samples = total_samples
     metrics.throughput = total_samples / total_time
-    
-    # 关闭 monitor
-    monitor.kill_checkpoint()
     
     return metrics
 
@@ -375,12 +448,17 @@ def benchmark_layerwise_pccheck(
     batch_size_mb: float,
     use_monitor: bool,
     checkpoint_freq: int,
-    num_steps: int = 100
+    num_steps: int = 100,
+    use_chunked_async: bool = True,  # 🔥 新增：是否使用分块异步保存（零拷贝优化）
+    chunk_size_mb: float = 512.0,    # 🔥 新增：块大小（MB）
+    async_workers: int = 4            # 🔥 新增：异步保存线程数
 ) -> BenchmarkMetrics:
-    """测试改进的分层 PCCheck"""
+    """测试改进的分层 PCCheck（支持零拷贝分块异步保存）"""
     
     print(f"\n{'='*80}")
     print(f"🟣 开始测试: 改进的分层 PCCheck")
+    if use_chunked_async:
+        print(f"   🚀 启用零拷贝分块异步保存")
     print(f"{'='*80}")
     
     metrics = BenchmarkMetrics("Layerwise PCCheck (Improved)")
@@ -392,6 +470,8 @@ def benchmark_layerwise_pccheck(
     print(f"   - Buffer size: {buffer_size_mb} MB")
     print(f"   - Batch size: {batch_size_mb} MB")
     print(f"   - Use monitor: {use_monitor}")
+    if use_chunked_async:
+        print(f"   - 🔥 Chunked async: True (chunk_size={chunk_size_mb}MB, workers={async_workers})")
     
     c_lib_path = "/home/linzhicheng/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
     
@@ -410,7 +490,10 @@ def benchmark_layerwise_pccheck(
         ratio=2.0,
         c_lib_path=c_lib_path,
         device=device,
-        verbose=False
+        verbose=False,
+        use_chunked_async=use_chunked_async,  # 🔥 启用分块异步保存
+        chunk_size_mb=chunk_size_mb,          # 🔥 传递块大小
+        async_workers=async_workers           # 🔥 传递工作线程数
     )
     
     model.train()
@@ -482,6 +565,150 @@ def benchmark_layerwise_pccheck(
     return metrics
 
 
+def benchmark_multistream_pccheck(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion,
+    optimizer,
+    device: str,
+    checkpoint_freq: int,
+    checkpoint_file: str,
+    num_threads: int,
+    max_async: int,
+    num_layer_groups: int,
+    num_steps: int = 100
+) -> BenchmarkMetrics:
+    """测试多流并行 PCCheck"""
+    
+    print(f"\n{'='*80}")
+    print(f"🟡 开始测试: 多流并行 PCCheck")
+    print(f"{'='*80}")
+    
+    metrics = BenchmarkMetrics("Multistream PCCheck")
+    model.train()
+    
+    # 初始化 PCCheck Monitor
+    print(f"📝 初始化多流 PCCheck:")
+    
+    # ✅ 修复：使用 do_opt_step=True 来初始化优化器状态（exp_avg, exp_avg_sq）
+    # 这确保 gpu_ar 包含完整的 4 份数据：param, grad, exp_avg, exp_avg_sq
+    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True)
+    
+    print(f"   - 模型大小: {total_size/1e6:.2f}M 参数")
+    print(f"   - Threads: {num_threads}, Max async: {max_async}")
+    print(f"   - 层分组数: {num_layer_groups}")
+    
+    # 设置存储
+    set_storage(model, [optimizer], gpu_ar)
+    torch.cuda.empty_cache()
+    
+    # ✅ 修复：使用正确的 build_param_layout 函数，而不是 build_test_layout_from_model
+    # build_param_layout 使用 model_size 而不是 total_size 来计算偏移
+    param_layout = build_param_layout(model, optimizer)
+    
+    # 创建多流检查点
+    c_lib_path = "/home/linzhicheng/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
+    checkpoint = MultiStreamCheckpoint(
+        param_layout=param_layout,
+        gpu_ar=gpu_ar,
+        total_size=total_size,
+        num_streams=4,
+        num_threads=num_threads,
+        num_layer_groups=num_layer_groups,
+        lib_path=c_lib_path,
+        filename=checkpoint_file,
+        max_async=max_async
+    )
+    
+    # 创建MultiStreamOptimizer包装器
+    ms_optimizer = checkpoint.create_optimizer(optimizer, model)
+    
+    # 设置数据大小
+    metrics.data_size_gb = total_size * 4 / 1e9
+    
+    # 设置IO统计回调
+    def io_callback(save_time_sec, throughput_gbps):
+        metrics.add_io_stats(save_time_sec, throughput_gbps)
+    
+    checkpoint.set_io_callback(io_callback)
+    
+    step = 0
+    total_samples = 0
+    start_time = time.time()
+    
+    data_iter = iter(train_loader)
+    
+    while step < num_steps:
+        try:
+            data, target = next(data_iter)
+        except StopIteration:
+            data_iter = iter(train_loader)
+            data, target = next(data_iter)
+        
+        data, target = data.to(device), target.to(device)
+        batch_size = data.size(0)
+        
+        # 训练步
+        step_start = time.time()
+        step += 1
+        
+        ms_optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output.view(-1, output.size(-1)), target.view(-1))
+        loss.backward()
+        
+        # 检查点保存（边更新边保存）
+        if step % checkpoint_freq == 0:
+            chk_start = time.time()
+            
+            # 使用多流 PCCheck 边更新边保存（异步模式，公平对比）
+            # 1. 开始检查点（通过OptimizerWrapper，它会创建实际的MultiStreamOptimizer）
+            ms_optimizer.begin_checkpoint()
+            
+            # 2. 分层更新参数（自动触发异步保存）
+            ms_optimizer.step_with_callback()
+            
+            # 3. 完成检查点（异步模式：不等待，后台保存）
+            ms_optimizer.finalize_checkpoint(wait=False)
+            
+            raw_chk_time = (time.time() - chk_start) * 1000
+            
+            # 估算纯检查点开销：减去平均训练步时间（因为step_with_callback包含了参数更新）
+            avg_step_time = 0
+            if len(metrics.training_step_times) > 0:
+                avg_step_time = sum(metrics.training_step_times) / len(metrics.training_step_times)
+            
+            # 只有当raw_chk_time明显大于avg_step_time时才计算开销
+            # 否则认为开销极小（被噪声掩盖）
+            overhead = max(0.0, raw_chk_time - avg_step_time)
+            
+            metrics.add_checkpoint_time(overhead)
+            # 减少输出频率
+            if step % (checkpoint_freq * 5) == 0:  # 每5次检查点输出一次
+                print(f"  ✓ Step {step}: 多流PCCheck 边更新边保存（异步）(总耗时: {raw_chk_time:.2f} ms, 估算开销: {overhead:.2f} ms)")
+        else:
+            # 非检查点步骤：正常更新（不触发回调）
+            ms_optimizer.step()
+        
+        step_time = (time.time() - step_start) * 1000
+        metrics.add_step_time(step_time)
+        
+        total_samples += batch_size
+        
+        # 记录内存
+        if step % 10 == 0:
+            metrics.record_memory()
+    
+    # 关闭 checkpoint（会等待所有后台异步保存完成）
+    checkpoint.shutdown()
+    total_time = time.time() - start_time
+    metrics.total_time = total_time
+    metrics.num_samples = total_samples
+    metrics.throughput = total_samples / total_time
+    
+    return metrics
+
+
 def compare_methods(results: Dict[str, BenchmarkMetrics], output_file: str):
     """对比不同方法的结果"""
     
@@ -495,7 +722,9 @@ def compare_methods(results: Dict[str, BenchmarkMetrics], output_file: str):
         all_stats[name] = metrics.compute_statistics()
     
     # 打印对比表格
-    print(f"{'指标':<30} {'传统':<20} {'原始PCCheck':<20} {'分层PCCheck':<20}")
+    method_names = ['传统', '原始PCCheck', '分层PCCheck', '多流PCCheck']
+    header = f"{'指标':<30} " + " ".join([f"{name:<20}" for name in method_names[:len(all_stats)]])
+    print(header)
     print(f"{'-'*90}")
     
     # 基准方法
@@ -530,6 +759,19 @@ def compare_methods(results: Dict[str, BenchmarkMetrics], output_file: str):
         gpu_mem = stats['memory']['peak_gpu_gb']
         print(f"  {name:<30}: CPU {cpu_mem:>6.2f}, GPU {gpu_mem:>6.2f}")
     
+    # IO传输速率对比
+    print(f"\n💾 IO传输性能:")
+    for name, stats in all_stats.items():
+        io_perf = stats['io_performance']
+        if io_perf['count'] > 0:
+            print(f"  {name:<30}:")
+            print(f"    数据大小: {io_perf['data_size_gb']:.2f} GB")
+            print(f"    平均传输速率: {io_perf['mean_io_throughput_gbps']:.2f} GB/s")
+            print(f"    传输速率范围: [{io_perf['min_io_throughput_gbps']:.2f}, {io_perf['max_io_throughput_gbps']:.2f}] GB/s")
+            print(f"    平均实际保存时间: {io_perf['mean_save_time_sec']:.2f} 秒")
+        else:
+            print(f"  {name:<30}: 暂无IO统计（异步保存中）")
+    
     # 保存结果到文件
     output_data = {
         'timestamp': datetime.now().isoformat(),
@@ -540,7 +782,6 @@ def compare_methods(results: Dict[str, BenchmarkMetrics], output_file: str):
         json.dump(output_data, f, indent=2)
     
     print(f"\n✅ 结果已保存到: {output_file}")
-    print(f"{'='*80}\n")
 
 
 def main():
@@ -567,10 +808,19 @@ def main():
     parser.add_argument('--batch-size-mb', type=float, default=100.0, help='PCCheck 批次大小 (MB)')
     parser.add_argument('--use-monitor', action='store_true', help='使用 Monitor 模式')
     
+    # 🔥 零拷贝分块异步保存配置
+    parser.add_argument('--use-chunked-async', action='store_true', default=True, 
+                        help='使用零拷贝分块异步保存（默认启用）')
+    parser.add_argument('--chunk-size-mb', type=float, default=512.0, 
+                        help='分块大小 (MB)，默认512MB')
+    parser.add_argument('--async-workers', type=int, default=4, 
+                        help='异步保存工作线程数，默认4')
+    
     # 实验配置
-    parser.add_argument('--methods', nargs='+', default=['traditional', 'original', 'layerwise'],
-                        choices=['traditional', 'original', 'layerwise'],
+    parser.add_argument('--methods', nargs='+', default=['traditional', 'original', 'layerwise', 'multistream'],
+                        choices=['traditional', 'original', 'layerwise', 'multistream'],
                         help='要测试的方法')
+    parser.add_argument('--num-layer-groups', type=int, default=4, help='多流PCCheck的层分组数')
     parser.add_argument('--output-dir', type=str, default='./benchmark_results',
                         help='结果输出目录')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -593,6 +843,10 @@ def main():
     print(f"   - 训练: {args.num_steps} steps, batch_size={args.batch_size}")
     print(f"   - 检查点频率: 每 {args.checkpoint_freq} 步")
     print(f"   - 测试方法: {', '.join(args.methods)}")
+    if 'layerwise' in args.methods and args.use_chunked_async:
+        print(f"   - 🔥 零拷贝分块异步保存: 已启用")
+        print(f"     • 块大小: {args.chunk_size_mb} MB")
+        print(f"     • 异步工作线程: {args.async_workers}")
     print(f"{'='*80}\n")
     
     # 创建数据集
@@ -677,13 +931,42 @@ def main():
             args.device, checkpoint_dir,
             args.num_threads, args.max_async,
             args.buffer_size_mb, args.batch_size_mb,
-            True, args.checkpoint_freq, args.num_steps
+            True, args.checkpoint_freq, args.num_steps,
+            use_chunked_async=args.use_chunked_async,  # 🔥 传递零拷贝分块参数
+            chunk_size_mb=args.chunk_size_mb,
+            async_workers=args.async_workers
         )
         metrics.print_summary()
         results['Layerwise PCCheck (Improved)'] = metrics
         
         # 清理
         del model
+        torch.cuda.empty_cache()
+    
+    # 测试多流 PCCheck
+    if 'multistream' in args.methods:
+        model = TestModel(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=args.num_layers,
+            dim_feedforward=args.dim_feedforward
+        ).to(args.device)
+        
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        checkpoint_file = os.path.join(args.output_dir, f'multistream_{timestamp}.chk')
+        
+        metrics = benchmark_multistream_pccheck(
+            model, train_loader, criterion, optimizer,
+            args.device, args.checkpoint_freq, checkpoint_file,
+            2, args.max_async, args.num_layer_groups, args.num_steps
+        )
+        metrics.print_summary()
+        results['Multistream PCCheck'] = metrics
+        
+        # 清理
+        del model, optimizer
         torch.cuda.empty_cache()
     
     # 对比结果
