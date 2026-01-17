@@ -4,23 +4,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 home_dir = os.path.expanduser("~")
-lib_path = f"{home_dir}/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
-script_dir = f"{home_dir}/pccheck/checkpoint_eval/models/microbenchmarks"
-iters = 20
+lib_path = f"{home_dir}/data/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
+script_dir = f"{home_dir}/code/pccheck/checkpoint_eval/models/microbenchmarks"
+lib_path_stream = f"{home_dir}/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
 
-sizes_mb = [10,100,1000,10000]
-baselines = ["CheckFreq", "GPM", "PCcheck"]
+iters = 10  # 减少迭代次数，加快测试
+
+# 检查点大小说明：
+# - 输入 size MB 表示 **完整检查点大小**（包括 params + grads + exp_avg + exp_avg_sq）
+# - 即 4 × model_size
+# - 例如：100MB 检查点 = 25MB 模型参数 × 4
+# 注意：10000MB(10GB) 在单GPU上可能导致OOM，改为 5000MB
+sizes_mb = [10, 100, 1000, 5000]  # 最大5GB避免OOM
+baselines = ["CheckFreq", "GPM", "PCcheck", "MultiStream"]
 
 def run():
     for size in sizes_mb:
-        run_cfreq = f"python3.9 {script_dir}/test_cfreq.py --size {size} --iterations 20 > cfreq_{size}.txt"
+        run_cfreq = f"python3.9 {script_dir}/test_cfreq.py --size {size} --iterations {iters} > cfreq_{size}.txt"
         os.system(run_cfreq)
 
-        run_gpm = f"python3.9 {script_dir}/test_gpm.py --size {size} --iterations 20 > gpm_{size}.txt"
+        run_gpm = f"python3.9 {script_dir}/test_gpm.py --size {size} --iterations {iters} > gpm_{size}.txt"
         os.system(run_gpm)
 
-        run_pccheck = f"python3.9 {script_dir}/test_pccheck.py --size {size} --iterations 20 --num-threads 4 --c_lib_path {lib_path} > pccheck_{size}.txt"
+        run_pccheck = f"python3.9 {script_dir}/test_pccheck.py --size {size} --iterations {iters} --num-threads 16 --c_lib_path {lib_path} > pccheck_{size}.txt"
         os.system(run_pccheck)
+        
+        run_multistream = f"python3.9 {script_dir}/test_multistream.py --size {size} --iterations {iters} --num-threads 16 --max-async 2 --c_lib_path {lib_path_stream} > multistream_{size}.txt"
+        os.system(run_multistream)
 
 
 def collect():
@@ -43,7 +53,7 @@ def collect():
         return micro_time
 
     micro_times = []
-    for baseline in ["cfreq", "gpm", "pccheck"]:
+    for baseline in ["cfreq", "gpm", "pccheck", "multistream"]:
         micro_times_baseline = []
         for size in sizes_mb:
             time_baseline_size = get_time(baseline, size)
@@ -60,8 +70,8 @@ def collect():
 def plot(data):
 
     label_font_size = 27
-    colors = ['#4392B8', '#E27733','#A7B972']
-    width = 0.15
+    colors = ['#4392B8', '#E27733','#A7B972', '#D4526E']
+    width = 0.12
     fig, ax = plt.subplots(figsize=(14, 6))
     x = np.arange(len(sizes_mb))
     bars = []

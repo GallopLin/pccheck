@@ -37,23 +37,37 @@ parser.add_argument(
 
 
 def run(args):
-    num_floats = args.size * 1000000 / 4
-    print(f"allocate tensor of {int(num_floats)} floats")
+    # ===== --size 参数表示完整检查点大小（包括 params + grads + exp_avg + exp_avg_sq）=====
+    # 对于 Adam 优化器，完整检查点 = 4 × model_size
+    # 因此 model_size = size / 4
+    checkpoint_size_mb = args.size
+    model_size_floats = int(checkpoint_size_mb * 1000000 / 4 / 4)  # size MB / 4 bytes / 4 copies
+    print(f"Target checkpoint size: {checkpoint_size_mb} MB")
+    print(f"Model size: {model_size_floats} floats ({model_size_floats * 4 / 1e6:.2f} MB)")
 
     class TestModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            tensor = torch.ones(int(num_floats), dtype=torch.float32)
+            tensor = torch.ones(model_size_floats, dtype=torch.float32)
             self.a = torch.nn.Parameter(tensor)
 
     model = TestModel()
     model.cuda()
-    gpu_ar, total_size = initialize(model, [])
-
-    start_idx = 0
-    # assume gpu_ar is big 1D GPU tensor
-    set_storage(model, [], gpu_ar)
+    
+    # ===== 保存完整训练状态：4 × model_size =====
+    # 与 MultiStream 保持一致：params + grads + exp_avg + exp_avg_sq
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # 初始化优化器状态（执行一次 step）
+    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True)
+    
+    # 设置存储映射
+    set_storage(model, [optimizer], gpu_ar)
+    
     torch.cuda.empty_cache()
+    
+    print(f"Checkpoint size: {total_size} floats = {total_size*4/1e6:.2f} MB (4x model_size)")
+    
     chk_monitor = Chk_monitor(
         args.c_lib_path,
         total_size,
@@ -64,7 +78,7 @@ def run(args):
         is_sync=True,
         bsize=total_size,
         model=model.state_dict(),
-        optimizer={},
+        optimizer=optimizer.state_dict(),
         memory_saving=True,
     )
 

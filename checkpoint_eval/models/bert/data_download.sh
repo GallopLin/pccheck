@@ -19,4 +19,4 @@ DATA_DIR="data"
 cd vocab && python3 download_models.py && rm *.zip && rm ./*/*.ckpt.*
 
 # Download SQUAD
-cd $HOME/DeepLearningExamples/PyTorch/LanguageModeling/BERT/data/squad && ./squad_download.sh
+cd $HOME/data/DeepLearningExamples/PyTorch/LanguageModeling/BERT/data/squad && ./squad_download.sh

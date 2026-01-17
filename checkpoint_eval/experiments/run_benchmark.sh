@@ -62,10 +62,10 @@ python benchmark_comparison.py \
     --num-steps 100 \
     --batch-size 4 \
     --checkpoint-freq 30 \
-    --num-threads 8 \
+    --num-threads 16 \
     --max-async 3 \
     --num-layer-groups 6 \
-    --methods multistream \
+    --methods original multistream \
     --output-dir $OUTPUT_DIR/large_model \
     --device cuda
 

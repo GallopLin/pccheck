@@ -28,12 +28,16 @@ parser.add_argument("--iterations", default=10, type=int, help="iterations to si
 
 
 def run(args):
-    num_floats = args.size * 1000000 / 4
-    print(f"allocate tensor of {int(num_floats)} floats")
-    tensor = torch.ones(int(num_floats), dtype=torch.float32)
+    # ===== --size 参数表示完整检查点大小（包括 params + grads + exp_avg + exp_avg_sq）=====
+    # CheckFreq 直接保存一个 tensor，所以直接使用 size MB
+    checkpoint_size_mb = args.size
+    total_floats = int(checkpoint_size_mb * 1000000 / 4)  # size MB / 4 bytes per float
+    print(f"Target checkpoint size: {checkpoint_size_mb} MB")
+    print(f"Checkpoint size: {total_floats} floats ({total_floats * 4 / 1e6:.2f} MB)")
+    
+    tensor = torch.ones(total_floats, dtype=torch.float32)
     tensor = tensor.cuda()
     tensor.share_memory_()
-    print(tensor)
 
     model_dict = {"dummy_layer": tensor}
     chk = CFCheckpoint(model=model_dict)

@@ -11,17 +11,39 @@ from ctypes import *
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor
 import time
-from typing import Callable, List, Dict, Optional
+from typing import Callable, List, Dict, Optional, Tuple
 from collections import deque
+import threading
+from itertools import cycle
+import os
+import json
+
+# #############################################################################
+# #region agent log (ndjson)
+# NOTE: Debug-mode runtime instrumentation. Do NOT remove until post-fix verified.
+_PCCHECK_DEBUG_LOG_PATH = "/home/linzhicheng/.cursor/debug.log"
+_PCCHECK_SESSION_ID = "debug-session"
+
+def _pccheck_log(hypothesisId: str, location: str, message: str, data: dict, runId: str = "pre-fix"):
+    try:
+        payload = {
+            "sessionId": _PCCHECK_SESSION_ID,
+            "runId": runId,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_PCCHECK_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
+# #############################################################################
 
 
 class MultiStreamOptimizer:
-    """
-    多流优化器包装器：支持分层更新并触发回调
-    
-    使用装饰器模式包装标准PyTorch优化器，在每层组更新后触发回调
-    """
-    
     def __init__(
         self, 
         optimizer: torch.optim.Optimizer,
@@ -53,12 +75,10 @@ class MultiStreamOptimizer:
         # 检测优化器类型
         self.optimizer_type = type(optimizer).__name__
         
-    def step_with_callback(self, closure=None):
-        """
-        分层执行优化器更新，每层组更新后触发回调
+        # ✅ 跨检查点同步：更新前的等待回调
+        self.pre_update_callback = None  # 签名: pre_update_callback(group_idx)
         
-        这是核心方法，按层组顺序更新参数，每组更新完成后立即触发回调
-        """
+    def step_with_callback(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -66,12 +86,16 @@ class MultiStreamOptimizer:
         
         # 按层组遍历并更新
         for group_idx, (layer_ids, params) in enumerate(zip(self.layer_groups, self.group_params)):
+            # ✅ 更新前回调：等待上一个检查点的该层拷贝完成
+            if self.pre_update_callback is not None:
+                self.pre_update_callback(group_idx)
+            
             # 对这组参数执行真实的优化器更新
             self._step_param_group(params)
             
-            # 触发回调（在更新完成后）
+            # 触发回调（在更新完成后），传递 group_idx
             if self.callback is not None:
-                self.callback(layer_ids)
+                self.callback(group_idx, layer_ids)
         
         return loss
     
@@ -150,7 +174,7 @@ class MultiStreamOptimizer:
             weight_decay=group.get('weight_decay', 0),
             eps=group['eps'],
             maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
+            foreach=False,  # 启用foreach优化
             capturable=False,
             differentiable=False,
             fused=False,
@@ -208,7 +232,7 @@ class MultiStreamOptimizer:
             weight_decay=group.get('weight_decay', 0),
             eps=group['eps'],
             maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
+            foreach=False,  # 启用foreach优化
             capturable=False,
             differentiable=False,
             fused=False,
@@ -315,7 +339,8 @@ class MultiStreamOptimizer:
 class MultiStreamWriter:
     """多流Writer封装"""
     
-    def __init__(self, fname, lib_path, max_async, num_streams, stream_sizes, chunk_size=None, num_chunks=None):
+    def __init__(self, fname, lib_path, max_async, num_streams, stream_sizes, chunk_size=None, num_chunks=None, 
+                 is_distributed=False, rank=0, world_size=1):
         """
         Args:
             fname: 文件名
@@ -325,10 +350,18 @@ class MultiStreamWriter:
             stream_sizes: 每个流的大小列表
             chunk_size: DRAMAlloc分配的块大小（如果为None，则使用总大小）
             num_chunks: DRAMAlloc分配的块数量（如果为None，则使用max_async + 1）
+            is_distributed: 是否分布式
+            rank: 当前进程rank
+            world_size: 总进程数
         """
         self.lib = cdll.LoadLibrary(lib_path)
         self.num_streams = num_streams
         self.max_async = max_async
+
+        # CPU 亲和设置：优先避开 CPU0（主训练线程常驻），其余核轮询分配
+        self._affinity_cpus = self._init_affinity_cpus()
+        self._affinity_cycle = cycle(self._affinity_cpus)
+        self._thread_local_affinity = threading.local()
         
         # 计算总大小
         total_size = sum(stream_sizes)
@@ -342,11 +375,23 @@ class MultiStreamWriter:
             
         self.chunk_size = chunk_size
         
+        # ✅ 设置 lib.writer 的参数类型，确保正确传递 size_t 和 bool 参数
+        self.lib.writer.restype = c_void_p
+        self.lib.writer.argtypes = [c_char_p, c_int, c_size_t, c_size_t, c_bool, c_int, c_int]
+        
+        # ✅ 设置 lib.init_streams 的参数类型
+        self.lib.init_streams.restype = c_int
+        self.lib.init_streams.argtypes = [c_void_p, c_int, POINTER(c_size_t)]
+        
         # ✅ 内存优化：使用指定的chunk_size和num_chunks初始化DRAMAlloc
         self.writer_obj = self.lib.writer(
-            fname, max_async, c_size_t(chunk_size), 
-            num_chunks,
-            False, 0, 1  # is_distributed, rank, world_size
+            fname.encode('utf-8') if isinstance(fname, str) else fname, 
+            max_async, 
+            c_size_t(chunk_size), 
+            c_size_t(num_chunks),
+            is_distributed, 
+            rank, 
+            world_size
         )
         
         # 初始化多流
@@ -356,22 +401,62 @@ class MultiStreamWriter:
         if ret != 0:
             raise RuntimeError(f"Failed to initialize {num_streams} streams")
         
-        # 注册C函数返回类型
+        # ✅ 注册C函数的参数和返回类型
         self.lib.registerCheck.restype = c_int
+        self.lib.registerCheck.argtypes = [c_void_p]
+        
+        self.lib.write_stream_chunk.restype = None
+        self.lib.write_stream_chunk.argtypes = [c_void_p, c_int, c_void_p, c_size_t, c_size_t, c_int, c_int]
+        
+        self.lib.sync_stream.restype = None
+        self.lib.sync_stream.argtypes = [c_void_p, c_int, c_int]
+        
+        self.lib.sync_all_streams.restype = None
+        self.lib.sync_all_streams.argtypes = [c_void_p, c_int]
         
         # ✅ 注册borrow_cpu_slot和return_cpu_slot的返回类型
         self.lib.borrow_cpu_slot.restype = c_void_p
         self.lib.borrow_cpu_slot.argtypes = [c_void_p, c_int]
+        self.lib.return_cpu_slot.restype = None
         self.lib.return_cpu_slot.argtypes = [c_void_p, c_int]
         
         # ✅ 注册borrow_chunk和return_chunk
         if hasattr(self.lib, 'borrow_chunk'):
             self.lib.borrow_chunk.restype = c_void_p
             self.lib.borrow_chunk.argtypes = [c_void_p]
+            self.lib.return_chunk.restype = None
             self.lib.return_chunk.argtypes = [c_void_p, c_void_p]
         
         print(f"✓ MultiStreamWriter initialized with {num_streams} streams")
         print(f"  DRAMAlloc: {num_chunks} chunks of size {chunk_size} floats ({chunk_size*4/1e6:.2f} MB)")
+
+    def _init_affinity_cpus(self):
+        """选择亲和CPU列表，优先避开0号核。"""
+        try:
+            avail = sorted(os.sched_getaffinity(0))
+        except Exception:
+            return [0]
+        if len(avail) > 1 and 0 in avail:
+            avail.remove(0)
+        return avail or [0]
+
+    def _ensure_thread_affinity(self):
+        tl = self._thread_local_affinity
+        if getattr(tl, "pinned", False):
+            return
+        try:
+            cpu = next(self._affinity_cycle)
+            os.sched_setaffinity(0, {cpu})
+            tl.cpu = cpu
+        except Exception:
+            pass
+        tl.pinned = True
+
+    def _submit_with_affinity(self, executor, fn, *args, **kwargs):
+        def wrapped(*a, **k):
+            self._ensure_thread_affinity()
+            return fn(*a, **k)
+        return executor.submit(wrapped, *args, **kwargs)
     
     def write_stream_chunk(self, stream_id, data, offset_in_stream, chunk_size, 
                            parall_iter, num_threads):
@@ -380,56 +465,45 @@ class MultiStreamWriter:
         
         Args:
             stream_id: 流ID (0-3)
-            data: numpy数组
+            data: numpy数组 或 ctypes指针
             offset_in_stream: 在流内的偏移 (float count)
             chunk_size: 数据块大小 (float count)
             parall_iter: 并行迭代槽位（由registerCheck返回）
             num_threads: 写入线程数
         """
-        ct_arr = np.ctypeslib.as_ctypes(data)
-        # 注意：C++接口期望的是字节大小，但偏移量是float count（内部会自动x4）
-        # 修正：write_stream_chunk 似乎需要字节单位的 offset 和 size
+        # ✅ 优化：支持直接传递 ctypes 指针，避免 numpy 转换开销
+        if isinstance(data, (POINTER(c_float), c_void_p, int)):
+            ct_arr = c_void_p(data) if isinstance(data, int) else data
+        else:
+            ct_arr = cast(np.ctypeslib.as_ctypes(data), c_void_p)
+            
+        # 调用 C++ 函数（argtypes 已设置，自动类型转换）
         self.lib.write_stream_chunk(
             self.writer_obj,
-            c_int(stream_id),
+            stream_id,
             ct_arr,
-            c_size_t(offset_in_stream),
-            c_size_t(chunk_size),
-            c_int(parall_iter),
-            c_int(num_threads)
+            offset_in_stream,
+            chunk_size,
+            parall_iter,
+            num_threads
         )
     
     def sync_stream(self, stream_id, parall_iter):
         """同步单个流到磁盘"""
-        self.lib.sync_stream(self.writer_obj, c_int(stream_id), c_int(parall_iter))
+        self.lib.sync_stream(self.writer_obj, stream_id, parall_iter)
     
     def sync_all_streams(self, parall_iter):
         """同步所有流到磁盘并更新检查点元数据（沿用原pccheck的槽位管理）"""
-        self.lib.sync_all_streams(self.writer_obj, c_int(parall_iter))
+        self.lib.sync_all_streams(self.writer_obj, parall_iter)
     
     def register(self):
         """注册新的检查点槽位（沿用原pccheck的槽位管理）"""
         return self.lib.registerCheck(self.writer_obj)
     
     def borrow_cpu_slot(self, parall_iter):
-        """
-        从DRAMAlloc借用一块pinned buffer用于检查点保存
-        
-        Args:
-            parall_iter: 并行迭代槽位
-            
-        Returns:
-            void*: pinned buffer的指针（需要转换为numpy数组）
-        """
         return self.lib.borrow_cpu_slot(self.writer_obj, c_int(parall_iter))
     
     def return_cpu_slot(self, parall_iter):
-        """
-        归还pinned buffer到DRAMAlloc
-        
-        Args:
-            parall_iter: 并行迭代槽位
-        """
         self.lib.return_cpu_slot(self.writer_obj, c_int(parall_iter))
     
     def borrow_chunk(self):
@@ -442,15 +516,6 @@ class MultiStreamWriter:
 
 
 class MultiStreamCheckpoint:
-    """
-    多流并行检查点保存
-    
-    核心特性：
-    - 4个独立数据流分别管理 param、grad、exp_avg、exp_avg_sq
-    - 每个流独立传输和写入，充分利用带宽
-    - 使用CUDA流实现GPU->CPU的并行传输
-    """
-    
     def __init__(
         self,
         param_layout,           # 参数布局信息
@@ -462,9 +527,21 @@ class MultiStreamCheckpoint:
         num_streams=4,          # 流的数量（param, grad, exp_avg, exp_avg_sq）
         max_async=2,            # 最大异步检查点数
         num_layer_groups=8,     # 分成多少个层组
+        distributed=False,
+        rank=0,
+        world_size=1,
     ):
         self.param_layout = param_layout
-        self.gpu_ar = gpu_ar
+        # ✅ 关键防护（针对 H5）：checkpoint 线程只应读取“无 autograd”的视图
+        # 在 transformer 场景下我们观察到 gpu_ar_requires_grad=True（见 debug.log H5），
+        # 这会让后台 slice/copy 路径构建 autograd Node（CopySlices/SliceBackward），
+        # 并在训练尾部的 Node 析构/free 阶段更容易触发随机段错。
+        # detach() 不会复制数据，只是生成共享存储的无梯度 Tensor 视图。
+        try:
+            self.gpu_ar = gpu_ar.detach()
+            self.gpu_ar.requires_grad_(False)
+        except Exception:
+            self.gpu_ar = gpu_ar
         self.total_size = total_size
         self.num_threads = num_threads
         self.lib_path = lib_path
@@ -472,6 +549,9 @@ class MultiStreamCheckpoint:
         self.num_streams = num_streams
         self.max_async = max_async
         self.num_layer_groups = num_layer_groups
+        self.distributed = distributed
+        self.rank = rank
+        self.world_size = world_size
         
         # 计算每个流的大小
         self.stream_sizes = self._calculate_stream_sizes()
@@ -486,48 +566,91 @@ class MultiStreamCheckpoint:
         # 创建层分组
         self.layer_groups = self._create_layer_groups()
         print(f"  Layer groups: {len(self.layer_groups)} groups")
+
+        # self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB
         
-        # ✅ 内存优化：计算DRAMAlloc的chunk大小和数量
-        # 使用固定大小的chunk (64MB)，避免因大层组导致内存爆炸
-        # 64MB = 16M floats
-        self.chunk_size = 16 * 1024 * 1024
+        # 优化：根据模型大小动态调整 chunk size (问题7)
+        model_size_gb = total_size * 4 / 1e9
+        if model_size_gb < 0.5:
+            self.chunk_size = 4 * 1024 * 1024   # 4M floats = 16MB
+        elif model_size_gb < 2:
+            self.chunk_size = 8 * 1024 * 1024   # 8M floats = 32MB
+        elif model_size_gb < 5:
+            self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB
+        else:
+            self.chunk_size = 16 * 1024 * 1024  # 32M floats = 128MB
         
-        # num_chunks = max_async * num_streams * pipeline_depth + buffer
-        # 每个流使用三缓冲流水线 (depth=3)
-        # 必须确保有足够的chunk，否则会导致死锁
-        self.pipeline_depth = 3
-        self.num_chunks = max_async * num_streams * self.pipeline_depth + 4
+        # 策略2：基于实际并发需求估算
+        # 关键洞察：虽然层组是串行的，但SSD写入慢，chunks会在pipeline中堆积
+        # 需要为"最坏情况"预留足够的chunks
+        max_stream_size = max(self.stream_sizes)
+        chunks_per_stream = (max_stream_size + self.chunk_size - 1) // self.chunk_size
+        
+        # 并发分析：
+        # - 理论上：每个checkpoint最多num_layer_groups个层组在飞行中
+        # - 实际上：由于SSD写入慢，几乎所有层组的chunks都被占用直到checkpoint完成
+        # - 因此需要：max_async × num_streams × chunks_per_stream
+        # 
+        # 但由于chunks是按需借用的，可以适当减少（假设有50%的复用率）
+        estimated_concurrent_chunks = max_async * num_streams * chunks_per_stream
+        self.num_chunks = int(estimated_concurrent_chunks * 0.6) + num_streams * 2
+        
+        # 确保不少于一个checkpoint的完整需求
+        min_chunks = num_streams * chunks_per_stream + num_streams
+        self.num_chunks = max(self.num_chunks, min_chunks)
+        
         print(f"  DRAMAlloc chunk size: {self.chunk_size} floats ({self.chunk_size*4/1024/1024:.2f} MB)")
-        print(f"  DRAMAlloc num chunks: {self.num_chunks} (Total: {self.num_chunks*self.chunk_size*4/1024/1024/1024:.2f} GB)")
+        print(f"  DRAMAlloc num chunks: {self.num_chunks} (chunks/stream={chunks_per_stream}, estimated_usage=60%, Total: {self.num_chunks*self.chunk_size*4/1024/1024/1024:.2f} GB)")
         
         # 初始化多流writer
+        resolved_filename = filename
+        if isinstance(resolved_filename, str):
+            try:
+                resolved_filename = resolved_filename.format(rank=rank, world_size=world_size)
+            except KeyError:
+                # 如果用户提供了无法解析的模板，直接使用原始字符串
+                resolved_filename = filename
+            fname_bytes = resolved_filename.encode()
+        else:
+            fname_bytes = resolved_filename
         self.writer = MultiStreamWriter(
-            filename.encode(), lib_path, max_async, 
-            num_streams, self.stream_sizes,
+            fname_bytes,
+            lib_path,
+            max_async,
+            num_streams,
+            self.stream_sizes,
             chunk_size=self.chunk_size,
-            num_chunks=self.num_chunks
+            num_chunks=self.num_chunks,
+            is_distributed=distributed,
+            rank=rank,
+            world_size=world_size
         )
         
-        # ✅ 修复：为每个并行检查点创建独立的CUDA流（固定大小为max_async）
-        # cuda_streams[stream_index][stream_id] = 该检查点该流的CUDA流
-        # parall_iter通过writer.register()获得，可能的值范围是0到max_async（包含），但会循环使用
-        # 我们使用 parall_iter % (max_async + 1) 来映射到固定的CUDA流索引，实现流的复用
-        # 这样最多支持max_async个并行检查点，每个检查点有num_streams个流
         self.cuda_streams = []
         for i in range(max_async + 1):  # max_async+1个槽位（0到max_async）
             self.cuda_streams.append([torch.cuda.Stream() for _ in range(num_streams)])
         print(f"  ✓ Created CUDA streams: {max_async + 1} slots × {num_streams} streams = {(max_async + 1) * num_streams} streams (reusable)")
         
-        # ✅ 内存优化：不再预先分配pinned memory缓冲区
-        # 改为在begin_checkpoint时从DRAMAlloc借用，在finalize_checkpoint时归还
-        # 这样可以实现内存复用，将峰值内存从 2.82GB × 4流 × max_async ≈ 22GB 降到 2.82GB
-        print(f"  ✓ Using DRAM slot-based memory management (reuse pinned buffers)")
+        # 创建双线程池架构：
+        # 1. copy_thread_pool: 专门处理 GPU→CPU 拷贝（等待 CUDA stream 同步）
+        # 2. ssd_thread_pool: 专门处理 SSD 写入（IO 密集型，不阻塞拷贝）
+        import os
+        cpu_count = os.cpu_count() or 16
         
-        # 创建线程池（避免频繁创建销毁线程）
-        # max_workers = num_streams * max_async，以支持多个检查点并行保存
-        pool_workers = num_streams * max_async
-        self.thread_pool = ThreadPoolExecutor(max_workers=pool_workers, thread_name_prefix="stream_worker")
-        print(f"  ✓ Created thread pool with {pool_workers} workers (num_streams={num_streams} * max_async={max_async})")
+        # GPU→CPU 拷贝线程池：每个流一个线程足够（瓶颈在 PCIe 带宽）
+        copy_pool_workers = num_streams * (max_async + 1)
+        self.copy_thread_pool = ThreadPoolExecutor(max_workers=copy_pool_workers, thread_name_prefix="copy_worker")
+        
+        # SSD 写入线程池：IO 密集型，可以多一些线程
+        ssd_pool_workers = min(num_streams * max_async * 2, cpu_count)
+        self.ssd_thread_pool = ThreadPoolExecutor(max_workers=ssd_pool_workers, thread_name_prefix="ssd_worker")
+        
+        # 保留旧名称以兼容性（指向 copy_thread_pool）
+        self.thread_pool = self.copy_thread_pool
+        
+        print(f"  ✓ Created dual thread pools:")
+        print(f"      Copy pool: {copy_pool_workers} workers (for GPU→CPU)")
+        print(f"      SSD pool:  {ssd_pool_workers} workers (for SSD writes)")
         
         # 统计信息
         self.save_times = []
@@ -535,11 +658,36 @@ class MultiStreamCheckpoint:
         # IO统计回调
         self.io_callback = None
         
+        # #############################################################################
+        # #region agent log (ssd inflight)
+        # Hypothesis H3: finalize/shutdown doesn't actually wait for SSD write tasks,
+        # leaving background work running near the last checkpoints.
+        self._inflight_ssd_tasks = 0
+        self._inflight_ssd_lock = Lock()
+        # #endregion
+        # #############################################################################
+        
         # ✅ 修复：槽位管理器（支持多个并行检查点）
         # 使用字典跟踪每个槽位的状态：{parall_iter: {'futures': [...], 'start_time': ...}}
         self._checkpoint_slots = {}  # 当前活跃的检查点槽位
         self._slot_lock = Lock()  # 保护槽位操作的锁
         self._max_async = max_async
+        
+        # ✅ 跨检查点同步：记录每个层组的拷贝完成事件
+        # _layer_copy_events[group_idx] = [event0, event1, event2, event3] (每个流一个事件)
+        # 新检查点更新该层组之前，需要等待所有 4 个事件
+        self._layer_copy_events = {}  # {group_idx: [events]}
+        self._layer_copy_events_lock = Lock()
+        print(f"  ✓ Cross-checkpoint layer synchronization enabled")
+
+        # #############################################################################
+        # #region agent log (chunk lifecycle tracking)
+        # Hypothesis H1: DRAMAlloc chunk pool returns the same pointer concurrently
+        # or a pointer is returned twice (double-free/use-after-free) due to threading.
+        self._borrowed_chunks = set()
+        self._borrowed_chunks_lock = Lock()
+        # #endregion
+        # #############################################################################
         
     def _calculate_max_chunk_size(self):
         """计算最大的chunk大小（用于DRAMAlloc）"""
@@ -585,180 +733,441 @@ class MultiStreamCheckpoint:
         
         return groups
     
-    def save_layer_group(self, layer_group_ids, parall_iter):
+    def save_layer_group(self, layer_group_ids, parall_iter, group_idx, sync_event=None):
         """
         保存一组层的参数（4个流并行，异步不阻塞）
         
         Args:
             layer_group_ids: 要保存的层ID列表
             parall_iter: 并行迭代槽位（由registerCheck返回）
+            group_idx: 层组索引，用于跨检查点同步
+            sync_event: CUDA同步事件，用于确保参数更新完成后再开始拷贝
             
         Returns:
             futures: 返回futures列表，供后续等待
         """
+        # ✅ 创建 4 个拷贝完成事件，每个流一个
+        copy_done_events = [torch.cuda.Event() for _ in range(4)]
+        
         # 使用线程池提交任务（避免反复创建销毁线程）
         futures = []
         
         for stream_id, param_type in enumerate(['param', 'grad', 'exp_avg', 'exp_avg_sq']):
-            future = self.thread_pool.submit(
+            future = self.writer._submit_with_affinity(
+                self.thread_pool,
                 self._save_stream_for_layers,
-                stream_id, param_type, layer_group_ids, parall_iter
+                stream_id, param_type, layer_group_ids, parall_iter, sync_event, 
+                copy_done_events[stream_id], group_idx
             )
             futures.append(future)
         
+        # ✅ 立即更新层组的拷贝完成事件列表（事件会在各自的流中被记录）
+        with self._layer_copy_events_lock:
+            self._layer_copy_events[group_idx] = copy_done_events
+        
         # 不阻塞，直接返回futures，让调用者决定何时等待
         return futures
+
+    def _register_layer_group_futures(self, parall_iter, futures):
+        """将异步future登记到指定槽位，供finalize阶段统一等待"""
+        if not futures:
+            return
+        with self._slot_lock:
+            if parall_iter in self._checkpoint_slots:
+                self._checkpoint_slots[parall_iter]['futures'].extend(futures)
     
-    def _save_stream_for_layers(self, stream_id, param_type, layer_group_ids, parall_iter):
+    def _save_stream_for_layers(self, stream_id, param_type, layer_group_ids, parall_iter, sync_event=None, copy_done_event=None, group_idx=None):
         """
         保存指定层组的某一类参数
+        
+        优化设计：
+        1. GPU→CPU 拷贝完成后立即记录 copy_done_event，允许新 checkpoint 开始
+        2. SSD 写入在后台异步完成，不阻塞新的拷贝操作
+        3. 移除复杂的流水线设计，简化逻辑
         
         Args:
             stream_id: 流ID
             param_type: 参数类型 (param/grad/exp_avg/exp_avg_sq)
             layer_group_ids: 层ID列表
             parall_iter: 并行迭代槽位（由registerCheck返回）
+            sync_event: CUDA同步事件，用于确保参数更新完成后再开始拷贝
+            copy_done_event: 拷贝完成事件，用于跨检查点同步
+            group_idx: 层组索引
         """
         try:
-            # ✅ 修复：通过映射复用CUDA流（parall_iter映射到固定的流索引）
-            # parall_iter可能的值范围是0到max_async（包含），但会循环使用
-            # 我们使用 modulo 操作将parall_iter映射到0到max_async的范围，实现流的复用
+            import ctypes
+            import numpy as np
+            
             stream_index = parall_iter % (self._max_async + 1)
-            with torch.cuda.stream(self.cuda_streams[stream_index][stream_id]):
+            current_stream = self.cuda_streams[stream_index][stream_id]
+
+            # #############################################################################
+            # #region agent log
+            # Hypothesis H2: offset/size boundary mismatch (last chunks/layers overrun).
+            # Hypothesis H4: writer/chunk lifecycle races surface near the last checkpoints.
+            _pccheck_log(
+                "H2",
+                "multistream_checkpoint.py:_save_stream_for_layers:entry",
+                "enter _save_stream_for_layers",
+                {
+                    "stream_id": stream_id,
+                    "param_type": param_type,
+                    "parall_iter": parall_iter,
+                    "stream_index": stream_index,
+                    "group_idx": group_idx,
+                    "layer_start": layer_group_ids[0] if layer_group_ids else None,
+                    "layer_end": layer_group_ids[-1] if layer_group_ids else None,
+                    "num_layers_in_group": len(layer_group_ids),
+                    "chunk_size_floats": int(self.chunk_size),
+                    "stream_size_floats": int(self.stream_sizes[stream_id]) if hasattr(self, "stream_sizes") else None,
+                    "py_thread": threading.get_ident(),
+                },
+            )
+            # #endregion
+            # #############################################################################
+            
+            with torch.cuda.stream(current_stream):
+                # 等待默认流上的参数更新完成
+                if sync_event is not None:
+                    sync_event.wait(current_stream)
+                
+                # #############################################################################
+                # #region agent log
+                # Hypothesis H5: unexpected autograd tracking in checkpoint copy path.
+                if layer_group_ids and layer_group_ids[0] == 0 and stream_id == 0:
+                    _pccheck_log(
+                        "H5",
+                        "multistream_checkpoint.py:_save_stream_for_layers:grad_mode",
+                        "grad mode + requires_grad snapshot",
+                        {
+                            "grad_enabled": bool(torch.is_grad_enabled()),
+                            "gpu_ar_requires_grad": bool(getattr(self.gpu_ar, "requires_grad", False)),
+                            "gpu_ar_is_cuda": bool(getattr(self.gpu_ar, "is_cuda", False)),
+                            "parall_iter": parall_iter,
+                            "group_idx": group_idx,
+                            "py_thread": threading.get_ident(),
+                        },
+                    )
+                # #endregion
+                # #############################################################################
+                
                 # 计算该组在当前流中的偏移
                 offset_in_stream = 0
                 for i in range(min(layer_group_ids[0], len(self.param_layout))):
                     layer_info = self.param_layout[i]
                     offset_in_stream += layer_info.get(f'{param_type}_size', 0)
                 
-                # 收集数据到临时列表
-                data_chunks = []
-                total_size = 0
+                # 预先计算需要处理的层信息
+                layers_to_process = []
+                total_elements = 0
                 
                 for layer_id in layer_group_ids:
                     if layer_id >= len(self.param_layout):
                         continue
-                        
+                    
                     layer_info = self.param_layout[layer_id]
+                    gpu_offset = layer_info.get(f'{param_type}_offset', 0)
+                    size = layer_info.get(f'{param_type}_size', 0)
                     
-                    # 获取该参数在gpu_ar中的位置
-                    offset_key = f'{param_type}_offset'
-                    size_key = f'{param_type}_size'
-                    gpu_offset = layer_info.get(offset_key, 0)
-                    size = layer_info.get(size_key, 0)
-                    
-                    if size == 0:
-                        continue
-                    
-                    # 从GPU提取数据
-                    if gpu_offset + size <= len(self.gpu_ar):
-                        gpu_data = self.gpu_ar[gpu_offset:gpu_offset+size]
-                        data_chunks.append(gpu_data)
-                        total_size += size
+                    if size > 0 and gpu_offset + size <= len(self.gpu_ar):
+                        layers_to_process.append((gpu_offset, size))
+                        total_elements += size
                 
-                if not data_chunks:
+                if not layers_to_process:
+                    # 即使没有数据，也要记录事件（保持一致性）
+                    if copy_done_event is not None:
+                        copy_done_event.record(current_stream)
                     return
-                
-                # ❌ 移除 torch.cat，避免GPU内存峰值
-                # combined_data = torch.cat(data_chunks)
-                
-                # ✅ 内存优化：按需借用chunk，支持分块处理大层组
-                # ✅ 性能优化：使用流水线（Pipeline）重叠GPU拷贝和SSD写入
-                total_elements = total_size
-                current_offset = 0
-                
-                # 虚拟张量读取器状态
-                current_chunk_idx = 0
-                offset_in_current_chunk = 0
-                
-                import ctypes
-                import numpy as np
-                from collections import deque
-                
-                # 流水线队列：存储 (chunk_ptr, size, offset, event)
-                pipeline_queue = deque()
-                # pipeline_depth = self.pipeline_depth  # 三缓冲
-                
-                current_stream = torch.cuda.current_stream()
-                
-                try:
-                    while current_offset < total_elements or pipeline_queue:
-                        # 1. 填充流水线（发射GPU拷贝任务）
-                        while len(pipeline_queue) < self.pipeline_depth and current_offset < total_elements:
-                            # 计算本次处理的大小
-                            elements_to_process = min(self.chunk_size, total_elements - current_offset)
-                            
-                            # 借用一个pinned buffer chunk
-                            chunk_ptr = self.writer.borrow_chunk()
-                            
-                            # 将C指针转换为numpy数组视图
-                            chunk_array = np.ctypeslib.as_array(
-                                (ctypes.c_float * self.chunk_size).from_address(chunk_ptr)
-                            )
-                            
-                            # 创建Tensor视图
-                            chunk_tensor = torch.from_numpy(chunk_array)
-                            
-                            # 获取切片（只使用需要的部分）
-                            cpu_buffer_slice = chunk_tensor[:elements_to_process]
-                            
-                            # ✅ 从data_chunks列表中逐个拷贝数据到cpu_buffer_slice
-                            dest_offset = 0
-                            while dest_offset < elements_to_process:
-                                src_tensor = data_chunks[current_chunk_idx]
-                                remaining_in_src = src_tensor.numel() - offset_in_current_chunk
-                                needed = elements_to_process - dest_offset
-                                
-                                to_copy = min(remaining_in_src, needed)
-                                
-                                # 拷贝
-                                src_view = src_tensor.view(-1)[offset_in_current_chunk : offset_in_current_chunk + to_copy]
-                                dest_view = cpu_buffer_slice[dest_offset : dest_offset + to_copy]
-                                dest_view.copy_(src_view, non_blocking=True)
-                                
-                                dest_offset += to_copy
-                                offset_in_current_chunk += to_copy
-                                
-                                if offset_in_current_chunk == src_tensor.numel():
-                                    current_chunk_idx += 1
-                                    offset_in_current_chunk = 0
-                            
-                            # 记录事件用于同步
-                            event = torch.cuda.Event(enable_timing=False, blocking=True)
-                            event.record(current_stream)
-                            
-                            pipeline_queue.append((chunk_ptr, elements_to_process, current_offset, event, cpu_buffer_slice))
-                            
-                            # 更新偏移
-                            current_offset += elements_to_process
-                        
-                        # 2. 处理流水线头部（等待拷贝完成并写入SSD）
-                        if pipeline_queue:
-                            chunk_ptr, size, offset, event, buffer_slice = pipeline_queue.popleft()
-                            
-                            # 等待GPU拷贝完成
-                            event.synchronize()
-                            
-                            # 写入持久化存储 (阻塞操作，但此时GPU正在处理下一个块)
-                            self.writer.write_stream_chunk(
+
+                # #############################################################################
+                # #region agent log
+                # Boundary check evidence for H2.
+                _pccheck_log(
+                    "H2",
+                    "multistream_checkpoint.py:_save_stream_for_layers:bounds",
+                    "computed stream bounds",
+                    {
+                        "stream_id": stream_id,
+                        "param_type": param_type,
+                        "parall_iter": parall_iter,
+                        "group_idx": group_idx,
+                        "offset_in_stream": int(offset_in_stream),
+                        "total_elements": int(total_elements),
+                        "offset_plus_total": int(offset_in_stream + total_elements),
+                        "stream_size_floats": int(self.stream_sizes[stream_id]),
+                        "gpu_ar_len": int(len(self.gpu_ar)) if self.gpu_ar is not None else None,
+                        "layers_to_process_len": int(len(layers_to_process)),
+                        "py_thread": threading.get_ident(),
+                    },
+                )
+                # #endregion
+                # #############################################################################
+
+                # ========== 阶段2：异步写入 SSD ==========
+                # ✅ 供“按 chunk 流式提交”使用：避免 pinned chunk 池不足导致 borrow_chunk 阻塞/死锁（H6）
+                def ssd_write_task(chunks, stream_id, offset_in_stream, parall_iter, num_threads, writer):
+                    try:
+                        total_chunk_elems = 0
+                        try:
+                            total_chunk_elems = int(sum(c[1] for c in chunks))
+                        except Exception:
+                            total_chunk_elems = 0
+                        for chunk_ptr, chunk_size, offset in chunks:
+                            float_ptr = cast(chunk_ptr, POINTER(c_float))
+
+                            # #############################################################################
+                            # #region agent log
+                            # Hypothesis H1/H2: pointer lifecycle and write-range correlation.
+                            is_sample = (offset == 0) or (total_chunk_elems and (offset + chunk_size == total_chunk_elems))
+                            if is_sample:
+                                _pccheck_log(
+                                    "H2",
+                                    "multistream_checkpoint.py:ssd_write_task:write_stream_chunk",
+                                    "ssd write_stream_chunk sample",
+                                    {
+                                        "stream_id": stream_id,
+                                        "parall_iter": parall_iter,
+                                        "offset_in_stream": int(offset_in_stream),
+                                        "offset": int(offset),
+                                        "chunk_size": int(chunk_size),
+                                        "write_offset": int(offset_in_stream + offset),
+                                        "chunk_ptr": int(chunk_ptr),
+                                        "py_thread": threading.get_ident(),
+                                    },
+                                )
+                            # #endregion
+                            # #############################################################################
+
+                            writer.write_stream_chunk(
                                 stream_id,
-                                buffer_slice.numpy(),
+                                float_ptr,
                                 offset_in_stream + offset,
-                                size,
+                                chunk_size,
                                 parall_iter,
-                                self.num_threads
+                                num_threads,
                             )
-                            
-                            # 归还chunk
-                            self.writer.return_chunk(chunk_ptr)
-                            
-                except Exception as e:
-                    print(f"[ERROR] Pipeline failed: {e}")
-                    # 清理剩余的chunk
-                    while pipeline_queue:
-                        chunk_ptr, _, _, _, _ = pipeline_queue.popleft()
-                        self.writer.return_chunk(chunk_ptr)
-                    raise e
+                    except Exception as e:
+                        print(f"[ERROR] SSD write failed for stream {stream_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    finally:
+                        for chunk_ptr, _, _ in chunks:
+                            # #############################################################################
+                            # #region agent log
+                            # Hypothesis H1: double-return / return without borrow.
+                            with self._borrowed_chunks_lock:
+                                if int(chunk_ptr) not in self._borrowed_chunks:
+                                    _pccheck_log(
+                                        "H1",
+                                        "multistream_checkpoint.py:ssd_write_task:return_chunk",
+                                        "double-return or return-without-borrow detected",
+                                        {
+                                            "chunk_ptr": int(chunk_ptr),
+                                            "stream_id": stream_id,
+                                            "parall_iter": parall_iter,
+                                            "py_thread": threading.get_ident(),
+                                        },
+                                    )
+                                else:
+                                    self._borrowed_chunks.remove(int(chunk_ptr))
+                            # #endregion
+                            # #############################################################################
+                            writer.return_chunk(chunk_ptr)
+
+                        # #############################################################################
+                        # #region agent log
+                        # Hypothesis H3: observe SSD task completion vs. finalize/shutdown.
+                        with self._inflight_ssd_lock:
+                            self._inflight_ssd_tasks -= 1
+                            inflight_after = int(self._inflight_ssd_tasks)
+                        _pccheck_log(
+                            "H3",
+                            "multistream_checkpoint.py:ssd_write_task:done",
+                            "ssd_write_task finished",
+                            {
+                                "stream_id": stream_id,
+                                "parall_iter": parall_iter,
+                                "group_idx": group_idx,
+                                "chunks": int(len(chunks)),
+                                "inflight_after": inflight_after,
+                                "py_thread": threading.get_ident(),
+                            },
+                        )
+                        # #endregion
+                        # #############################################################################
+
+                def _submit_ssd(chunks):
+                    # #############################################################################
+                    # #region agent log
+                    with self._inflight_ssd_lock:
+                        self._inflight_ssd_tasks += 1
+                        inflight_before_submit = int(self._inflight_ssd_tasks)
+                    _pccheck_log(
+                        "H3",
+                        "multistream_checkpoint.py:_save_stream_for_layers:ssd_submit",
+                        "submit ssd_write_task",
+                        {
+                            "stream_id": stream_id,
+                            "param_type": param_type,
+                            "parall_iter": parall_iter,
+                            "group_idx": group_idx,
+                            "chunks": int(len(chunks)),
+                            "inflight_after_submit": inflight_before_submit,
+                            "py_thread": threading.get_ident(),
+                        },
+                    )
+                    # #endregion
+                    # #############################################################################
+                    fut = self.writer._submit_with_affinity(
+                        self.ssd_thread_pool,
+                        ssd_write_task,
+                        chunks,
+                        stream_id,
+                        offset_in_stream,
+                        parall_iter,
+                        self.num_threads,
+                        self.writer,
+                    )
+                    self._register_layer_group_futures(parall_iter, [fut])
+                    # #############################################################################
+                    # #region agent log
+                    _pccheck_log(
+                        "H3",
+                        "multistream_checkpoint.py:_save_stream_for_layers:ssd_future_registered",
+                        "registered ssd future into slot futures",
+                        {
+                            "stream_id": stream_id,
+                            "param_type": param_type,
+                            "parall_iter": parall_iter,
+                            "group_idx": group_idx,
+                            "chunks": int(len(chunks)),
+                            "py_thread": threading.get_ident(),
+                        },
+                    )
+                    # #endregion
+                    # #############################################################################
+
+                # ========== 阶段1：GPU→CPU 拷贝（按 chunk 流式提交 SSD 写入） ==========
+                current_offset = 0
+                current_layer_idx = 0
+                offset_in_current_layer = 0
+
+                while current_offset < total_elements:
+                    elements_to_process = min(self.chunk_size, total_elements - current_offset)
+
+                    # #############################################################################
+                    # #region agent log
+                    # Hypothesis H6: borrow_chunk may block if chunk pool is too small.
+                    _pccheck_log(
+                        "H6",
+                        "multistream_checkpoint.py:_save_stream_for_layers:borrow_attempt",
+                        "attempt borrow_chunk",
+                        {
+                            "stream_id": stream_id,
+                            "param_type": param_type,
+                            "parall_iter": parall_iter,
+                            "group_idx": group_idx,
+                            "current_offset": int(current_offset),
+                            "elements_to_process": int(elements_to_process),
+                            "py_thread": threading.get_ident(),
+                        },
+                    )
+                    # #endregion
+                    # #############################################################################
+
+                    chunk_ptr = self.writer.borrow_chunk()
+                    if chunk_ptr is None or chunk_ptr == 0:
+                        raise RuntimeError(f"borrow_chunk() returned invalid pointer: {chunk_ptr}")
+
+                    # #############################################################################
+                    # #region agent log
+                    is_sample = (current_offset == 0) or (current_offset + elements_to_process == total_elements)
+                    if is_sample:
+                        _pccheck_log(
+                            "H1",
+                            "multistream_checkpoint.py:_save_stream_for_layers:borrow_chunk",
+                            "borrow_chunk sample",
+                            {
+                                "stream_id": stream_id,
+                                "param_type": param_type,
+                                "parall_iter": parall_iter,
+                                "group_idx": group_idx,
+                                "chunk_ptr": int(chunk_ptr),
+                                "elements_to_process": int(elements_to_process),
+                                "current_offset": int(current_offset),
+                                "total_elements": int(total_elements),
+                                "py_thread": threading.get_ident(),
+                            },
+                        )
+                    with self._borrowed_chunks_lock:
+                        if int(chunk_ptr) in self._borrowed_chunks:
+                            _pccheck_log(
+                                "H1",
+                                "multistream_checkpoint.py:_save_stream_for_layers:double_borrow",
+                                "double-borrow detected (same chunk_ptr already borrowed)",
+                                {
+                                    "chunk_ptr": int(chunk_ptr),
+                                    "stream_id": stream_id,
+                                    "param_type": param_type,
+                                    "parall_iter": parall_iter,
+                                    "group_idx": group_idx,
+                                    "current_offset": int(current_offset),
+                                    "elements_to_process": int(elements_to_process),
+                                    "py_thread": threading.get_ident(),
+                                },
+                            )
+                        self._borrowed_chunks.add(int(chunk_ptr))
+                    # #endregion
+                    # #############################################################################
+
+                    chunk_array = np.ctypeslib.as_array((ctypes.c_float * self.chunk_size).from_address(chunk_ptr))
+                    # ✅ 修复段错误：使用 detach() 彻底断开 autograd 图
+                    # 
+                    # 问题根因：
+                    # 1. torch.from_numpy() 创建的 tensor 与 numpy 数组共享底层内存
+                    # 2. 对 tensor 进行 slice 会创建 SliceBackward0 autograd 节点
+                    # 3. 当 chunk 被归还到 DRAMAlloc 池后，autograd 节点仍持有对该内存的引用
+                    # 4. 在 Python GC 清理时，autograd::deleteNode() 会访问已失效的内存 → 段错误
+                    # 
+                    # 解决方案：
+                    # - 使用 detach() 断开所有 autograd 连接
+                    # - torch.no_grad() 只能阻止新梯度被记录，无法阻止已有的 storage 引用
+                    chunk_tensor = torch.from_numpy(chunk_array).detach()
+                    cpu_buffer_slice = chunk_tensor[:elements_to_process].detach()
+
+                    # ✅ H5: 禁用 autograd，避免 CopySlices/SliceBackward 在后台线程构建
+                    dest_offset = 0
+                    with torch.no_grad():
+                        while dest_offset < elements_to_process:
+                            gpu_offset, size = layers_to_process[current_layer_idx]
+                            remaining_in_layer = size - offset_in_current_layer
+                            needed = elements_to_process - dest_offset
+                            to_copy = min(remaining_in_layer, needed)
+
+                            src_start = gpu_offset + offset_in_current_layer
+                            # ✅ 修复：对 gpu_ar 的 slice 也要 detach()，防止 autograd 节点持有引用
+                            src_view = self.gpu_ar[src_start : src_start + to_copy].detach()
+                            dest_view = cpu_buffer_slice[dest_offset : dest_offset + to_copy]
+                            dest_view.copy_(src_view, non_blocking=True)
+
+                            dest_offset += to_copy
+                            offset_in_current_layer += to_copy
+
+                            if offset_in_current_layer == size:
+                                current_layer_idx += 1
+                                offset_in_current_layer = 0
+
+                    chunk_offset = current_offset
+                    current_offset += elements_to_process
+
+                    # 确保该 chunk 拷贝完成后再交给 SSD 线程（SSD 线程不触发 CUDA）
+                    current_stream.synchronize()
+                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset)])
+
+                # ✅ 所有 GPU→CPU 拷贝命令已完成/已提交，记录跨检查点同步事件
+                if copy_done_event is not None:
+                    copy_done_event.record(current_stream)
+                
         except Exception as e:
             print(f"[ERROR] Stream {stream_id} ({param_type}) failed: {e}")
             import traceback
@@ -804,21 +1213,154 @@ class MultiStreamCheckpoint:
                 self._ms_optimizer = None  # 在begin_checkpoint时创建
                 self._current_parall_iter = None
             
+            def step(self, closure=None):
+                """
+                普通的优化器step，不执行checkpoint。
+                
+                ✅ 性能优化：在非checkpoint迭代时，直接使用原生优化器，
+                避免分层组更新和CUDA流同步的开销。
+                
+                Args:
+                    closure: 可选的闭包函数
+                    
+                Returns:
+                    loss: 如果提供了closure则返回loss，否则返回None
+                """
+                return self._real_optimizer.step(closure)
+            
+            def step_with_checkpoint(self, closure=None, wait=False):
+                """
+                执行带checkpoint的step（一体化接口）。
+                
+                自动处理 begin_checkpoint → step_with_callback → finalize_checkpoint 流程。
+                
+                Args:
+                    closure: 可选的闭包函数
+                    wait: 是否等待checkpoint完成（True=同步，False=异步）
+                    
+                Returns:
+                    loss: 如果提供了closure则返回loss，否则返回None
+                """
+                self.begin_checkpoint()
+                loss = self.step_with_callback(closure)
+                self.finalize_checkpoint(wait=wait)
+                return loss
+            
             def begin_checkpoint(self):
                 """开始检查点，创建实际的MultiStreamOptimizer"""
                 parall_iter = self._checkpoint.begin_checkpoint()
                 self._current_parall_iter = parall_iter
                 
+                # ✅ 跨检查点同步：只在检查点开始时获取需要等待的事件快照
+                # 这样可以避免在同一个检查点内等待自己刚刚创建的事件
+                with self._checkpoint._layer_copy_events_lock:
+                    # 复制当前的事件映射（这些是上一个检查点的事件）
+                    prev_checkpoint_events = dict(self._checkpoint._layer_copy_events)
+                
+                def pre_update_callback(group_idx):
+                    prev_events = prev_checkpoint_events.get(group_idx)
+                    
+                    if prev_events is not None:
+                        # 优化：使用 CUDA stream wait 替代 CPU synchronize (问题1)
+                        # 让当前 GPU 流等待，而不是阻塞 CPU
+                        # 选项1：只等待param流（当前实现，性能最优但有小概率风险）
+                        torch.cuda.current_stream().wait_event(prev_events[0])
+                        
+                        # 选项2：等待param + exp_avg + exp_avg_sq（更安全，慢25%）
+                        # torch.cuda.current_stream().wait_event(prev_events[0])  # param
+                        # torch.cuda.current_stream().wait_event(prev_events[2])  # exp_avg
+                        # torch.cuda.current_stream().wait_event(prev_events[3])  # exp_avg_sq
+                        
+                        # 选项3：等待所有4个流（最安全，但grad不需要）
+                        # for event in prev_events:
+                        #     torch.cuda.current_stream().wait_event(event)
+                
+                # 优化：使用专门的拷贝流，避免阻塞默认流 (问题6)
+                copy_stream = torch.cuda.Stream()
+                
+                # 检测是否启用了零拷贝（通过检查第一个参数是否在 gpu_ar 范围内）
+                # 如果使用了 pccheck_utils.set_storage，参数应该已经在 gpu_ar 上
+                is_zero_copy_enabled = False
+                if hasattr(self._checkpoint, '_pending_param_list') and self._checkpoint._pending_param_list and hasattr(self._checkpoint, 'gpu_ar') and self._checkpoint.gpu_ar is not None:
+                    first_param = self._checkpoint._pending_param_list[0]
+                    gpu_ar_ptr = self._checkpoint.gpu_ar.data_ptr()
+                    # 计算 gpu_ar 的字节范围
+                    gpu_ar_size_bytes = self._checkpoint.gpu_ar.numel() * self._checkpoint.gpu_ar.element_size()
+                    
+                    if first_param.data_ptr() >= gpu_ar_ptr and first_param.data_ptr() < gpu_ar_ptr + gpu_ar_size_bytes:
+                        is_zero_copy_enabled = True
+                        print("  ✓ Zero-copy mode detected: skipping D2D copies in save_callback")
+
                 # 创建回调函数，捕获parall_iter
-                def save_callback(layer_ids):
-                    """层组更新后的回调：异步保存该层组"""
-                    # 提交异步保存任务
-                    futures = self._checkpoint.save_layer_group(layer_ids, parall_iter)
+                def save_callback(group_idx, layer_ids):
+                    if is_zero_copy_enabled:
+                        # 🔥 零拷贝优化：参数已经在 gpu_ar 上，无需拷贝
+                        # 直接在默认流上记录事件，标记参数更新已完成
+                        sync_event = torch.cuda.Event()
+                        sync_event.record(torch.cuda.current_stream())
+                    else:
+                        # 常规模式：在拷贝流上执行 D2D 拷贝
+                        with torch.cuda.stream(copy_stream):
+                            # 等待默认流上的参数更新完成
+                            copy_stream.wait_stream(torch.cuda.current_stream())
+                            
+                            # ✅ 修复段错误：必须在 no_grad 上下文中执行拷贝
+                            # 并且使用 detach() 断开所有 autograd 连接
+                            # 
+                            # 问题根因：
+                            # 1. param.view(-1).float() 会创建 autograd 节点
+                            # 2. gpu_ar[...] slice 操作也会创建 SliceBackward0 节点
+                            # 3. 这些节点持有对底层 storage 的引用
+                            # 4. 在程序退出时 GC 清理这些节点会访问已失效的内存 → 段错误
+                            with torch.no_grad():
+                                # Copy updated parameters to gpu_ar
+                                for layer_id in layer_ids:
+                                    if layer_id >= len(self._checkpoint.param_layout):
+                                        continue
+                                    layer_info = self._checkpoint.param_layout[layer_id]
+                                    param = self._checkpoint._pending_param_list[layer_id]
+                                    
+                                    # Copy param - 使用 detach() 断开 autograd
+                                    start = layer_info["param_offset"]
+                                    size = layer_info["param_size"]
+                                    self._checkpoint.gpu_ar[start : start + size].copy_(param.detach().view(-1).float(), non_blocking=True)
+                                    
+                                    # Copy grad
+                                    grad_start = layer_info["grad_offset"]
+                                    grad_size = layer_info["grad_size"]
+                                    if param.grad is None:
+                                        self._checkpoint.gpu_ar[grad_start : grad_start + grad_size].zero_()
+                                    else:
+                                        self._checkpoint.gpu_ar[grad_start : grad_start + grad_size].copy_(param.grad.detach().view(-1).float(), non_blocking=True)
+                                        
+                                    # Copy optimizer states (exp_avg, exp_avg_sq)
+                                    state = self._real_optimizer.state.get(param, {})
+                                    exp_avg = state.get("exp_avg")
+                                    exp_avg_sq = state.get("exp_avg_sq")
+                                    
+                                    exp_avg_start = layer_info["exp_avg_offset"]
+                                    exp_avg_size = layer_info["exp_avg_size"]
+                                    if exp_avg is None:
+                                        self._checkpoint.gpu_ar[exp_avg_start : exp_avg_start + exp_avg_size].zero_()
+                                    else:
+                                        self._checkpoint.gpu_ar[exp_avg_start : exp_avg_start + exp_avg_size].copy_(exp_avg.detach().view(-1).float(), non_blocking=True)
+                                        
+                                    exp_avg_sq_start = layer_info["exp_avg_sq_offset"]
+                                    exp_avg_sq_size = layer_info["exp_avg_sq_size"]
+                                    if exp_avg_sq is None:
+                                        self._checkpoint.gpu_ar[exp_avg_sq_start : exp_avg_sq_start + exp_avg_sq_size].zero_()
+                                    else:
+                                        self._checkpoint.gpu_ar[exp_avg_sq_start : exp_avg_sq_start + exp_avg_sq_size].copy_(exp_avg_sq.detach().view(-1).float(), non_blocking=True)
+
+                            # ✅ 在拷贝流上记录事件，标记该层组的参数拷贝已完成
+                            sync_event = torch.cuda.Event()
+                            sync_event.record(copy_stream)
+                        
+                    # 提交异步保存任务，传递同步事件和group_idx
+                    futures = self._checkpoint.save_layer_group(layer_ids, parall_iter, group_idx, sync_event)
                     
                     # 将futures添加到对应槽位的记录中
-                    with self._checkpoint._slot_lock:
-                        if parall_iter in self._checkpoint._checkpoint_slots:
-                            self._checkpoint._checkpoint_slots[parall_iter]['futures'].extend(futures)
+                    self._checkpoint._register_layer_group_futures(parall_iter, futures)
                 
                 # 创建实际的MultiStreamOptimizer
                 self._ms_optimizer = MultiStreamOptimizer(
@@ -827,6 +1369,8 @@ class MultiStreamCheckpoint:
                     param_list=self._checkpoint._pending_param_list,
                     callback=save_callback
                 )
+                # ✅ 设置更新前回调
+                self._ms_optimizer.pre_update_callback = pre_update_callback
                 
                 return parall_iter
             
@@ -845,13 +1389,57 @@ class MultiStreamCheckpoint:
                 self._ms_optimizer = None
                 return self._checkpoint.finalize_checkpoint(parall_iter, wait)
             
+            def zero_grad(self, set_to_none=True):
+                """清零梯度，直接代理到原生优化器"""
+                return self._real_optimizer.zero_grad(set_to_none=set_to_none)
+            
+            @property
+            def param_groups(self):
+                """返回原生优化器的参数组"""
+                return self._real_optimizer.param_groups
+            
+            @property
+            def state(self):
+                """返回原生优化器的状态"""
+                return self._real_optimizer.state
+            
+            def state_dict(self):
+                """返回原生优化器的状态字典"""
+                return self._real_optimizer.state_dict()
+            
+            def load_state_dict(self, state_dict):
+                """加载状态字典到原生优化器"""
+                return self._real_optimizer.load_state_dict(state_dict)
+            
             def __getattr__(self, name):
-                # 代理其他方法到原始优化器或MultiStreamOptimizer
-                if self._ms_optimizer is not None and hasattr(self._ms_optimizer, name):
-                    return getattr(self._ms_optimizer, name)
+                # 代理其他方法到原始优化器
+                # 注意：不再代理到 _ms_optimizer，因为它只在 checkpoint 期间存在
                 return getattr(self._real_optimizer, name)
         
         return OptimizerWrapper(self, optimizer)
+    
+    def save_full_checkpoint(self, sync: bool = True, stream: Optional[torch.cuda.Stream] = None) -> Tuple[int, float]:
+        """
+        手动触发一次完整的多流保存，常用于快照模式或分布式rank独立保存。
+        
+        Args:
+            sync: True 表示等待写入完成；False 表示后台异步。
+            stream: 可选的CUDA流，在该流完成后再开始拷贝；默认使用当前流。
+        
+        Returns:
+            Tuple[int, float]: (parall_iter, finalize_result)
+        """
+        parall_iter = self.begin_checkpoint()
+        working_stream = stream or torch.cuda.current_stream()
+        
+        for group_idx, layer_ids in enumerate(self.layer_groups):
+            sync_event = torch.cuda.Event()
+            sync_event.record(working_stream)
+            futures = self.save_layer_group(layer_ids, parall_iter, group_idx, sync_event)
+            self._register_layer_group_futures(parall_iter, futures)
+        
+        finalize_result = self.finalize_checkpoint(parall_iter, wait=sync)
+        return parall_iter, finalize_result
     
     def begin_checkpoint(self):
         """
@@ -912,6 +1500,27 @@ class MultiStreamCheckpoint:
             slot_info = self._checkpoint_slots[parall_iter]
             futures = slot_info['futures']
             start_time = slot_info['start_time']
+
+        # #############################################################################
+        # #region agent log
+        # Hypothesis H3: finalize called while SSD tasks are still running.
+        with self._inflight_ssd_lock:
+            inflight_ssd = int(self._inflight_ssd_tasks)
+        _pccheck_log(
+            "H3",
+            "multistream_checkpoint.py:finalize_checkpoint:entry",
+            "enter finalize_checkpoint",
+            {
+                "parall_iter": parall_iter,
+                "wait": bool(wait),
+                "num_copy_futures": int(len(futures)),
+                "inflight_ssd_tasks": inflight_ssd,
+                "active_slots": int(len(self._checkpoint_slots)),
+                "py_thread": threading.get_ident(),
+            },
+        )
+        # #endregion
+        # #############################################################################
         
         if wait:
             # 同步模式：等待所有保存完成
@@ -944,7 +1553,8 @@ class MultiStreamCheckpoint:
             
             # ✅ 修复：释放槽位
             with self._slot_lock:
-                del self._checkpoint_slots[parall_iter]
+                # 可能在 drain() 与后台 async finalize 并发时被其他线程抢先删除
+                self._checkpoint_slots.pop(parall_iter, None)
             
             return total_time
         else:
@@ -995,12 +1605,39 @@ class MultiStreamCheckpoint:
             print(f"✓ Checkpoint {parall_iter} submitted to background (Async submit time: {submit_time*1000:.2f}ms)")
             
             return submit_time
+
+    def drain(self):
+        """等待所有尚未完成的异步 checkpoint 完成并落盘。
+
+        目的：
+        - 让 benchmark 的时间统计包含尾部异步写入/flush，避免吞吐被高估或出现非单调异常。
+        - 避免后台线程池继续占用 CPU/SSD 带宽，干扰后续 step 或后续实验。
+        """
+        # 快照当前活跃槽位，逐个同步 finalize。
+        while True:
+            with self._slot_lock:
+                active = list(self._checkpoint_slots.keys())
+            if not active:
+                return
+            for parall_iter in active:
+                # finalize_checkpoint(wait=True) 内部会在完成后释放槽位。
+                self.finalize_checkpoint(parall_iter, wait=True)
     
     def shutdown(self):
         """关闭线程池，释放资源"""
-        if hasattr(self, 'thread_pool'):
-            self.thread_pool.shutdown(wait=True)
-            print("✓ Thread pool shutdown")
+        # 在关闭线程池之前，先确保没有未完成的异步 checkpoint。
+        # 否则 ThreadPoolExecutor.shutdown(wait=True) 只保证任务执行完，
+        # 但我们的槽位状态/统计可能还没走完 finalize 的释放逻辑。
+        try:
+            self.drain()
+        except Exception as e:
+            print(f"[WARN] MultiStreamCheckpoint.drain() failed during shutdown: {e}")
+        if hasattr(self, 'copy_thread_pool'):
+            self.copy_thread_pool.shutdown(wait=True)
+            print("✓ Copy thread pool shutdown")
+        if hasattr(self, 'ssd_thread_pool'):
+            self.ssd_thread_pool.shutdown(wait=True)
+            print("✓ SSD thread pool shutdown")
     
     def __del__(self):
         """析构时自动关闭线程池"""

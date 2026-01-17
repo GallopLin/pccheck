@@ -423,13 +423,14 @@ private:
     size_t total_checkpoint_size;     // 单个检查点的总大小（以float为单位）
     size_t checkpoint_padding_bytes;  // 单个checkpoint的4KB对齐padding字节数
     size_t checkpoint_stride_floats;  // 单个checkpoint的stride（以float为单位，包含padding）
-    size_t chunk_threshold_bytes;     // 动态线程切分阈值（字节），根据检查点大小自动调整
-    std::unique_ptr<ThreadPool> thread_pool;  // 线程池（用于write_stream_chunk）
-    int pool_num_threads;             // 线程池大小
+    // ✅ 移除了不再需要的成员变量：
+    // - chunk_threshold_bytes: 多线程切分阈值（已移除多线程 memcpy）
+    // - thread_pool: C++ 线程池（由 Python ssd_thread_pool 替代）
+    // - pool_num_threads: 线程池大小
     std::unordered_map<int, float*> slot_buffers;  // 槽位→pinned buffer映射（用于DRAM复用）
     std::mutex slot_mutex;             // 保护slot_buffers的互斥锁
     
-    // ✅ 对齐开销彻底固定：复用checkpoint基地址计算，避免每次重复计算offset
+    // ✅ 复用checkpoint基地址计算，避免每次重复计算offset
     float* checkpoint_base_ptr(int parall_iter) {
         if (checkpoint_stride_floats == 0) {
             fprintf(stderr, "[ERROR] checkpoint_stride_floats not initialized! Call init_streams first.\n");
@@ -440,15 +441,11 @@ private:
     
 public:
     NVM_write() : active_streams(0), multistream_mode(false), total_checkpoint_size(0), 
-                  checkpoint_padding_bytes(0), checkpoint_stride_floats(0), 
-                  chunk_threshold_bytes(64 * 1024 * 1024), pool_num_threads(16) {
-        // 默认创建12个工作线程的线程池
-        // 默认阈值64MB（适合2-10GB检查点）
-        thread_pool = std::make_unique<ThreadPool>(16);
+                  checkpoint_padding_bytes(0), checkpoint_stride_floats(0) {
+        // ✅ 简化：移除 C++ 线程池，由 Python ssd_thread_pool 管理并行
     }
     
     // 初始化多个数据流
-    // ✅ 对齐开销彻底固定：提前计算checkpoint_padding_bytes和checkpoint_stride_floats
     int init_streams(int num_streams, size_t* stream_sizes) {
         printf("Initializing %d streams for multi-stream checkpoint\n", num_streams);
         streams.clear();
@@ -490,40 +487,23 @@ public:
         // checkpoint_stride_floats = 实际数据 + padding（转换为float单位）
         checkpoint_stride_floats = total_checkpoint_size + (checkpoint_padding_bytes / sizeof(float));
         
-        // ✅ 动态线程切分阈值：根据检查点大小自动调整
-        // 策略：
-        // - 小检查点(<1GB): 32MB阈值
-        // - 中检查点(1-5GB): 64MB阈值
-        // - 大检查点(>5GB): 128MB阈值 (避免多流模式下线程竞争)
-        if (checkpoint_bytes < 1ULL * 1024 * 1024 * 1024) {
-            chunk_threshold_bytes = 64 * 1024 * 1024;
-        } else if (checkpoint_bytes < 5ULL * 1024 * 1024 * 1024) {
-            chunk_threshold_bytes = 128 * 1024 * 1024;
-        } else {
-            chunk_threshold_bytes = 256 * 1024 * 1024;
-        }
-        
         printf("Total checkpoint size: %lu floats (%.2f GB)\n", 
                total_checkpoint_size, checkpoint_bytes / 1e9);
         printf("Checkpoint padding: %lu bytes (%.2f KB), stride: %lu floats\n",
                checkpoint_padding_bytes, checkpoint_padding_bytes / 1024.0, checkpoint_stride_floats);
-        printf("Dynamic chunk threshold: %.2f MB (auto-adjusted for checkpoint size)\n",
-               chunk_threshold_bytes / (1024.0 * 1024.0));
         
         return 0;
     }
     
-    // 异步写入单个流的数据块（使用线程池，减少线程创建/销毁开销）
-    // ✅ 动态线程切分：按4MB粒度估算线程数，小块退化为单线程，大块多线程，64B对齐
+    // 写入单个流的数据块到 mmap 区域
+    // ✅ 简化设计：使用单线程 memcpy，原因：
+    // 1. mmap 写入的瓶颈是磁盘 IO 带宽，不是 CPU
+    // 2. Python 端已经有 ssd_thread_pool 实现并行（4个流并行）
+    // 3. 多线程 memcpy 对 mmap 几乎没有收益，反而增加同步开销
     void write_stream_chunk(int stream_id, float* data, size_t offset_in_stream, 
                            size_t chunk_size, int parall_iter, int num_threads) {
         if (stream_id < 0 || stream_id >= (int)streams.size()) {
             fprintf(stderr, "[ERROR] Invalid stream_id: %d\n", stream_id);
-            return;
-        }
-        
-        if (!thread_pool) {
-            fprintf(stderr, "[ERROR] Thread pool not initialized\n");
             return;
         }
         
@@ -533,73 +513,19 @@ public:
         }
         
         StreamWriter* stream = streams[stream_id].get();
-        stream->is_writing = true;
         
-        // ✅ 对齐开销彻底固定：使用checkpoint_base_ptr复用地址计算
+        // 计算目标地址
         float* checkpoint_base = checkpoint_base_ptr(parall_iter);
         float* target_addr = checkpoint_base + stream->stream_offset + offset_in_stream;
         
         size_t chunk_bytes = chunk_size * sizeof(float);
-        const size_t CACHE_LINE_SIZE = 64;  // 64B对齐
         
-        // ✅ 动态线程切分：使用动态阈值（根据检查点大小自动调整）
-        // 阈值已在init_streams中根据检查点大小设置（16MB/32MB/64MB）
-        int actual_threads = 1;
-        if (chunk_bytes >= chunk_threshold_bytes) {
-            // 大块数据：按动态阈值粒度估算线程数，最多不超过线程池规模
-            actual_threads = std::min((int)(chunk_bytes / chunk_threshold_bytes) + 1, pool_num_threads);
-            actual_threads = std::min(actual_threads, (int)num_threads);
-            // 确保至少2个线程才使用多线程（避免单线程路径的开销）
-            if (actual_threads < 2) {
-                actual_threads = 1;
-            }
-        }
-        // 小块数据退化为单线程memcpy
-        
-        if (actual_threads == 1) {
-            // 单线程路径：直接memcpy，无需同步开销
-            memcpy(target_addr, data, chunk_bytes);
-        } else {
-            // ✅ 同步路径瘦身：多线程路径按byte范围拷贝，复用atomic + condition_variable
-            std::atomic<int> completed_tasks(0);
-            std::mutex completion_mutex;
-            std::condition_variable completion_cv;
-            
-            size_t bytes_per_thread = chunk_bytes / actual_threads;
-            // ✅ 64B对齐：每个任务对齐到cache line边界
-            bytes_per_thread = (bytes_per_thread / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-            
-            for (int i = 0; i < actual_threads; i++) {
-                size_t byte_start = i * bytes_per_thread;
-                size_t byte_end = (i == actual_threads - 1) ? chunk_bytes : (i + 1) * bytes_per_thread;
-                size_t copy_bytes = byte_end - byte_start;
-                
-                // 确保对齐到64B边界
-                if (copy_bytes > 0) {
-                    thread_pool->enqueue([=, &completed_tasks, &completion_cv, &completion_mutex]() {
-                        // 按byte范围拷贝（使用char*指针）
-                        memcpy((char*)target_addr + byte_start, (char*)data + byte_start, copy_bytes);
-                        
-                        int remaining = completed_tasks.fetch_add(1) + 1;
-                        if (remaining == actual_threads) {
-                            std::unique_lock<std::mutex> lock(completion_mutex);
-                            completion_cv.notify_one();
-                        }
-                    });
-                }
-            }
-            
-            // 等待所有任务完成
-            {
-                std::unique_lock<std::mutex> lock(completion_mutex);
-                completion_cv.wait(lock, [&completed_tasks, actual_threads] {
-                    return completed_tasks.load() == actual_threads;
-                });
-            }
-        }
-        
-        stream->is_writing = false;
-        // ✅ 同步路径瘦身：去掉热路径printf，减少syslog开销
+        // ✅ 简化：直接使用单线程 memcpy
+        // 原因：
+        // - mmap 写入是内存映射，实际写入由内核 page cache 管理
+        // - 多线程 memcpy 不会加快磁盘写入，只会增加 CPU 竞争
+        // - Python 端的 ssd_thread_pool 已经实现了 4 路并行（4个stream）
+        memcpy(target_addr, data, chunk_bytes);
     }
     
     // 同步单个流到磁盘
@@ -765,9 +691,6 @@ public:
     
     // 清理资源
     ~NVM_write() {
-        // cpu_buffer由Python端管理，这里不需要释放
-        // 线程池会在析构时自动清理
-        thread_pool.reset();
         streams.clear();
     }
     

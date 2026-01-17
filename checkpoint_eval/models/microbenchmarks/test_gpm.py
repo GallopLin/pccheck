@@ -28,20 +28,24 @@ parser.add_argument("--iterations", default=10, type=int, help="iterations to si
 
 
 def run(args):
-    num_floats = args.size * 1000000 / 4
-    print(f"allocate tensor of {int(num_floats)} floats")
+    # ===== --size 参数表示完整检查点大小（包括 params + grads + exp_avg + exp_avg_sq）=====
+    # GPM 直接保存模型参数到 mmap，所以直接使用 size MB
+    checkpoint_size_mb = args.size
+    total_floats = int(checkpoint_size_mb * 1000000 / 4)  # size MB / 4 bytes per float
+    print(f"Target checkpoint size: {checkpoint_size_mb} MB")
+    print(f"Checkpoint size: {total_floats} floats ({total_floats * 4 / 1e6:.2f} MB)")
 
     class TestModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            tensor = torch.ones(int(num_floats), dtype=torch.float32)
+            tensor = torch.ones(total_floats, dtype=torch.float32)
             self.a = torch.nn.Parameter(tensor)
 
     model = TestModel()
     model.cuda()
 
     total_size = get_total_size(model, [])
-    print(f"total size is {total_size*4}")
+    print(f"Model total_size: {total_size} floats = {total_size*4/1e6:.2f} MB")
 
     chk = GPMCheckpoint(
         f"checkpoint_gpm.chk", model=model, datasize=int(total_size * 4)  # use float
@@ -50,7 +54,7 @@ def run(args):
     warmup = 3
     checkpoint_time_list = []
     for it in range(args.iterations):
-        # time.sleep(2)
+        time.sleep(2)
 
         start_time = time.time()
         chk._checkpoint(iter_chk=it)

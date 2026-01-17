@@ -48,6 +48,9 @@ def set_storage(model, optimizer_list, gpu_ar):
     
     # ==================== Region 3 & 4: Optimizer States (exp_avg, exp_avg_sq) ====================
     # 🔥 Phase 1 新增：映射优化器状态到 gpu_ar
+    # 支持多种优化器命名：
+    #   - 标准 Adam/AdamW: exp_avg, exp_avg_sq
+    #   - BertAdam: next_m, next_v
     for optimizer in optimizer_list:
         # 按参数顺序映射优化器状态
         for group in optimizer.param_groups:
@@ -56,9 +59,11 @@ def set_storage(model, optimizer_list, gpu_ar):
                 if p in optimizer.state:
                     state = optimizer.state[p]
                     
-                    # 映射 exp_avg（momentum）
-                    if 'exp_avg' in state:
-                        exp_avg = state['exp_avg']
+                    # 映射 exp_avg / next_m（momentum）
+                    # 支持标准 Adam (exp_avg) 和 BertAdam (next_m)
+                    momentum_key = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
+                    if momentum_key:
+                        exp_avg = state[momentum_key]
                         end_idx = start_idx + exp_avg.numel()
                         my_ar = gpu_ar[start_idx:end_idx]
                         prev_shape = exp_avg.size()
@@ -68,9 +73,11 @@ def set_storage(model, optimizer_list, gpu_ar):
                             exp_avg.copy_(temp)
                         start_idx += exp_avg.numel()
                     
-                    # 映射 exp_avg_sq（adaptive learning rate）
-                    if 'exp_avg_sq' in state:
-                        exp_avg_sq = state['exp_avg_sq']
+                    # 映射 exp_avg_sq / next_v（adaptive learning rate）
+                    # 支持标准 Adam (exp_avg_sq) 和 BertAdam (next_v)
+                    variance_key = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
+                    if variance_key:
+                        exp_avg_sq = state[variance_key]
                         end_idx = start_idx + exp_avg_sq.numel()
                         my_ar = gpu_ar[start_idx:end_idx]
                         prev_shape = exp_avg_sq.size()

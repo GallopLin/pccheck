@@ -179,5 +179,5 @@ def train():
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    os.sched_setaffinity(0, {0})
+    os.sched_setaffinity(0, {0}) # 只允许在 CPU 0 上运行
     train()

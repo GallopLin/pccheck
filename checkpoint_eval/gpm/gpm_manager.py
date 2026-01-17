@@ -31,7 +31,7 @@ class GPMCheckpoint(object):
 
         home_dir = os.path.expanduser("~")
         self.lib = ctypes.cdll.LoadLibrary(
-            f'{home_dir}/pccheck/checkpoint_eval/gpm/libtest.so')
+            f'{home_dir}/code/pccheck/checkpoint_eval/gpm/libtest.so')
 
         total_size = ctypes.c_ulong(self.tracking_map['datasize'])
 
