@@ -72,6 +72,7 @@ static int *PR_ADDR;
 static int *PEER_CHECK_ADDR;
 static int PADDING[64];
 static int *PR_ADDR_DATA;
+static uint64_t MAPPED_SIZE = 0;
 
 static uint8_t Cores[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
@@ -86,8 +87,8 @@ struct thread_data
 
 struct checkpoint
 {
-    long area;
-    long counter;
+    int64_t area;
+    int64_t counter;
 } __attribute__((aligned(64)));
 
 // NUM_THREADS = # of parallel threads that works on a single checkpoint
@@ -101,7 +102,7 @@ static int ASYNC_CHECK = 1;
 static int SIZE = 512;
 static string TEST_TYPE = "";
 static atomic<int> curr_parall_iter __attribute__((aligned(64)));
-static atomic<long> counter __attribute__((aligned(64)));
+static atomic<int64_t> counter __attribute__((aligned(64)));
 // static MSQueue<int> free_space;
 static FAAArrayQueue<int> free_space;
 
@@ -219,6 +220,24 @@ static void mapPersistentRegion(const char *filename, int *regionAddr, const uin
 
 //====================================================================
 
+static uint64_t getFileSize(const char *filename, int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+    {
+        perror("fstat");
+        exit(1);
+    }
+    if (st.st_size == 0)
+    {
+        fprintf(stderr, "[ERROR] file size is zero for %s\n", filename);
+        exit(1);
+    }
+    return (uint64_t)st.st_size;
+}
+
+//====================================================================
+
 static void FLUSH(void *p)
 {
     asm volatile("clwb (%0)" ::"r"(p));
@@ -244,7 +263,12 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     bool newfile = (stat(filename, &buffer) == -1);
 
     fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, (mode_t)0666);
-    ftruncate(fd, REGION_SIZE);
+    if (ftruncate(fd, REGION_SIZE) != 0) {
+        perror("ftruncate");
+        exit(1);
+    }
+
+    MAPPED_SIZE = REGION_SIZE;
 
     //mapPersistentRegion(filename, PR_ADDR_DATA, REGION_SIZE, true, fd);
     // 现在和filename无关（与fd有关），PR_ADDR PR_ADDR_DATA都是mmap出来的，与第二个参数无关（有关逻辑被注释了）
@@ -255,6 +279,7 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     printf("PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR);
 
     curr_parall_iter.store(0);
+    counter.store(1);
     counter.store(1);
 
     // write init checkpoint on NVMM - locted right next to the checkpoint *
@@ -318,6 +343,31 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     }
 
 
+}
+
+//====================================================================
+
+static void initialize_for_read(const char *filename, int max_async)
+{
+    fd = open(filename, O_RDWR, (mode_t)0666);
+    if (fd < 0)
+    {
+        perror("open");
+        exit(1);
+    }
+
+    uint64_t region_size = getFileSize(filename, fd);
+    MAPPED_SIZE = region_size;
+    mapPersistentRegion(filename, PR_ADDR, region_size, false, fd);
+
+    PEER_CHECK_ADDR = PR_ADDR + OFFSET_SIZE;
+    PR_ADDR_DATA = PR_ADDR + (max_async + 3) * OFFSET_SIZE;
+
+    printf("[Reader] PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR);
+
+    is_distributed = false;
+    my_rank = 0;
+    world_size = 1;
 }
 
 //====================================================================
@@ -527,6 +577,27 @@ public:
         // - Python 端的 ssd_thread_pool 已经实现了 4 路并行（4个stream）
         memcpy(target_addr, data, chunk_bytes);
     }
+
+    // 读取单个流的数据块到用户缓冲区
+    void read_stream_chunk(int stream_id, float* out, size_t offset_in_stream,
+                           size_t chunk_size, int parall_iter) {
+        if (stream_id < 0 || stream_id >= (int)streams.size()) {
+            fprintf(stderr, "[ERROR] Invalid stream_id for read: %d\n", stream_id);
+            return;
+        }
+
+        if (checkpoint_stride_floats == 0) {
+            fprintf(stderr, "[ERROR] checkpoint_stride_floats not initialized! Call init_streams first.\n");
+            exit(1);
+        }
+
+        StreamWriter* stream = streams[stream_id].get();
+        float* checkpoint_base = checkpoint_base_ptr(parall_iter);
+        float* source_addr = checkpoint_base + stream->stream_offset + offset_in_stream;
+
+        size_t chunk_bytes = chunk_size * sizeof(float);
+        memcpy(out, source_addr, chunk_bytes);
+    }
     
     // 同步单个流到磁盘
     // ✅ 同步/flush逻辑复用：使用checkpoint_base_ptr确保和写入路径一致
@@ -623,7 +694,15 @@ public:
         // 更新检查点元数据（沿用原pccheck的逻辑）
         struct checkpoint *curr_checkpoint = (struct checkpoint *)(PR_ADDR + OFFSET_SIZE * (parall_iter + 3));
         struct checkpoint *volatile last_check = *(struct checkpoint *volatile *)PR_ADDR;
-        long curr_counter = curr_checkpoint->counter;
+        int64_t curr_counter = curr_checkpoint->counter;
+        // 防御：若元数据被破坏（如出现负值或回退），重新生成单调递增的计数
+        int64_t last_published = (*(struct checkpoint *volatile *)PR_ADDR)->counter;
+        if (curr_counter <= 0 || curr_counter <= last_published)
+        {
+            // 重新获取一个新的计数并回写元数据，保证单调递增
+            curr_counter = counter.fetch_add(1) + 1;
+            curr_checkpoint->counter = curr_counter;
+        }
         
         // 同步元数据
         int metadata_res = msync(curr_checkpoint, sizeof(struct checkpoint), MS_SYNC);
@@ -638,7 +717,7 @@ public:
             bool cas_res = __sync_bool_compare_and_swap((checkpoint **)PR_ADDR, last_check, curr_checkpoint);
             struct checkpoint *volatile check = *(struct checkpoint *volatile *)PR_ADDR;
             if (cas_res) {
-                printf("CAS was successful! new counter is %ld\n", check->counter);
+                printf("CAS was successful! new counter is %lld\n", (long long)check->counter);
                 BARRIER(PR_ADDR);
                 
                 // 释放旧的槽位
@@ -687,6 +766,26 @@ public:
         // 旧接口无法正确归还，因为没有传入buffer指针
         // 这里什么都不做，或者打印错误
         fprintf(stderr, "[WARNING] return_cpu_slot(int) is deprecated and does nothing. Use return_chunk(float*) instead.\n");
+    }
+
+    int get_latest_parall_iter() {
+        struct checkpoint *volatile last_check = *(struct checkpoint *volatile *)PR_ADDR;
+        if (last_check == nullptr) {
+            return -1;
+        }
+        return (int)last_check->area;
+    }
+
+    void close_writer() {
+        if (PR_ADDR != nullptr && MAPPED_SIZE > 0) {
+            munmap((void *)PR_ADDR, MAPPED_SIZE);
+            PR_ADDR = nullptr;
+            MAPPED_SIZE = 0;
+        }
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
     }
     
     // 清理资源
@@ -749,7 +848,31 @@ public:
     {
         int parall_iter = 0;
         // get a new counter for the current checkpoint attempt
-        long curr_counter = atomic_fetch_add(&counter, (long)1);
+        int64_t curr_counter = counter.fetch_add((int64_t)1) + 1; // fetch_add 返回旧值，+1 得到新计数
+
+        // 与已发布的最新检查点比较，确保单调递增
+        struct checkpoint *volatile published = *(struct checkpoint *volatile *)PR_ADDR;
+        int64_t published_counter = published ? published->counter : 0;
+        if (curr_counter <= published_counter)
+        {
+            int64_t expected = curr_counter;
+            int64_t desired = published_counter + 1;
+            while (true)
+            {
+                if (counter.compare_exchange_weak(expected, desired))
+                {
+                    curr_counter = desired;
+                    break;
+                }
+                // counter 已被其他线程更新，再次校验
+                if (expected > published_counter)
+                {
+                    curr_counter = expected;
+                    break;
+                }
+                desired = expected + 1;
+            }
+        }
         // find free space to update the new checkpoint
 
         while (true)
@@ -778,16 +901,17 @@ public:
         struct checkpoint *checkp_info_new = (struct checkpoint *)(PR_ADDR + OFFSET_SIZE * (parall_iter + 3));
 
         // int parallel_iteration = checkp_info_new->area;
-        int counter_num = checkp_info_new->counter;
+        int64_t counter_num = checkp_info_new->counter;
         struct checkpoint *volatile last_check = *(struct checkpoint *volatile *)PR_ADDR;
-        long curr_counter = counter_num;
+        int64_t curr_counter = counter_num;
         // int parall_iter = parallel_iteration;
 
-        printf("At savenvmNew, tid is %d, parall_iter is %d, num_threads is %d, last counter is %d, curr_counter is %d\n", tid, parall_iter, num_threads, last_check->counter, curr_counter);
+    printf("At savenvmNew, tid is %zu, parall_iter is %d, num_threads is %d, last counter is %lld, curr_counter is %lld\n", tid, parall_iter, num_threads, (long long)last_check->counter, (long long)curr_counter);
         if (last_check->counter > curr_counter)
         { // Room for optimization
             if (last_batch)
             {
+                printf("At savenvmNew, tid is %zu, parall_iter is %d, num_threads is %d, last counter is %lld, curr_counter is %lld\n", tid, parall_iter, num_threads, (long long)last_check->counter, (long long)curr_counter);
                 BARRIER(PR_ADDR);
                 printf("Return!\n");
                 free_space.enqueue(parall_iter, parall_iter);
@@ -890,7 +1014,7 @@ public:
                 struct checkpoint *volatile check = *(struct checkpoint *volatile *)PR_ADDR;
                 if (res)
                 {
-                    printf("CAS was successful! new counter is %ld, is_distributed is %d\n", check->counter, is_distributed);
+                    printf("CAS was successful! new counter is %lld, is_distributed is %d\n", (long long)check->counter, is_distributed);
                     BARRIER(PR_ADDR);
                     if (is_distributed) {
                         if (my_rank==0) {
@@ -958,6 +1082,13 @@ extern "C" // 生成的.so文件暴露出来的接口
         return nvmobj;
     }
 
+    NVM_write *reader(const char *filename, int max_async)
+    {
+        NVM_write *nvmobj = new NVM_write();
+        initialize_for_read(filename, max_async);
+        return nvmobj;
+    }
+
     float *readfromnvm(NVM_write *t, float *ar, int sz)
     {
         return t->readfromnvm(ar, sz);
@@ -994,6 +1125,13 @@ extern "C" // 生成的.so文件暴露出来的接口
         t->write_stream_chunk(stream_id, data, offset_in_stream, chunk_size, 
                              parall_iter, num_threads);
     }
+
+    // 读取单个流的数据块
+    void read_stream_chunk(NVM_write *t, int stream_id, float *out,
+                           size_t offset_in_stream, size_t chunk_size,
+                           int parall_iter) {
+        t->read_stream_chunk(stream_id, out, offset_in_stream, chunk_size, parall_iter);
+    }
     
     // 同步单个流到磁盘
     void sync_stream(NVM_write *t, int stream_id, int parall_iter) {
@@ -1023,6 +1161,16 @@ extern "C" // 生成的.so文件暴露出来的接口
     
     void return_cpu_slot(NVM_write *t, int parall_iter) {
         t->return_cpu_slot(parall_iter);
+    }
+
+    int get_latest_parall_iter(NVM_write *t) {
+        return t->get_latest_parall_iter();
+    }
+
+    void close_writer(NVM_write *t) {
+        if (t == nullptr) return;
+        t->close_writer();
+        delete t;
     }
 }
 

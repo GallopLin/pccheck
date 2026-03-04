@@ -168,6 +168,47 @@ class CFCheckpoint(object):
             print(f"Current checkpoint time median is: {np.median(time_meas)}")
 
 
+    """
+    Restores the checkpoint at given path.
+    Based on CheckFreq source code (cf_checkpoint.py _restore method).
+
+    Returns the part of checkpoint that was not among
+    the tractable items that were registered with CF.
+    """
+    def _restore(self, filepath='model.chk', gpu=0):
+        checkpoint = torch.load(filepath, map_location=lambda storage, loc: storage.cuda(gpu))
+
+        # reinitialize state of tractable objects
+        for name, ref in self.tracking_map.items():
+            if name in checkpoint:
+                try:
+                    if hasattr(ref, 'load_state_dict'):
+                        ref.load_state_dict(checkpoint[name])
+                    else:
+                        # For plain dict-based tracked objects, update in-place
+                        for k, v in checkpoint[name].items():
+                            if k in ref:
+                                if hasattr(ref[k], 'copy_'):
+                                    ref[k].copy_(v)
+                                else:
+                                    ref[k] = v
+                    del checkpoint[name]
+                except ValueError:
+                    print("Corrupt checkpoint for key: {}".format(name))
+            else:
+                print("Warning: key '{}' not found in checkpoint".format(name))
+
+        if len(checkpoint.keys()) > 0:
+            return checkpoint
+
+        return None
+
+
+def fname_from_path(path):
+    """Get the filename without the suffix/prefix"""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
 def update_stats(filepath, overwrite=True, iter_chk=None):
 
     dirpath = os.path.dirname(filepath)

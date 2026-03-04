@@ -18,31 +18,6 @@ from itertools import cycle
 import os
 import json
 
-# #############################################################################
-# #region agent log (ndjson)
-# NOTE: Debug-mode runtime instrumentation. Do NOT remove until post-fix verified.
-_PCCHECK_DEBUG_LOG_PATH = "/home/linzhicheng/.cursor/debug.log"
-_PCCHECK_SESSION_ID = "debug-session"
-
-def _pccheck_log(hypothesisId: str, location: str, message: str, data: dict, runId: str = "pre-fix"):
-    try:
-        payload = {
-            "sessionId": _PCCHECK_SESSION_ID,
-            "runId": runId,
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_PCCHECK_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-# #endregion
-# #############################################################################
-
-
 class MultiStreamOptimizer:
     def __init__(
         self, 
@@ -530,6 +505,7 @@ class MultiStreamCheckpoint:
         distributed=False,
         rank=0,
         world_size=1,
+        metadata_path: Optional[str] = None,
     ):
         self.param_layout = param_layout
         # ✅ 关键防护（针对 H5）：checkpoint 线程只应读取“无 autograd”的视图
@@ -552,6 +528,7 @@ class MultiStreamCheckpoint:
         self.distributed = distributed
         self.rank = rank
         self.world_size = world_size
+        self.metadata_path = metadata_path
         
         # 计算每个流的大小
         self.stream_sizes = self._calculate_stream_sizes()
@@ -613,6 +590,11 @@ class MultiStreamCheckpoint:
             fname_bytes = resolved_filename.encode()
         else:
             fname_bytes = resolved_filename
+
+        self.filename = resolved_filename
+
+        if self.metadata_path is None and isinstance(resolved_filename, str):
+            self.metadata_path = resolved_filename + ".metadata.json"
         self.writer = MultiStreamWriter(
             fname_bytes,
             lib_path,
@@ -657,15 +639,8 @@ class MultiStreamCheckpoint:
         
         # IO统计回调
         self.io_callback = None
-        
-        # #############################################################################
-        # #region agent log (ssd inflight)
-        # Hypothesis H3: finalize/shutdown doesn't actually wait for SSD write tasks,
-        # leaving background work running near the last checkpoints.
         self._inflight_ssd_tasks = 0
         self._inflight_ssd_lock = Lock()
-        # #endregion
-        # #############################################################################
         
         # ✅ 修复：槽位管理器（支持多个并行检查点）
         # 使用字典跟踪每个槽位的状态：{parall_iter: {'futures': [...], 'start_time': ...}}
@@ -680,14 +655,12 @@ class MultiStreamCheckpoint:
         self._layer_copy_events_lock = Lock()
         print(f"  ✓ Cross-checkpoint layer synchronization enabled")
 
-        # #############################################################################
-        # #region agent log (chunk lifecycle tracking)
-        # Hypothesis H1: DRAMAlloc chunk pool returns the same pointer concurrently
-        # or a pointer is returned twice (double-free/use-after-free) due to threading.
-        self._borrowed_chunks = set()
-        self._borrowed_chunks_lock = Lock()
-        # #endregion
-        # #############################################################################
+        # 尝试导出基础 metadata（不含 optimizer state），便于加载端提前准备
+        if self.metadata_path:
+            try:
+                self.export_metadata(self.metadata_path)
+            except Exception as e:
+                print(f"[WARN] export_metadata failed during init: {e}")
         
     def _calculate_max_chunk_size(self):
         """计算最大的chunk大小（用于DRAMAlloc）"""
@@ -732,6 +705,208 @@ class MultiStreamCheckpoint:
                 groups.append(list(range(start, end)))
         
         return groups
+
+    # ====================== Metadata Export ======================
+    def _serialize_optimizer_param_groups(self, optimizer, param_name_to_param):
+        if optimizer is None:
+            return None
+        param_id_to_name = {id(param): name for name, param in param_name_to_param.items()}
+        serialized = []
+        for group in optimizer.param_groups:
+            new_group = {}
+            for key, value in group.items():
+                if key == "params":
+                    new_group["params"] = [param_id_to_name.get(id(p)) for p in value if id(p) in param_id_to_name]
+                else:
+                    if isinstance(value, torch.Tensor):
+                        new_group[key] = value.item()
+                    elif isinstance(value, (list, tuple)):
+                        new_group[key] = [v.item() if isinstance(v, torch.Tensor) else v for v in value]
+                    else:
+                        new_group[key] = value
+            serialized.append(new_group)
+        return serialized
+
+    def _serialize_optimizer_steps(self, optimizer, param_name_to_param):
+        if optimizer is None:
+            return None
+        steps = {}
+        for name, param in param_name_to_param.items():
+            state = optimizer.state.get(param, {})
+            if "step" in state:
+                step_val = state["step"]
+                if isinstance(step_val, torch.Tensor):
+                    steps[name] = int(step_val.item())
+                else:
+                    steps[name] = int(step_val)
+        return steps
+
+    def export_metadata(self, output_path: Optional[str] = None, optimizer: Optional[torch.optim.Optimizer] = None,
+                        chunk_groups: Optional[List[List[int]]] = None) -> str:
+        """
+        导出 multistream 检查点元数据，供流水加载使用。
+
+        Args:
+            output_path: 元数据文件路径；默认使用 self.metadata_path。
+            optimizer: 可选，用于导出 optimizer param_groups 与 step。
+            chunk_groups: 可选自定义 layer group 划分；默认使用 self.layer_groups。
+        """
+        if output_path is None:
+            output_path = self.metadata_path
+        if output_path is None:
+            raise ValueError("metadata_path is not set; please pass output_path explicitly.")
+
+        stream_names = ["param", "grad", "exp_avg", "exp_avg_sq"]
+        stream_sizes = self.stream_sizes
+        total_checkpoint_size = sum(stream_sizes)
+        page_size = 4096
+        checkpoint_bytes = total_checkpoint_size * 4
+        checkpoint_padding_bytes = (page_size - (checkpoint_bytes % page_size)) % page_size
+        checkpoint_stride_floats = total_checkpoint_size + (checkpoint_padding_bytes // 4)
+
+        # 参数布局映射
+        param_map = {}
+        for layer_info in self.param_layout:
+            name = layer_info.get("name")
+            if not name:
+                continue
+            param_map[name] = {
+                "numel": int(layer_info.get("param_size", 0)),
+                "param_offset": int(layer_info.get("param_offset", 0)),
+                "param_size": int(layer_info.get("param_size", 0)),
+                "grad_offset": int(layer_info.get("grad_offset", 0)),
+                "grad_size": int(layer_info.get("grad_size", 0)),
+                "exp_avg_offset": int(layer_info.get("exp_avg_offset", 0)),
+                "exp_avg_size": int(layer_info.get("exp_avg_size", 0)),
+                "exp_avg_sq_offset": int(layer_info.get("exp_avg_sq_offset", 0)),
+                "exp_avg_sq_size": int(layer_info.get("exp_avg_sq_size", 0)),
+            }
+
+        chunk_groups = chunk_groups or self.layer_groups
+        chunks = {}
+        for group_idx, layer_ids in enumerate(chunk_groups):
+            params = []
+            stream_start = {name: None for name in stream_names}
+            stream_end = {name: None for name in stream_names}
+
+            for layer_id in layer_ids:
+                if layer_id >= len(self.param_layout):
+                    continue
+                info = self.param_layout[layer_id]
+                name = info.get("name")
+                if not name:
+                    continue
+                offsets = {
+                    "param": int(info.get("param_offset", 0)),
+                    "grad": int(info.get("grad_offset", 0)),
+                    "exp_avg": int(info.get("exp_avg_offset", 0)),
+                    "exp_avg_sq": int(info.get("exp_avg_sq_offset", 0)),
+                }
+                sizes = {
+                    "param": int(info.get("param_size", 0)),
+                    "grad": int(info.get("grad_size", 0)),
+                    "exp_avg": int(info.get("exp_avg_size", 0)),
+                    "exp_avg_sq": int(info.get("exp_avg_sq_size", 0)),
+                }
+                for stream in stream_names:
+                    if stream_start[stream] is None:
+                        stream_start[stream] = offsets[stream]
+                        stream_end[stream] = offsets[stream] + sizes[stream]
+                    else:
+                        stream_start[stream] = min(stream_start[stream], offsets[stream])
+                        stream_end[stream] = max(stream_end[stream], offsets[stream] + sizes[stream])
+
+                params.append({
+                    "name": name,
+                    "numel": int(info.get("param_size", 0)),
+                    "offsets": offsets,
+                    "sizes": sizes,
+                })
+
+            stream_slices = {}
+            for stream in stream_names:
+                if stream_start[stream] is None:
+                    stream_slices[stream] = {"offset": 0, "size": 0}
+                else:
+                    stream_slices[stream] = {
+                        "offset": int(stream_start[stream]),
+                        "size": int(stream_end[stream] - stream_start[stream]),
+                    }
+
+            # 计算每个参数在 chunk 内的 offset
+            for param in params:
+                param["offsets_in_chunk"] = {
+                    stream: param["offsets"][stream] - stream_slices[stream]["offset"]
+                    for stream in stream_names
+                }
+
+            chunks[str(group_idx)] = {
+                "group_idx": int(group_idx),
+                "layer_ids": [int(i) for i in layer_ids],
+                "params": params,
+                "stream_slices": stream_slices,
+            }
+
+        # optimizer metadata
+        param_name_to_param = {}
+        if hasattr(self, "_pending_model") and self._pending_model is not None:
+            param_name_to_param = {name: p for name, p in self._pending_model.named_parameters()}
+        optimizer_param_groups = self._serialize_optimizer_param_groups(optimizer, param_name_to_param) if optimizer else None
+        optimizer_steps = self._serialize_optimizer_steps(optimizer, param_name_to_param) if optimizer else None
+
+        checkpoint_file = self.filename
+        if isinstance(checkpoint_file, (bytes, bytearray)):
+            try:
+                checkpoint_file = checkpoint_file.decode("utf-8")
+            except Exception:
+                checkpoint_file = None
+
+        metadata = {
+            "format": "multistream",
+            "version": 1,
+            "dtype": "float32",
+            "checkpoint_file": checkpoint_file,
+            "max_async": int(self.max_async),
+            "num_streams": int(self.num_streams),
+            "stream_names": stream_names,
+            "stream_sizes": [int(x) for x in stream_sizes],
+            "total_checkpoint_size": int(total_checkpoint_size),
+            "checkpoint_padding_bytes": int(checkpoint_padding_bytes),
+            "checkpoint_stride_floats": int(checkpoint_stride_floats),
+            "num_chunks": len(chunks),
+            "chunks": chunks,
+            "param_map": param_map,
+        }
+
+        if optimizer_param_groups is not None:
+            metadata["optimizer_param_groups"] = optimizer_param_groups
+        if optimizer_steps is not None:
+            metadata["optimizer_steps"] = optimizer_steps
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        print(f"✓ Multistream metadata exported to {output_path}")
+        return output_path
+
+    def _update_latest_parall_iter(self, parall_iter: int) -> None:
+        """
+        更新 metadata 文件中的 latest_parall_iter 字段。
+        
+        在 checkpoint 成功落盘后调用，记录最新可用的检查点槽位，
+        供加载时直接读取，避免调用 C++ 的 get_latest_parall_iter。
+        """
+        if not self.metadata_path or not os.path.exists(self.metadata_path):
+            return
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            metadata["latest_parall_iter"] = int(parall_iter)
+            with open(self.metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARN] Failed to update latest_parall_iter in metadata: {e}")
     
     def save_layer_group(self, layer_group_ids, parall_iter, group_idx, sync_event=None):
         """
@@ -801,55 +976,10 @@ class MultiStreamCheckpoint:
             stream_index = parall_iter % (self._max_async + 1)
             current_stream = self.cuda_streams[stream_index][stream_id]
 
-            # #############################################################################
-            # #region agent log
-            # Hypothesis H2: offset/size boundary mismatch (last chunks/layers overrun).
-            # Hypothesis H4: writer/chunk lifecycle races surface near the last checkpoints.
-            _pccheck_log(
-                "H2",
-                "multistream_checkpoint.py:_save_stream_for_layers:entry",
-                "enter _save_stream_for_layers",
-                {
-                    "stream_id": stream_id,
-                    "param_type": param_type,
-                    "parall_iter": parall_iter,
-                    "stream_index": stream_index,
-                    "group_idx": group_idx,
-                    "layer_start": layer_group_ids[0] if layer_group_ids else None,
-                    "layer_end": layer_group_ids[-1] if layer_group_ids else None,
-                    "num_layers_in_group": len(layer_group_ids),
-                    "chunk_size_floats": int(self.chunk_size),
-                    "stream_size_floats": int(self.stream_sizes[stream_id]) if hasattr(self, "stream_sizes") else None,
-                    "py_thread": threading.get_ident(),
-                },
-            )
-            # #endregion
-            # #############################################################################
-            
             with torch.cuda.stream(current_stream):
                 # 等待默认流上的参数更新完成
                 if sync_event is not None:
                     sync_event.wait(current_stream)
-                
-                # #############################################################################
-                # #region agent log
-                # Hypothesis H5: unexpected autograd tracking in checkpoint copy path.
-                if layer_group_ids and layer_group_ids[0] == 0 and stream_id == 0:
-                    _pccheck_log(
-                        "H5",
-                        "multistream_checkpoint.py:_save_stream_for_layers:grad_mode",
-                        "grad mode + requires_grad snapshot",
-                        {
-                            "grad_enabled": bool(torch.is_grad_enabled()),
-                            "gpu_ar_requires_grad": bool(getattr(self.gpu_ar, "requires_grad", False)),
-                            "gpu_ar_is_cuda": bool(getattr(self.gpu_ar, "is_cuda", False)),
-                            "parall_iter": parall_iter,
-                            "group_idx": group_idx,
-                            "py_thread": threading.get_ident(),
-                        },
-                    )
-                # #endregion
-                # #############################################################################
                 
                 # 计算该组在当前流中的偏移
                 offset_in_stream = 0
@@ -879,30 +1009,6 @@ class MultiStreamCheckpoint:
                         copy_done_event.record(current_stream)
                     return
 
-                # #############################################################################
-                # #region agent log
-                # Boundary check evidence for H2.
-                _pccheck_log(
-                    "H2",
-                    "multistream_checkpoint.py:_save_stream_for_layers:bounds",
-                    "computed stream bounds",
-                    {
-                        "stream_id": stream_id,
-                        "param_type": param_type,
-                        "parall_iter": parall_iter,
-                        "group_idx": group_idx,
-                        "offset_in_stream": int(offset_in_stream),
-                        "total_elements": int(total_elements),
-                        "offset_plus_total": int(offset_in_stream + total_elements),
-                        "stream_size_floats": int(self.stream_sizes[stream_id]),
-                        "gpu_ar_len": int(len(self.gpu_ar)) if self.gpu_ar is not None else None,
-                        "layers_to_process_len": int(len(layers_to_process)),
-                        "py_thread": threading.get_ident(),
-                    },
-                )
-                # #endregion
-                # #############################################################################
-
                 # ========== 阶段2：异步写入 SSD ==========
                 # ✅ 供“按 chunk 流式提交”使用：避免 pinned chunk 池不足导致 borrow_chunk 阻塞/死锁（H6）
                 def ssd_write_task(chunks, stream_id, offset_in_stream, parall_iter, num_threads, writer):
@@ -914,30 +1020,6 @@ class MultiStreamCheckpoint:
                             total_chunk_elems = 0
                         for chunk_ptr, chunk_size, offset in chunks:
                             float_ptr = cast(chunk_ptr, POINTER(c_float))
-
-                            # #############################################################################
-                            # #region agent log
-                            # Hypothesis H1/H2: pointer lifecycle and write-range correlation.
-                            is_sample = (offset == 0) or (total_chunk_elems and (offset + chunk_size == total_chunk_elems))
-                            if is_sample:
-                                _pccheck_log(
-                                    "H2",
-                                    "multistream_checkpoint.py:ssd_write_task:write_stream_chunk",
-                                    "ssd write_stream_chunk sample",
-                                    {
-                                        "stream_id": stream_id,
-                                        "parall_iter": parall_iter,
-                                        "offset_in_stream": int(offset_in_stream),
-                                        "offset": int(offset),
-                                        "chunk_size": int(chunk_size),
-                                        "write_offset": int(offset_in_stream + offset),
-                                        "chunk_ptr": int(chunk_ptr),
-                                        "py_thread": threading.get_ident(),
-                                    },
-                                )
-                            # #endregion
-                            # #############################################################################
-
                             writer.write_stream_chunk(
                                 stream_id,
                                 float_ptr,
@@ -952,72 +1034,15 @@ class MultiStreamCheckpoint:
                         traceback.print_exc()
                     finally:
                         for chunk_ptr, _, _ in chunks:
-                            # #############################################################################
-                            # #region agent log
-                            # Hypothesis H1: double-return / return without borrow.
-                            with self._borrowed_chunks_lock:
-                                if int(chunk_ptr) not in self._borrowed_chunks:
-                                    _pccheck_log(
-                                        "H1",
-                                        "multistream_checkpoint.py:ssd_write_task:return_chunk",
-                                        "double-return or return-without-borrow detected",
-                                        {
-                                            "chunk_ptr": int(chunk_ptr),
-                                            "stream_id": stream_id,
-                                            "parall_iter": parall_iter,
-                                            "py_thread": threading.get_ident(),
-                                        },
-                                    )
-                                else:
-                                    self._borrowed_chunks.remove(int(chunk_ptr))
-                            # #endregion
-                            # #############################################################################
                             writer.return_chunk(chunk_ptr)
-
-                        # #############################################################################
-                        # #region agent log
-                        # Hypothesis H3: observe SSD task completion vs. finalize/shutdown.
                         with self._inflight_ssd_lock:
                             self._inflight_ssd_tasks -= 1
                             inflight_after = int(self._inflight_ssd_tasks)
-                        _pccheck_log(
-                            "H3",
-                            "multistream_checkpoint.py:ssd_write_task:done",
-                            "ssd_write_task finished",
-                            {
-                                "stream_id": stream_id,
-                                "parall_iter": parall_iter,
-                                "group_idx": group_idx,
-                                "chunks": int(len(chunks)),
-                                "inflight_after": inflight_after,
-                                "py_thread": threading.get_ident(),
-                            },
-                        )
-                        # #endregion
-                        # #############################################################################
 
                 def _submit_ssd(chunks):
-                    # #############################################################################
-                    # #region agent log
                     with self._inflight_ssd_lock:
                         self._inflight_ssd_tasks += 1
                         inflight_before_submit = int(self._inflight_ssd_tasks)
-                    _pccheck_log(
-                        "H3",
-                        "multistream_checkpoint.py:_save_stream_for_layers:ssd_submit",
-                        "submit ssd_write_task",
-                        {
-                            "stream_id": stream_id,
-                            "param_type": param_type,
-                            "parall_iter": parall_iter,
-                            "group_idx": group_idx,
-                            "chunks": int(len(chunks)),
-                            "inflight_after_submit": inflight_before_submit,
-                            "py_thread": threading.get_ident(),
-                        },
-                    )
-                    # #endregion
-                    # #############################################################################
                     fut = self.writer._submit_with_affinity(
                         self.ssd_thread_pool,
                         ssd_write_task,
@@ -1029,23 +1054,6 @@ class MultiStreamCheckpoint:
                         self.writer,
                     )
                     self._register_layer_group_futures(parall_iter, [fut])
-                    # #############################################################################
-                    # #region agent log
-                    _pccheck_log(
-                        "H3",
-                        "multistream_checkpoint.py:_save_stream_for_layers:ssd_future_registered",
-                        "registered ssd future into slot futures",
-                        {
-                            "stream_id": stream_id,
-                            "param_type": param_type,
-                            "parall_iter": parall_iter,
-                            "group_idx": group_idx,
-                            "chunks": int(len(chunks)),
-                            "py_thread": threading.get_ident(),
-                        },
-                    )
-                    # #endregion
-                    # #############################################################################
 
                 # ========== 阶段1：GPU→CPU 拷贝（按 chunk 流式提交 SSD 写入） ==========
                 current_offset = 0
@@ -1055,70 +1063,10 @@ class MultiStreamCheckpoint:
                 while current_offset < total_elements:
                     elements_to_process = min(self.chunk_size, total_elements - current_offset)
 
-                    # #############################################################################
-                    # #region agent log
-                    # Hypothesis H6: borrow_chunk may block if chunk pool is too small.
-                    _pccheck_log(
-                        "H6",
-                        "multistream_checkpoint.py:_save_stream_for_layers:borrow_attempt",
-                        "attempt borrow_chunk",
-                        {
-                            "stream_id": stream_id,
-                            "param_type": param_type,
-                            "parall_iter": parall_iter,
-                            "group_idx": group_idx,
-                            "current_offset": int(current_offset),
-                            "elements_to_process": int(elements_to_process),
-                            "py_thread": threading.get_ident(),
-                        },
-                    )
-                    # #endregion
-                    # #############################################################################
-
                     chunk_ptr = self.writer.borrow_chunk()
+                    
                     if chunk_ptr is None or chunk_ptr == 0:
                         raise RuntimeError(f"borrow_chunk() returned invalid pointer: {chunk_ptr}")
-
-                    # #############################################################################
-                    # #region agent log
-                    is_sample = (current_offset == 0) or (current_offset + elements_to_process == total_elements)
-                    if is_sample:
-                        _pccheck_log(
-                            "H1",
-                            "multistream_checkpoint.py:_save_stream_for_layers:borrow_chunk",
-                            "borrow_chunk sample",
-                            {
-                                "stream_id": stream_id,
-                                "param_type": param_type,
-                                "parall_iter": parall_iter,
-                                "group_idx": group_idx,
-                                "chunk_ptr": int(chunk_ptr),
-                                "elements_to_process": int(elements_to_process),
-                                "current_offset": int(current_offset),
-                                "total_elements": int(total_elements),
-                                "py_thread": threading.get_ident(),
-                            },
-                        )
-                    with self._borrowed_chunks_lock:
-                        if int(chunk_ptr) in self._borrowed_chunks:
-                            _pccheck_log(
-                                "H1",
-                                "multistream_checkpoint.py:_save_stream_for_layers:double_borrow",
-                                "double-borrow detected (same chunk_ptr already borrowed)",
-                                {
-                                    "chunk_ptr": int(chunk_ptr),
-                                    "stream_id": stream_id,
-                                    "param_type": param_type,
-                                    "parall_iter": parall_iter,
-                                    "group_idx": group_idx,
-                                    "current_offset": int(current_offset),
-                                    "elements_to_process": int(elements_to_process),
-                                    "py_thread": threading.get_ident(),
-                                },
-                            )
-                        self._borrowed_chunks.add(int(chunk_ptr))
-                    # #endregion
-                    # #############################################################################
 
                     chunk_array = np.ctypeslib.as_array((ctypes.c_float * self.chunk_size).from_address(chunk_ptr))
                     # ✅ 修复段错误：使用 detach() 彻底断开 autograd 图
@@ -1204,6 +1152,12 @@ class MultiStreamCheckpoint:
         self._pending_optimizer = optimizer
         self._pending_model = model
         self._pending_param_list = param_list
+
+        if self.metadata_path:
+            try:
+                self.export_metadata(self.metadata_path, optimizer=optimizer)
+            except Exception as e:
+                print(f"[WARN] export_metadata failed in create_optimizer: {e}")
         
         # 返回一个包装器，支持在begin_checkpoint后获取实际的MultiStreamOptimizer
         class OptimizerWrapper:
@@ -1261,9 +1215,9 @@ class MultiStreamCheckpoint:
                     prev_events = prev_checkpoint_events.get(group_idx)
                     
                     if prev_events is not None:
-                        # 优化：使用 CUDA stream wait 替代 CPU synchronize (问题1)
+                        # 优化：使用 CUDA stream wait 替代 CPU synchronize
                         # 让当前 GPU 流等待，而不是阻塞 CPU
-                        # 选项1：只等待param流（当前实现，性能最优但有小概率风险）
+                        # 只等待param流（性能最优）
                         torch.cuda.current_stream().wait_event(prev_events[0])
                         
                         # 选项2：等待param + exp_avg + exp_avg_sq（更安全，慢25%）
@@ -1501,27 +1455,9 @@ class MultiStreamCheckpoint:
             futures = slot_info['futures']
             start_time = slot_info['start_time']
 
-        # #############################################################################
-        # #region agent log
-        # Hypothesis H3: finalize called while SSD tasks are still running.
         with self._inflight_ssd_lock:
             inflight_ssd = int(self._inflight_ssd_tasks)
-        _pccheck_log(
-            "H3",
-            "multistream_checkpoint.py:finalize_checkpoint:entry",
-            "enter finalize_checkpoint",
-            {
-                "parall_iter": parall_iter,
-                "wait": bool(wait),
-                "num_copy_futures": int(len(futures)),
-                "inflight_ssd_tasks": inflight_ssd,
-                "active_slots": int(len(self._checkpoint_slots)),
-                "py_thread": threading.get_ident(),
-            },
-        )
-        # #endregion
-        # #############################################################################
-        
+            
         if wait:
             # 同步模式：等待所有保存完成
             # 等待所有异步保存任务完成
@@ -1548,8 +1484,8 @@ class MultiStreamCheckpoint:
             print(f"  Throughput: {throughput:.2f} GB/s")
             print(f"{'='*60}\n")
             
-            # ✅ 内存优化：归还DRAM槽位
-            # self.writer.return_cpu_slot(parall_iter) # Deprecated
+            # ✅ 更新 metadata 中的 latest_parall_iter
+            self._update_latest_parall_iter(parall_iter)
             
             # ✅ 修复：释放槽位
             with self._slot_lock:
@@ -1560,13 +1496,16 @@ class MultiStreamCheckpoint:
         else:
             # 异步模式：立即返回，后台继续保存
             def async_finalize():
-                try:
-                    # 等待所有异步保存任务完成
+                try:  
+                    # 等待所有异步保存任务完成（GPU→CPU拷贝）
                     for future in futures:
                         future.result()
                     
                     # 同步所有流到磁盘
+                    sync_streams_start = time.time()
                     self.writer.sync_all_streams(parall_iter)
+                    
+                    sync_streams_time = time.time() - sync_streams_start
                     
                     total_time = time.time() - start_time
                     throughput = (self.total_size * 4 / 1e9) / total_time
@@ -1575,14 +1514,14 @@ class MultiStreamCheckpoint:
                     
                     print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
                     
+                    # ✅ 更新 metadata 中的 latest_parall_iter
+                    self._update_latest_parall_iter(parall_iter)
+                    
                     # 调用IO统计回调
                     if self.io_callback is not None:
                         self.io_callback(total_time, throughput)
                     
-                    # ✅ 内存优化：归还DRAM槽位（在后台任务完成后）
-                    # self.writer.return_cpu_slot(parall_iter) # Deprecated
-                    
-                    # ✅ 修复：释放槽位（在后台任务完成后）
+                    # ✅ 修复：释放槽位（sync_all_streams完成后）
                     with self._slot_lock:
                         if parall_iter in self._checkpoint_slots:
                             del self._checkpoint_slots[parall_iter]
@@ -1590,12 +1529,9 @@ class MultiStreamCheckpoint:
                     print(f"✗ Background checkpoint {parall_iter} failed: {e}")
                     import traceback
                     traceback.print_exc()
-                    # ✅ 内存优化：即使失败也要归还DRAM槽位
-                    self.writer.return_cpu_slot(parall_iter)
-                    # 即使失败也要释放槽位
+                    # ✅ 修复：即使失败也要确保槽位被释放
                     with self._slot_lock:
-                        if parall_iter in self._checkpoint_slots:
-                            del self._checkpoint_slots[parall_iter]
+                        self._checkpoint_slots.pop(parall_iter, None)
             
             # 提交到线程池
             self.thread_pool.submit(async_finalize)
@@ -1613,15 +1549,23 @@ class MultiStreamCheckpoint:
         - 让 benchmark 的时间统计包含尾部异步写入/flush，避免吞吐被高估或出现非单调异常。
         - 避免后台线程池继续占用 CPU/SSD 带宽，干扰后续 step 或后续实验。
         """
-        # 快照当前活跃槽位，逐个同步 finalize。
+        print("Draining multistream checkpoint: waiting for all background tasks...")
+        
+        # 等待所有SSD写入任务完成
+        max_wait_time = 60
+        wait_start = time.time()
+        
         while True:
-            with self._slot_lock:
-                active = list(self._checkpoint_slots.keys())
-            if not active:
-                return
-            for parall_iter in active:
-                # finalize_checkpoint(wait=True) 内部会在完成后释放槽位。
-                self.finalize_checkpoint(parall_iter, wait=True)
+            with self._inflight_ssd_lock:
+                inflight = self._inflight_ssd_tasks
+            
+            if inflight == 0:
+                print(f"✓ All background tasks completed")
+                break
+            
+            if time.time() - wait_start > max_wait_time:
+                print(f"⚠ Warning: drain timeout after {max_wait_time}s, {inflight} tasks still running")
+                break
     
     def shutdown(self):
         """关闭线程池，释放资源"""

@@ -1,5 +1,92 @@
 import torch
+import os
+import re
+from os.path import isfile
 from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock
+
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+
+def natural_keys(text):
+    """
+    Sort helper for natural sorting of checkpoint filenames.
+    Based on CheckFreq source code (cf_manager.py).
+    """
+    return [atoi(c) for c in re.split(r'(\d+)', text)]
+
+
+def get_latest_checkpoint(chk_dir, checkpoint_format="./checkpoint-{epoch}-{it}.chk"):
+    """
+    Finds the latest checkpoint file in the given directory.
+    Based on CheckFreq source code (CFManager.get_latest_checkpoint and initalize_chk_dir).
+    
+    Args:
+        chk_dir: Directory to search for checkpoint files.
+        checkpoint_format: The checkpoint filename format pattern.
+    
+    Returns:
+        Full path to the latest checkpoint file, or None if no checkpoint found.
+    """
+    if not os.path.exists(chk_dir):
+        print("Checkpoint directory {} does not exist.".format(chk_dir))
+        return None
+
+    # Get list of all .chk files in the directory
+    chk_files = [f for f in os.listdir(chk_dir) if f.endswith('.chk') and isfile(os.path.join(chk_dir, f))]
+
+    if len(chk_files) == 0:
+        print("No checkpoint files found in {}".format(chk_dir))
+        return None
+
+    # Sort by natural order to get the latest checkpoint
+    chk_files.sort(key=natural_keys)
+
+    latest_chk = chk_files[-1]
+    filepath = os.path.join(chk_dir, latest_chk)
+    print("Latest checkpoint found: {}".format(filepath))
+    return filepath
+
+
+def restore_checkpoint(
+    chk,
+    chk_dir="./",
+    checkpoint_path=None,
+    checkpoint_format="./checkpoint-{epoch}-{it}.chk",
+    gpu=0,
+):
+    """
+    Restores the latest checkpoint, based on CheckFreq source code
+    (CFManager.restore and CFCheckpoint._restore).
+
+    Args:
+        chk: An instance of CFCheckpoint that tracks model/optimizer state.
+        chk_dir: Directory containing checkpoint files.
+        checkpoint_path: If provided, restore from this specific path instead of
+                         searching for the latest. 
+        checkpoint_format: The checkpoint filename format pattern.
+        gpu: GPU device ID for loading the checkpoint.
+
+    Returns:
+        A dict of extra state (epoch, iter, etc.) that was saved alongside 
+        the tracked objects, or None if no checkpoint was found/restored.
+    """
+    if checkpoint_path is None:
+        # Search for the latest checkpoint in the directory
+        checkpoint_path = get_latest_checkpoint(chk_dir, checkpoint_format)
+
+    if checkpoint_path is None:
+        print("No checkpoint to restore from.")
+        return None
+
+    if not os.path.isfile(checkpoint_path):
+        print("Checkpoint file {} does not exist.".format(checkpoint_path))
+        return None
+
+    print("Restoring checkpoint from: {}".format(checkpoint_path))
+    extra_state = chk._restore(filepath=checkpoint_path, gpu=gpu)
+    return extra_state
 
 
 def save_checkpoint(

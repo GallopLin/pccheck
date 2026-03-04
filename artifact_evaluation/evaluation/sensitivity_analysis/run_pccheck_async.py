@@ -9,10 +9,10 @@ lib_path = f"{home_dir}/data/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
 script_dir = f"{home_dir}/code/pccheck/checkpoint_eval/models/vision/"
 lib_path_stream = f"{home_dir}/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
 
-iters = 200
+iters = 300
 model = "vgg16"
 batchsize = 32
-num_threads = 1
+num_threads = 8
 
 cfreqs = [0, 1, 5, 10, 15, 20, 25, 30]
 max_async = [1, 2, 4, 6, 8]
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     
     if args_main.mode == "all":
         # Run both PCCheck and Multistream
-        run()
+        # run()
         run_multistream()
         # Collect results
         pccheck_data = collect()

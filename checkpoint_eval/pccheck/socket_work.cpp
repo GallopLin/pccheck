@@ -18,9 +18,9 @@ void setup_rank0_socket(const int port, int* server_fd, struct sockaddr_in* addr
     // Wait for all nodes to connect
     for (int i=0; i<N; i++) {
         printf("Get new connection for node %d\n", i);
-        int new_socket = accept(*server_fd, (struct sockaddr *)address, (socklen_t *)&addrlen);
+    int new_socket = accept(*server_fd, (struct sockaddr *)address, (socklen_t *)&addrlen);
         client_sockets.push_back(new_socket);
-        printf("Node %d connected!\n");
+    printf("Node %d connected!\n", i);
     }
 
 }
@@ -42,8 +42,9 @@ void setup_other_socket(int* sock, struct sockaddr_in* serv_addr, const std::str
 void wait_to_receive(std::vector<int>& client_sockets, int N) {
 
     for (auto sock: client_sockets) {
-        int* iter = (int*)malloc(sizeof(int));
-        read(sock, iter, 4);
+    int* iter = (int*)malloc(sizeof(int));
+    ssize_t r1 = read(sock, iter, 4);
+    (void)r1;
     }
 
     for (int sock : client_sockets) {
@@ -56,7 +57,8 @@ void wait_to_receive(std::vector<int>& client_sockets, int N) {
 void send_and_wait(int* socket, int counter) {
     send(*socket, &counter, 4, 0);
     int* val = (int*)malloc(sizeof(int));
-    read(*socket, val, 4);
+    ssize_t r2 = read(*socket, val, 4);
+    (void)r2;
 }
 
 void close_rank0_socket(std::vector<int>& client_sockets, int* server_fd) {

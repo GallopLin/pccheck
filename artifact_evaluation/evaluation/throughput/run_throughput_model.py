@@ -16,14 +16,15 @@ QUICK_CFREQS = [0, 1, 10, 25, 50, 100]  # Reduced set for quick testing
 model_scripts_dir = {
     "transformer": f"{home_dir}/code/DeepLearningExamples/PyTorch/LanguageModeling/Transformer-XL/pytorch",
     "bert": f"{home_dir}/code/DeepLearningExamples/PyTorch/LanguageModeling/BERT",
-    "opt13": f"{home_dir}/code/transformers/examples/pytorch/language-modeling"
+    "opt13": f"{home_dir}/code/transformers/examples/pytorch/language-modeling",
+    "opt27": f"{home_dir}/code/transformers/examples/pytorch/language-modeling"
 }
 
 # Default iterations
-DEFAULT_ITERS = {"opt13": 200, "transformer": 300, "bert": 300}
-QUICK_ITERS = {"opt13": 100, "transformer": 150, "bert": 150}  # Reduced for quick testing
+DEFAULT_ITERS = {"opt13": 300, "transformer": 350, "bert": 350, "opt27": 300}
+QUICK_ITERS = {"opt13": 300, "transformer": 350, "bert": 350, "opt27": 300} # Reduced for quick testing (still needs warmup=50)
 
-batch_size_dir = {"opt13": 1, "transformer": 64, "bert": 3}
+batch_size_dir = {"opt13": 1, "transformer": 64, "bert": 3, "opt27": 1}
 
 label_dict = {
     "cfreq": "CheckFreq",
@@ -32,7 +33,10 @@ label_dict = {
     "multistream": "Multistream"
 }
 
-WARMUP = 3 # iterations
+WARMUP = 50 # iterations - 大模型(OPT-2.7B)需要~50步让CUDA内存分配器和set_storage的瞬态开销稳定
+# 注意：训练脚本中的 warmup 也必须与此值一致！
+# 小模型(BERT/Transformer-XL)不需要这么多 warmup，但统一使用 50 简化逻辑，
+# 相应地增加了它们的总迭代数(300→350)以保持足够的有效迭代。
 
 # Global variables set by parse_args
 cfreqs = DEFAULT_CFREQS
@@ -84,6 +88,60 @@ def run_opt():
 
 
 
+def run_opt27():
+    """Run OPT-2.7B benchmarks for all checkpoint methods.
+    
+    OPT-2.7B (facebook/opt-2.7b) has 32 transformer layers, ~2.7B parameters.
+    Checkpoint size ~30GB (with optimizer states in FP32).
+    Compared to OPT-1.3B:
+      - 32 layers vs 24 layers
+      - ~2x checkpoint size
+      - num_layer_groups=8 (32 layers / 4 layers per group)
+      - max_async=2, psize=8 (larger bucket for bigger model)
+    """
+    global methods_to_run
+    os.makedirs("opt27", exist_ok=True)
+    script_dir = model_scripts_dir[model]
+    batch_size = batch_size_dir[model]
+    iters = iters_dir[model]
+
+    # run cfreq
+    if methods_to_run is None or "cfreq" in methods_to_run:
+        print("Run for CheckFreq")
+        for cf in cfreqs:
+            os.system("rm -rf output")
+            print(f"Checkpoint Frequency {cf}")
+            proc = f"python3.9 {script_dir}/run_clm_cfreq.py --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 --do_train --per_device_train_batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} > opt27/log_opt27_cfreq_{cf}.txt"
+            os.system(proc)
+
+    # run GPM
+    if methods_to_run is None or "gpm" in methods_to_run:
+        print("Run for GPM")
+        for cf in cfreqs:
+            os.system("rm -rf output")
+            print(f"Checkpoint Frequency {cf}")
+            proc = f"python3.9 {script_dir}/run_clm_gpm.py --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 --do_train --per_device_train_batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} > opt27/log_opt27_gpm_{cf}.txt"
+            os.system(proc)
+
+    # run PCcheck
+    if methods_to_run is None or "pccheck" in methods_to_run:
+        print("Run for PCcheck")
+        for cf in cfreqs:
+            os.system("rm -rf output")
+            print(f"Checkpoint Frequency {cf}")
+            proc = f"python3.9 {script_dir}/run_clm_pccheck.py --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 --do_train --max_async 2 --num_threads 2 --psize 8 --per_device_train_batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} > opt27/log_opt27_pccheck_{cf}.txt"
+            os.system(proc)
+
+    # run Multistream PCcheck
+    if methods_to_run is None or "multistream" in methods_to_run:
+        print("Run for Multistream PCcheck")
+        for cf in cfreqs:
+            os.system("rm -rf output")
+            print(f"Checkpoint Frequency {cf}")
+            proc = f"python3.9 {script_dir}/run_clm_multistream.py --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 --do_train --max_async 2 --num_threads 2 --num_layer_groups 8 --per_device_train_batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path_stream} > opt27/log_opt27_multistream_{cf}.txt 2>&1"
+            os.system(proc)
+
+
 def run_transformer():
     global methods_to_run
     os.makedirs("transformer", exist_ok=True)
@@ -121,7 +179,7 @@ def run_transformer():
         print("Run for Multistream PCCheck")
         for cf in cfreqs:
             print(f"Checkpoint Frequency {cf}")
-            proc = f"cd {script_dir} && python3.9 train_multistream.py --config_file wt103_base.yaml --batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} --max_async 4 --num_threads 2 --num_layer_groups 6 --c_lib_path {lib_path_stream} > {this_dir}/transformer/log_transformer_multistream_{cf}.txt 2>&1"
+            proc = f"cd {script_dir} && python3.9 train_multistream.py --config_file wt103_base.yaml --batch_size {batch_size} --cfreq {cf} --bench_total_steps {iters} --max_async 4 --num_threads 2 --num_layer_groups 2 --c_lib_path {lib_path_stream} > {this_dir}/transformer/log_transformer_multistream_{cf}.txt 2>&1"
             os.system(proc)
 
 
@@ -171,14 +229,17 @@ def run(model):
         run_bert()
     elif model == "opt13":
         run_opt()
+    elif model == "opt27":
+        run_opt27()
     else:
         raise NotImplementedError
 
 
 def collect_model(model):
     def get_exec_throughput(input_file, baseline):
-        exec_time  = 0.0
+        exec_time = 0.0
         extra_time = 0.0
+        iter_count = None
         try:
             with open(input_file, 'r') as f:
                 for line in f.readlines():
@@ -187,13 +248,28 @@ def collect_model(model):
                         exec_time = float(tokens[-2])
                     elif 'MMAP/UMAP' in line:
                         tokens = line.split(" ")
-                        extra_time = float(tokens[-2])/1000 # convert in sec
-            exec_time -= extra_time
-            # 统一口径：各 Trainer 的 EXECUTION TIME 现在从 warmup 结束后开始计时，
-            # 因此这里不再二次扣除 WARMUP。
-            if exec_time <= 0:
+                        extra_time = float(tokens[-2]) / 1000  # convert in sec
+                    elif 'Number of iterations' in line:
+                        # -- BENCHMARK ENDED: Total time: X sec, Number of iterations: Y, Number of checkpoints: Z
+                        try:
+                            iter_count = int(line.split('Number of iterations:')[-1].split(',')[0].strip())
+                        except Exception:
+                            pass
+            # Only subtract MMAP/UMAP time for non-GPM methods.
+            # For GPM, mmap/munmap is integral to its checkpoint mechanism
+            # (GPU writes directly to mmap'd persistent memory), so subtracting
+            # it would incorrectly remove checkpoint overhead from the measurement.
+            # Other methods (PCcheck, CheckFreq, Multistream) don't output this
+            # line, so extra_time is 0 for them anyway.
+            if baseline != "gpm":
+                exec_time -= extra_time
+            # EXECUTION TIME 从 warmup 结束后开始计时，因此需要从迭代次数中扣除 warmup。
+            effective_iters = iters_dir[model]
+            if iter_count is not None:
+                effective_iters = max(0, iter_count - WARMUP)
+            if exec_time <= 0 or effective_iters <= 0:
                 return 0.0
-            thr = iters_dir[model] / exec_time
+            thr = effective_iters / exec_time
             return thr
         except Exception as e:
             print(f"Warning: Failed to read {input_file}: {e}")
@@ -279,7 +355,7 @@ def plot_model(model, data):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run throughput benchmarks for checkpoint methods')
-    parser.add_argument('model', type=str, choices=['transformer', 'bert', 'opt13'],
+    parser.add_argument('model', type=str, choices=['transformer', 'bert', 'opt13', 'opt27'],
                         help='Model to benchmark')
     parser.add_argument('--quick', action='store_false',
                         help='Quick mode: fewer iterations (50) and fewer checkpoint frequencies [0, 10, 50]')
