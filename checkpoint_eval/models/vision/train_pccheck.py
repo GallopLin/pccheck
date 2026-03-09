@@ -74,7 +74,7 @@ def train():
     )
     model = model.to(local_rank)  # to GPU
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     metric_fn = torch.nn.CrossEntropyLoss().to(0)
 
     model.train()

@@ -86,7 +86,7 @@ def run(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
     # 初始化 gpu_ar（4 × model_size）
-    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True)
+    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True, separate_streams=True)
     
     # 设置存储映射
     set_storage(model, [optimizer], gpu_ar)

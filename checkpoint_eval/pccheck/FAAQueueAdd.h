@@ -123,8 +123,9 @@ private:
     static const int MAX_THREADS = 128;
     const int maxThreads;
 
-    T val = new float(0);
-    T *taken = new float *(val); // Muuuahahah !
+    float sentinel_val_ = 0.0f;
+    float *sentinel_ptr_ = &sentinel_val_;
+    T *taken = &sentinel_ptr_;
 
     // We need just one hazard pointer
     HazardPointers<Node> hp{1, maxThreads};
@@ -144,8 +145,7 @@ public:
     {
         while (dequeue(0) != nullptr)
             ;               // Drain the queue
-        delete head.load(); // Delete the last node
-        delete (float *)taken;
+        delete head.load();
     }
 
     std::string className() { return "FAAArrayQueue"; }

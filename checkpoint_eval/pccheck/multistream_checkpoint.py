@@ -149,7 +149,7 @@ class MultiStreamOptimizer:
             weight_decay=group.get('weight_decay', 0),
             eps=group['eps'],
             maximize=group.get('maximize', False),
-            foreach=False,  # 启用foreach优化
+            foreach=True,  # 启用foreach优化
             capturable=False,
             differentiable=False,
             fused=False,
@@ -207,7 +207,7 @@ class MultiStreamOptimizer:
             weight_decay=group.get('weight_decay', 0),
             eps=group['eps'],
             maximize=group.get('maximize', False),
-            foreach=False,  # 启用foreach优化
+            foreach=True,  # 启用foreach优化
             capturable=False,
             differentiable=False,
             fused=False,
@@ -508,16 +508,6 @@ class MultiStreamCheckpoint:
         metadata_path: Optional[str] = None,
     ):
         self.param_layout = param_layout
-        # ✅ 关键防护（针对 H5）：checkpoint 线程只应读取“无 autograd”的视图
-        # 在 transformer 场景下我们观察到 gpu_ar_requires_grad=True（见 debug.log H5），
-        # 这会让后台 slice/copy 路径构建 autograd Node（CopySlices/SliceBackward），
-        # 并在训练尾部的 Node 析构/free 阶段更容易触发随机段错。
-        # detach() 不会复制数据，只是生成共享存储的无梯度 Tensor 视图。
-        try:
-            self.gpu_ar = gpu_ar.detach()
-            self.gpu_ar.requires_grad_(False)
-        except Exception:
-            self.gpu_ar = gpu_ar
         self.total_size = total_size
         self.num_threads = num_threads
         self.lib_path = lib_path
@@ -532,6 +522,11 @@ class MultiStreamCheckpoint:
         
         # 计算每个流的大小
         self.stream_sizes = self._calculate_stream_sizes()
+
+        # gpu_ar 可以是单个 tensor（legacy）或 dict（四块独立分配）。
+        # 统一转为 self.gpu_buffers: List[Tensor]，长度 = num_streams。
+        self.gpu_buffers = self._make_gpu_buffers(gpu_ar)
+        self.gpu_ar = gpu_ar if not isinstance(gpu_ar, dict) else None
         print(f"\nMultiStreamCheckpoint Configuration:")
         print(f"  Total size: {total_size:,} floats ({total_size*4/1e9:.2f} GB)")
         print(f"  Num streams: {num_streams}")
@@ -647,6 +642,8 @@ class MultiStreamCheckpoint:
         self._checkpoint_slots = {}  # 当前活跃的检查点槽位
         self._slot_lock = Lock()  # 保护槽位操作的锁
         self._max_async = max_async
+        self._slot_available_event = threading.Event()  # 槽位释放通知
+        self._slot_available_event.set()  # 初始状态：有可用槽位
         
         # ✅ 跨检查点同步：记录每个层组的拷贝完成事件
         # _layer_copy_events[group_idx] = [event0, event1, event2, event3] (每个流一个事件)
@@ -691,6 +688,32 @@ class MultiStreamCheckpoint:
             sizes[2] += layer_info.get('exp_avg_size', 0)
             sizes[3] += layer_info.get('exp_avg_sq_size', 0)
         return sizes
+
+    @staticmethod
+    def _detach_buf(t):
+        """detach + 关闭 requires_grad，防止 autograd 节点泄漏。"""
+        if t is None:
+            return None
+        try:
+            b = t.detach()
+            b.requires_grad_(False)
+            return b
+        except Exception:
+            return t
+
+    def _make_gpu_buffers(self, gpu_ar):
+        """将 gpu_ar（tensor 或 dict）转换为 List[Tensor]，长度 = num_streams。"""
+        _KEYS = ['param', 'grad', 'exp_avg', 'exp_avg_sq']
+        if isinstance(gpu_ar, dict):
+            return [self._detach_buf(gpu_ar.get(k) or gpu_ar.get(i))
+                    for i, k in enumerate(_KEYS)]
+        # legacy: 使用 stream_sizes 精确拆分（兼容 total_size 不一致的场景）
+        offset = 0
+        buffers = []
+        for sz in self.stream_sizes:
+            buffers.append(self._detach_buf(gpu_ar[offset:offset + sz]))
+            offset += sz
+        return buffers
     
     def _create_layer_groups(self):
         """将层分成多组"""
@@ -999,7 +1022,8 @@ class MultiStreamCheckpoint:
                     gpu_offset = layer_info.get(f'{param_type}_offset', 0)
                     size = layer_info.get(f'{param_type}_size', 0)
                     
-                    if size > 0 and gpu_offset + size <= len(self.gpu_ar):
+                    gpu_buffer = self.gpu_buffers[stream_id]
+                    if size > 0 and gpu_buffer is not None and gpu_offset + size <= len(gpu_buffer):
                         layers_to_process.append((gpu_offset, size))
                         total_elements += size
                 
@@ -1093,8 +1117,7 @@ class MultiStreamCheckpoint:
                             to_copy = min(remaining_in_layer, needed)
 
                             src_start = gpu_offset + offset_in_current_layer
-                            # ✅ 修复：对 gpu_ar 的 slice 也要 detach()，防止 autograd 节点持有引用
-                            src_view = self.gpu_ar[src_start : src_start + to_copy].detach()
+                            src_view = self.gpu_buffers[stream_id][src_start : src_start + to_copy].detach()
                             dest_view = cpu_buffer_slice[dest_offset : dest_offset + to_copy]
                             dest_view.copy_(src_view, non_blocking=True)
 
@@ -1232,18 +1255,20 @@ class MultiStreamCheckpoint:
                 # 优化：使用专门的拷贝流，避免阻塞默认流 (问题6)
                 copy_stream = torch.cuda.Stream()
                 
-                # 检测是否启用了零拷贝（通过检查第一个参数是否在 gpu_ar 范围内）
-                # 如果使用了 pccheck_utils.set_storage，参数应该已经在 gpu_ar 上
+                # 检测零拷贝：第一个参数是否位于 gpu_buffers[0]（param buffer）内
                 is_zero_copy_enabled = False
-                if hasattr(self._checkpoint, '_pending_param_list') and self._checkpoint._pending_param_list and hasattr(self._checkpoint, 'gpu_ar') and self._checkpoint.gpu_ar is not None:
+                if (hasattr(self._checkpoint, '_pending_param_list')
+                        and self._checkpoint._pending_param_list
+                        and hasattr(self._checkpoint, 'gpu_buffers')
+                        and self._checkpoint.gpu_buffers
+                        and self._checkpoint.gpu_buffers[0] is not None):
                     first_param = self._checkpoint._pending_param_list[0]
-                    gpu_ar_ptr = self._checkpoint.gpu_ar.data_ptr()
-                    # 计算 gpu_ar 的字节范围
-                    gpu_ar_size_bytes = self._checkpoint.gpu_ar.numel() * self._checkpoint.gpu_ar.element_size()
-                    
-                    if first_param.data_ptr() >= gpu_ar_ptr and first_param.data_ptr() < gpu_ar_ptr + gpu_ar_size_bytes:
+                    buf = self._checkpoint.gpu_buffers[0]
+                    buf_ptr = buf.data_ptr()
+                    buf_end = buf_ptr + buf.numel() * buf.element_size()
+                    if buf_ptr <= first_param.data_ptr() < buf_end:
                         is_zero_copy_enabled = True
-                        print("  ✓ Zero-copy mode detected: skipping D2D copies in save_callback")
+                        print("  \u2713 Zero-copy mode detected: skipping D2D copies in save_callback")
 
                 # 创建回调函数，捕获parall_iter
                 def save_callback(group_idx, layer_ids):
@@ -1267,44 +1292,41 @@ class MultiStreamCheckpoint:
                             # 3. 这些节点持有对底层 storage 的引用
                             # 4. 在程序退出时 GC 清理这些节点会访问已失效的内存 → 段错误
                             with torch.no_grad():
-                                # Copy updated parameters to gpu_ar
+                                bufs = self._checkpoint.gpu_buffers
                                 for layer_id in layer_ids:
                                     if layer_id >= len(self._checkpoint.param_layout):
                                         continue
-                                    layer_info = self._checkpoint.param_layout[layer_id]
+                                    li = self._checkpoint.param_layout[layer_id]
                                     param = self._checkpoint._pending_param_list[layer_id]
-                                    
-                                    # Copy param - 使用 detach() 断开 autograd
-                                    start = layer_info["param_offset"]
-                                    size = layer_info["param_size"]
-                                    self._checkpoint.gpu_ar[start : start + size].copy_(param.detach().view(-1).float(), non_blocking=True)
-                                    
-                                    # Copy grad
-                                    grad_start = layer_info["grad_offset"]
-                                    grad_size = layer_info["grad_size"]
+
+                                    off = li["param_offset"]
+                                    sz = li["param_size"]
+                                    bufs[0][off : off + sz].copy_(param.detach().view(-1).float(), non_blocking=True)
+
+                                    goff = li["grad_offset"]
+                                    gsz = li["grad_size"]
                                     if param.grad is None:
-                                        self._checkpoint.gpu_ar[grad_start : grad_start + grad_size].zero_()
+                                        bufs[1][goff : goff + gsz].zero_()
                                     else:
-                                        self._checkpoint.gpu_ar[grad_start : grad_start + grad_size].copy_(param.grad.detach().view(-1).float(), non_blocking=True)
-                                        
-                                    # Copy optimizer states (exp_avg, exp_avg_sq)
+                                        bufs[1][goff : goff + gsz].copy_(param.grad.detach().view(-1).float(), non_blocking=True)
+
                                     state = self._real_optimizer.state.get(param, {})
-                                    exp_avg = state.get("exp_avg")
-                                    exp_avg_sq = state.get("exp_avg_sq")
-                                    
-                                    exp_avg_start = layer_info["exp_avg_offset"]
-                                    exp_avg_size = layer_info["exp_avg_size"]
-                                    if exp_avg is None:
-                                        self._checkpoint.gpu_ar[exp_avg_start : exp_avg_start + exp_avg_size].zero_()
+
+                                    ea = state.get("exp_avg")
+                                    ea_off = li["exp_avg_offset"]
+                                    ea_sz = li["exp_avg_size"]
+                                    if ea is None:
+                                        bufs[2][ea_off : ea_off + ea_sz].zero_()
                                     else:
-                                        self._checkpoint.gpu_ar[exp_avg_start : exp_avg_start + exp_avg_size].copy_(exp_avg.detach().view(-1).float(), non_blocking=True)
-                                        
-                                    exp_avg_sq_start = layer_info["exp_avg_sq_offset"]
-                                    exp_avg_sq_size = layer_info["exp_avg_sq_size"]
-                                    if exp_avg_sq is None:
-                                        self._checkpoint.gpu_ar[exp_avg_sq_start : exp_avg_sq_start + exp_avg_sq_size].zero_()
+                                        bufs[2][ea_off : ea_off + ea_sz].copy_(ea.detach().view(-1).float(), non_blocking=True)
+
+                                    eas = state.get("exp_avg_sq")
+                                    eas_off = li["exp_avg_sq_offset"]
+                                    eas_sz = li["exp_avg_sq_size"]
+                                    if eas is None:
+                                        bufs[3][eas_off : eas_off + eas_sz].zero_()
                                     else:
-                                        self._checkpoint.gpu_ar[exp_avg_sq_start : exp_avg_sq_start + exp_avg_sq_size].copy_(exp_avg_sq.detach().view(-1).float(), non_blocking=True)
+                                        bufs[3][eas_off : eas_off + eas_sz].copy_(eas.detach().view(-1).float(), non_blocking=True)
 
                             # ✅ 在拷贝流上记录事件，标记该层组的参数拷贝已完成
                             sync_event = torch.cuda.Event()
@@ -1408,15 +1430,17 @@ class MultiStreamCheckpoint:
         Returns:
             parall_iter: 检查点槽位ID，用于后续操作
         """
-        # ✅ 修复：等待直到有可用槽位（当并行数超过max_async时）
+        # ✅ 修复：使用 Event 等待可用槽位，避免 time.sleep 轮询
         while True:
+            self._slot_available_event.wait()  # 阻塞直到收到槽位释放通知
             with self._slot_lock:
                 if len(self._checkpoint_slots) < self._max_async:
                     # 有可用槽位，注册获取
                     parall_iter = self.writer.register()
+                    # 如果槽位已满，清除事件，让下次 begin_checkpoint 等待
+                    if len(self._checkpoint_slots) + 1 >= self._max_async:
+                        self._slot_available_event.clear()
                     break
-            # 没有可用槽位，等待一小段时间后重试
-            time.sleep(0.01)
         
         # ✅ 内存优化：不再预先借用巨大的pinned buffer
         # 改为在save_layer_group中按需借用小块buffer (chunk)
@@ -1491,6 +1515,7 @@ class MultiStreamCheckpoint:
             with self._slot_lock:
                 # 可能在 drain() 与后台 async finalize 并发时被其他线程抢先删除
                 self._checkpoint_slots.pop(parall_iter, None)
+            self._slot_available_event.set()  # 通知等待的 begin_checkpoint
             
             return total_time
         else:
@@ -1525,6 +1550,7 @@ class MultiStreamCheckpoint:
                     with self._slot_lock:
                         if parall_iter in self._checkpoint_slots:
                             del self._checkpoint_slots[parall_iter]
+                    self._slot_available_event.set()  # 通知等待的 begin_checkpoint
                 except Exception as e:
                     print(f"✗ Background checkpoint {parall_iter} failed: {e}")
                     import traceback
@@ -1532,6 +1558,7 @@ class MultiStreamCheckpoint:
                     # ✅ 修复：即使失败也要确保槽位被释放
                     with self._slot_lock:
                         self._checkpoint_slots.pop(parall_iter, None)
+                    self._slot_available_event.set()  # 通知等待的 begin_checkpoint
             
             # 提交到线程池
             self.thread_pool.submit(async_finalize)
@@ -1590,62 +1617,46 @@ class MultiStreamCheckpoint:
 
 def build_param_layout(model, optimizer):
     """
-    构建参数布局信息
-    
-    Args:
-        model: PyTorch模型
-        optimizer: 优化器（Adam）
-    
+    构建参数布局信息。
+
+    所有偏移均为局部偏移（0-based），即在每种数据类型的缓冲区内的偏移。
+    这使得布局可以同时兼容单块 gpu_ar 拆分的 4 个 view 和四块独立 tensor。
+
     Returns:
         List[Dict]: 每层的参数信息
     """
     layout = []
-    
-    # 计算总大小和偏移
     total_param_size = sum(p.numel() for p in model.parameters())
-    
-    # 根据gpu_ar的布局：[所有param] [所有grad] [所有exp_avg] [所有exp_avg_sq]
-    grad_base_offset = total_param_size
-    exp_avg_base_offset = total_param_size * 2
-    exp_avg_sq_base_offset = total_param_size * 3
-    
-    # 构建每层的布局
+
     layer_id = 0
-    current_param_offset = 0
-    current_grad_offset = grad_base_offset
-    current_exp_avg_offset = exp_avg_base_offset
-    current_exp_avg_sq_offset = exp_avg_sq_base_offset
-    
+    current_offset = 0
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-            
+
         size = param.numel()
-        
+
         layer_info = {
             'layer_id': layer_id,
             'name': name,
-            'param_offset': current_param_offset,
+            'param_offset': current_offset,
             'param_size': size,
-            'grad_offset': current_grad_offset,
+            'grad_offset': current_offset,
             'grad_size': size,
-            'exp_avg_offset': current_exp_avg_offset,
+            'exp_avg_offset': current_offset,
             'exp_avg_size': size,
-            'exp_avg_sq_offset': current_exp_avg_sq_offset,
+            'exp_avg_sq_offset': current_offset,
             'exp_avg_sq_size': size,
         }
-        
+
         layout.append(layer_info)
-        
-        current_param_offset += size
-        current_grad_offset += size
-        current_exp_avg_offset += size
-        current_exp_avg_sq_offset += size
+        current_offset += size
         layer_id += 1
-    
-    print(f"\nBuilt parameter layout:")
+
+    print(f"\nBuilt parameter layout (local offsets):")
     print(f"  Total layers: {len(layout)}")
     print(f"  Total parameters: {total_param_size:,} ({total_param_size*4/1e9:.2f} GB)")
     print(f"  Total size (4 copies): {total_param_size*4:,} ({total_param_size*16/1e9:.2f} GB)")
-    
+
     return layout

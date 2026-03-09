@@ -825,7 +825,7 @@ def train(
     ms_optimizer = None
 
     # Always run set_storage for fair comparison
-    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True)
+    gpu_ar, total_size = initialize(model, [optimizer], do_opt_step=True, separate_streams=True)
     print(f"----------------- total size is {total_size}")
     set_storage(model, [optimizer], gpu_ar)
     torch.cuda.empty_cache()

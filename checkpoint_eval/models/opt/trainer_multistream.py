@@ -2126,7 +2126,7 @@ class MultistreamTrainer:
         # ✅ 始终执行 set_storage 内存布局优化（无论 cfreq 是否为 0）
         # 理由同 PCcheck trainer：set_storage 是检查点机制的固有成本，
         # cfreq=0 也应执行以确保公平比较。
-        gpu_ar, total_size = initialize(model, [self.optimizer], do_opt_step=False)
+        gpu_ar, total_size = initialize(model, [self.optimizer], do_opt_step=False, separate_streams=True)
         print(f"----------------- total size is {total_size}")
         set_storage(model, [self.optimizer], gpu_ar)
         torch.cuda.empty_cache()

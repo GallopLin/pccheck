@@ -19,7 +19,9 @@ import torch.optim as optim
 
 # Import MultiStream checkpointing
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../pccheck'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 from multistream_checkpoint import MultiStreamCheckpoint, build_param_layout
+from pccheck_utils import initialize, set_storage
 
 home_dir = os.path.expanduser("~")
 
@@ -83,15 +85,13 @@ def train():
     ms_checkpoint = None
     
     if args.cfreq > 0:
+        # Initialize gpu_ar and map model/optimizer storage (zero-copy, same as pccheck)
+        gpu_ar, total_size = initialize(model, [base_optimizer])
+        set_storage(model, [base_optimizer], gpu_ar)
+        torch.cuda.empty_cache()
+
         # Build parameter layout
         param_layout = build_param_layout(model, base_optimizer)
-        
-        # Calculate total size
-        total_params = sum(p.numel() for p in model.parameters())
-        total_size = total_params * 4  # param + grad + exp_avg + exp_avg_sq
-        
-        # Allocate GPU array
-        gpu_ar = torch.zeros(total_size, dtype=torch.float32, device='cuda')
         
         # Create MultiStreamCheckpoint
         ms_checkpoint = MultiStreamCheckpoint(
@@ -172,17 +172,22 @@ def train():
         batch_idx += 1
         print(f"Step {batch_idx} took {time.time()-start_iter:.4f}s")
     
-    # Wait for all pending checkpoints and cleanup
-    if ms_checkpoint:
-        ms_checkpoint.shutdown()
-    
     end_train_time = time.time()
     total_train_time = end_train_time - start_train_time if start_train_time else 0
-    
+
     print(f"\n-- BENCHMARK ENDED: Total time: {total_train_time:.4f} sec, "
           f"Number of iterations: {batch_idx}, Number of checkpoints: {checkpoints}")
     print(f"EXECUTION TIME: {total_train_time} sec")
     print(f"THROUGHPUT IS {(args.bench_total_steps-warmup)/total_train_time if total_train_time > 0 else 0:.4f}")
+
+    # Wait for all pending checkpoints and cleanup
+    # NOTE: shutdown() is called AFTER printing results to ensure timing data is
+    # preserved even if the C library crashes during cleanup (known malloc issue).
+    if ms_checkpoint:
+        try:
+            ms_checkpoint.shutdown()
+        except Exception as e:
+            print(f"Warning: ms_checkpoint.shutdown() raised: {e}")
 
 
 if __name__ == "__main__":
