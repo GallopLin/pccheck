@@ -16,8 +16,11 @@ label_dict = {
     "cfreq": "CheckFreq",
     "gpm": "GPM",
     "pccheck": "PCcheck",
-    "gemini": "Gemini"
+    "gemini": "Gemini",
+    "multistream": "MultiStream",
 }
+
+ms_checkpoint_dir = f"{home_dir}/ms_checkpoints_bench"
 
 def create_files(ip1, ip2):
 
@@ -64,6 +67,13 @@ def run(ip1):
         proc = f"cd {script_dir} && deepspeed --num_gpus=1 --num_nodes 2 --hostfile hostfile --master_addr {ip1} --master_port 1234  run_clm_pp_pccheck.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-350m --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} --max_async 2 --num_threads 2"
         os.system(proc)
 
+    # # run multistream
+    print("Run for MultiStream")
+    for cf in cfreqs:
+        print(f"Checkpoint Frequency {cf}")
+        proc = f"cd {script_dir} && deepspeed --num_gpus=1 --num_nodes 2 --hostfile hostfile --master_addr {ip1} --master_port 1234  run_clm_pp_multistream.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-350m --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} --max_async 2 --num_threads 2 --checkpoint_dir {ms_checkpoint_dir} > {this_dir}/opt_27/log_opt27_multistream_{cf}.txt"
+        os.system(proc)
+
 
 def collect():
     def get_exec_throughput(input_file, baseline):
@@ -84,7 +94,7 @@ def collect():
     throughput_dict = {}
     throughput_list = []
 
-    for baseline in ["cfreq", "gpm", "gemini", "pccheck"]:
+    for baseline in ["cfreq", "gpm", "gemini", "pccheck", "multistream"]:
         baseline_thr = []
         for cf in cfreqs:
             input_file = f"opt_27/log_opt27_{baseline}_{cf}.txt"
@@ -95,17 +105,18 @@ def collect():
 
     print(throughput_list)
     column_header = [str(x) for x in cfreqs]
-    index_header = ["CheckFreq", "GPM", "Gemini", "PCcheck"]
+    index_header = ["CheckFreq", "GPM", "Gemini", "PCcheck", "MultiStream"]
     df = pd.DataFrame(throughput_list, columns = column_header, index = index_header)
     df.to_csv(f'fig8_opt27.csv')
     return throughput_dict
 
 
 def plot(data):
-    colors = [ '#18384F', '#4392B8', '#E27733','#A7B972']
+    colors = ['#18384F', '#4392B8', '#E27733', '#A7B972', '#C75B7A']
     label_font_size = 36
-    width = 0.2
-    fig, ax = plt.subplots(figsize=(14, 8))
+    num_methods = len(data)
+    width = 0.8 / max(num_methods, 1)
+    fig, ax = plt.subplots(figsize=(16, 8))
     x = np.arange(len(cfreqs[1:]))
     bars = []
 
@@ -114,15 +125,17 @@ def plot(data):
             x + width * method_id, method_data[1:], width,
             label=method_key,
             align='edge',
-            color=colors[method_id]
+            color=colors[method_id % len(colors)]
         )
         bars.append(bar)
 
     plt.yticks(fontsize=label_font_size)
 
-    ax.plot(x+2*width, [data["PCcheck"][0]]*len(x), color='black', marker="s",linewidth=3,markersize=8)
+    ax.plot(x + 2 * width, [data["PCcheck"][0]] * len(x), color='black', marker="s", linewidth=3, markersize=8, label="PCcheck (cfreq=10)")
+    if "MultiStream" in data:
+        ax.plot(x + 2 * width, [data["MultiStream"][0]] * len(x), color='#C75B7A', marker="^", linewidth=3, markersize=8, linestyle='--', label="MultiStream (cfreq=10)")
 
-    x_tick_positions = x + width * len(label_dict) / 2
+    x_tick_positions = x + width * num_methods / 2
     ax.set_xticks(
         ticks=x_tick_positions,
         labels=cfreqs[1:], fontsize=label_font_size,
@@ -135,7 +148,7 @@ def plot(data):
     plt.tight_layout()
     handles, labels = ax.get_legend_handles_labels()
 
-    plt.legend(handles, labels, loc='upper left', ncol=4, fontsize=label_font_size-2, bbox_to_anchor=(-0.025, 1.2))
+    plt.legend(handles, labels, loc='upper left', ncol=3, fontsize=label_font_size - 6, bbox_to_anchor=(-0.025, 1.25))
     plt.savefig(f"fig8_opt27.png", bbox_inches="tight", dpi=500, pad_inches=0.1)
 
 

@@ -73,3 +73,4 @@ cp pccheck/checkpoint_eval/models/llm_distr/run_clm_pp_cfreq.py transformers/exa
 cp pccheck/checkpoint_eval/models/llm_distr/run_clm_pp_gemini.py transformers/examples/pytorch/language-modeling/
 cp pccheck/checkpoint_eval/models/llm_distr/run_clm_pp_gpm.py transformers/examples/pytorch/language-modeling/
 cp pccheck/checkpoint_eval/models/llm_distr/run_clm_pp_pccheck.py transformers/examples/pytorch/language-modeling/
+cp pccheck/checkpoint_eval/models/llm_distr/run_clm_pp_multistream.py transformers/examples/pytorch/language-modeling/

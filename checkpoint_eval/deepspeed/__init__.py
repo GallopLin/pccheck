@@ -85,6 +85,117 @@ class PCCheckPipelineEngine(PipelineEngine):
                 continue
         super()._exec_optimizer_step(lr_kwargs)
 
+
+class MultiStreamPipelineEngine(PipelineEngine):
+    """集成 multistream 异步检查点的 DeepSpeed Pipeline Engine。
+
+    每个 PP 阶段独立使用 MultiStreamCheckpoint 保存自己的参数和优化器状态，
+    恢复时通过 pipelayer 的 MultiStreamStateLoader 按阶段加载。
+    """
+
+    def __init__(self, has_bool_tensors=False, checkp_params=None,
+                 *super_args, **super_kwargs):
+        super().__init__(has_bool_tensors, *super_args, **super_kwargs)
+        checkp_params = checkp_params or {}
+        self._ms_checkpoint_dir = checkp_params.get(
+            "checkpoint_dir", "./ms_checkpoints")
+        self._ms_lib_path = checkp_params.get(
+            "lib_path", "./libtest_ssd.so")
+        self._ms_max_async = int(checkp_params.get("max_async", 2))
+        self._ms_num_layer_groups = int(
+            checkp_params.get("num_layer_groups", 8))
+        self._ms_num_threads = int(checkp_params.get("num_threads", 16))
+
+        self._ms_ckpt = None
+        self._ms_gpu_buffer = None
+        self._ms_param_layout = None
+        self._ms_initialized = False
+
+    def _init_multistream(self):
+        if self._ms_initialized:
+            return
+
+        import os
+        import sys
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from checkpoint_eval.pccheck.multistream_pipeline_utils import (
+            create_stage_checkpoint,
+        )
+
+        self._ms_ckpt, self._ms_gpu_buffer, self._ms_param_layout = (
+            create_stage_checkpoint(
+                model=self.module,
+                optimizer=self.optimizer,
+                checkpoint_dir=self._ms_checkpoint_dir,
+                lib_path=self._ms_lib_path,
+                rank=self.global_rank,
+                world_size=(self.grid.data_parallel_size
+                            * self.grid.pipe_parallel_size),
+                max_async=self._ms_max_async,
+                num_layer_groups=self._ms_num_layer_groups,
+                num_threads=self._ms_num_threads,
+            )
+        )
+        self._ms_initialized = True
+        if self.global_rank == 0:
+            print("[MultiStreamPipelineEngine] Checkpoint initialized "
+                  f"for rank {self.global_rank}")
+
+    def _exec_optimizer_step(self, lr_kwargs=None):
+        if self._ms_ckpt is not None:
+            for events in self._ms_ckpt._layer_copy_events.values():
+                if events and events[0] is not None:
+                    torch.cuda.current_stream().wait_event(events[0])
+        super()._exec_optimizer_step(lr_kwargs)
+
+    def save_multistream_checkpoint(self, step, sync=False):
+        """触发 multistream 异步保存，返回耗时（秒）。"""
+        if not self._ms_initialized:
+            self._init_multistream()
+
+        import os
+        import sys
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from checkpoint_eval.pccheck.multistream_pipeline_utils import (
+            save_stage_checkpoint,
+            save_global_training_state,
+        )
+
+        elapsed = save_stage_checkpoint(
+            ms_ckpt=self._ms_ckpt,
+            gpu_buffer=self._ms_gpu_buffer,
+            param_layout=self._ms_param_layout,
+            model=self.module,
+            optimizer=self.optimizer,
+            checkpoint_dir=self._ms_checkpoint_dir,
+            rank=self.global_rank,
+            step=step,
+            sync=sync,
+        )
+
+        if self.global_rank == 0:
+            save_global_training_state(
+                self._ms_checkpoint_dir, step)
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        return elapsed
+
+    def shutdown_multistream(self):
+        if self._ms_ckpt is not None:
+            self._ms_ckpt.shutdown()
+            self._ms_ckpt = None
+
+
 def initialize(args=None,
                model: torch.nn.Module = None,
                optimizer: Optional[Union[Optimizer,
@@ -232,6 +343,20 @@ def initialize(args=None,
                 config_class=config_class)
         elif checkp_type == 'PCCheck':
             engine = PCCheckPipelineEngine(
+                checkp_params=checkp_params,
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                model_parameters=model_parameters,
+                training_data=training_data,
+                lr_scheduler=lr_scheduler,
+                mpu=mpu,
+                dist_init_required=dist_init_required,
+                collate_fn=collate_fn,
+                config=config,
+                config_class=config_class)
+        elif checkp_type == 'MultiStream':
+            engine = MultiStreamPipelineEngine(
                 checkp_params=checkp_params,
                 args=args,
                 model=model,
