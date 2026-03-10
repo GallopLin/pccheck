@@ -17,6 +17,225 @@ import threading
 from itertools import cycle
 import os
 import json
+import multiprocessing as mp
+from multiprocessing import shared_memory
+import ctypes as _ctypes
+import struct
+
+
+# =====================================================================
+# SharedChunkPool: 跨进程共享的 pinned 内存池（替代 DRAMAlloc）
+# =====================================================================
+
+class SharedChunkPool:
+    """
+    跨进程共享的 chunk 内存池。
+    
+    底层使用 multiprocessing.shared_memory，主进程和后台写入进程
+    可以零拷贝访问同一块物理内存。
+    
+    主进程调用 borrow() 获取 chunk 用于 GPU→CPU 拷贝，
+    后台写入进程完成 SSD 写入后调用 release() 归还。
+    """
+    
+    def __init__(self, num_chunks: int, chunk_size_floats: int):
+        self.chunk_size = chunk_size_floats
+        self.num_chunks = num_chunks
+        total_bytes = num_chunks * chunk_size_floats * 4  # float32
+        
+        # 分配一大块共享内存（所有 chunk 连续排列）
+        self.shm = shared_memory.SharedMemory(create=True, size=total_bytes)
+        self.shm_name = self.shm.name  # 后台进程用名字 attach
+        
+        # 可用 chunk ID 队列（使用 spawn 上下文，确保可被 spawn 进程继承）
+        _ctx = mp.get_context('spawn')
+        self.free_queue = _ctx.Queue()
+        for i in range(num_chunks):
+            self.free_queue.put(i)
+    
+    def borrow(self, timeout=30) -> tuple:
+        """主进程调用：借用一个 chunk，返回 (chunk_id, numpy_view)
+        
+        Args:
+            timeout: 最长等待时间（秒），超时说明 writer 进程可能已崩溃
+        """
+        try:
+            chunk_id = self.free_queue.get(timeout=timeout)
+        except Exception:
+            raise RuntimeError(f"SharedChunkPool.borrow() timed out after {timeout}s - writer process may be dead")
+        offset = chunk_id * self.chunk_size * 4
+        arr = np.ndarray(
+            self.chunk_size, dtype=np.float32,
+            buffer=self.shm.buf[offset : offset + self.chunk_size * 4]
+        )
+        return chunk_id, arr
+    
+    def release(self, chunk_id: int):
+        """后台写入进程调用：归还 chunk"""
+        self.free_queue.put(chunk_id)
+    
+    def get_ptr_for_chunk(self, chunk_id: int, shm_buf) -> int:
+        """后台进程调用：获取 chunk 在共享内存中的原始地址"""
+        offset = chunk_id * self.chunk_size * 4
+        # 通过 ctypes 获取 buffer 的基地址
+        buf_ptr = _ctypes.c_char.from_buffer(shm_buf, offset)
+        return _ctypes.addressof(buf_ptr)
+    
+    def close(self):
+        """主进程调用：关闭共享内存"""
+        try:
+            self.shm.close()
+            self.shm.unlink()
+        except Exception:
+            pass
+
+
+# =====================================================================
+# _writer_process_loop: 后台 SSD 写入进程的主循环
+# =====================================================================
+
+def _writer_process_loop(
+    task_queue: mp.Queue,
+    sync_done_queue: mp.Queue,
+    shm_name: str,
+    chunk_size_floats: int,
+    num_chunks: int,
+    free_queue: mp.Queue,
+    filename: bytes,
+    max_async: int,
+    num_streams: int,
+    stream_sizes: list,
+    cpu_affinity: int,
+    lib_path: str,
+):
+    """
+    后台 SSD 写入进程的主循环（使用 C 库进行高速 memcpy 写入）。
+    
+    在独立进程中运行，负责：
+    1. 加载 C 库，调用 writer_process_init()（O_RDWR，不截断文件）
+    2. 接收 WRITE 命令：通过 C 库 write_stream_chunk 做高速 memcpy
+    3. 接收 SYNC 命令：通过 C 库 sync_data_only 做 msync（不更新元数据）
+    4. 接收 STOP 命令：退出
+    
+    注意：元数据 CAS 更新由主进程负责（主进程在收到 SYNC_DONE 后调用
+    self.writer.sync_all_streams），避免跨进程的静态变量冲突。
+    """
+    import sys
+    try:
+        _writer_process_loop_impl(
+            task_queue, sync_done_queue,
+            shm_name, chunk_size_floats, num_chunks, free_queue,
+            filename, max_async, num_streams, stream_sizes,
+            cpu_affinity, lib_path,
+        )
+    except Exception as e:
+        print(f"[WriterProcess] FATAL: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+
+
+def _writer_process_loop_impl(
+    task_queue, sync_done_queue,
+    shm_name, chunk_size_floats, num_chunks, free_queue,
+    filename, max_async, num_streams, stream_sizes,
+    cpu_affinity, lib_path,
+):
+    import sys
+    from ctypes import cdll, c_int, c_size_t, c_char_p, c_void_p, POINTER
+    
+    # Pin to dedicated CPU core
+    try:
+        os.sched_setaffinity(0, {cpu_affinity})
+    except Exception:
+        pass
+    
+    # Attach 到主进程创建的共享内存
+    shm = shared_memory.SharedMemory(name=shm_name, create=False)
+    
+    # 获取共享内存的基地址（用于传递指针给 C 库）
+    shm_base_ptr = _ctypes.addressof(_ctypes.c_char.from_buffer(shm.buf))
+    
+    # =====================================================================
+    # 加载 C 库，使用 writer_process_init() 初始化（不截断文件、不初始化元数据）
+    # =====================================================================
+    fname_bytes = filename if isinstance(filename, bytes) else filename.encode()
+    
+    lib = cdll.LoadLibrary(lib_path)
+    
+    # 设置函数签名
+    lib.writer_process_init.restype = c_void_p
+    lib.writer_process_init.argtypes = [c_char_p, c_int]
+    
+    lib.init_streams.restype = c_int
+    lib.init_streams.argtypes = [c_void_p, c_int, POINTER(c_size_t)]
+    
+    lib.write_stream_chunk.restype = None
+    lib.write_stream_chunk.argtypes = [c_void_p, c_int, c_void_p, c_size_t, c_size_t, c_int, c_int]
+    
+    lib.sync_data_only.restype = None
+    lib.sync_data_only.argtypes = [c_void_p, c_int]
+    
+    lib.close_writer.restype = None
+    lib.close_writer.argtypes = [c_void_p]
+    
+    # 初始化：打开主进程已创建的 mmap 文件（O_RDWR，不 O_TRUNC）
+    writer_obj = lib.writer_process_init(fname_bytes, max_async)
+    
+    # 初始化流布局（设置 stream_offsets, checkpoint_stride 等）
+    stream_sizes_arr = (c_size_t * num_streams)(*stream_sizes)
+    ret = lib.init_streams(writer_obj, num_streams, stream_sizes_arr)
+    if ret != 0:
+        print(f"[WriterProcess] FATAL: init_streams failed", flush=True)
+        return
+    
+    total_data_bytes = sum(stream_sizes) * 4
+    
+    print(f"[WriterProcess] Started on CPU {cpu_affinity} (C library memcpy)", flush=True)
+    print(f"[WriterProcess] shm={shm_name}, chunks={num_chunks}x{chunk_size_floats}", flush=True)
+    print(f"[WriterProcess] data_size={total_data_bytes/1e9:.2f} GB", flush=True)
+    
+    while True:
+        try:
+            cmd = task_queue.get()
+        except Exception as e:
+            print(f"[WriterProcess] task_queue.get() exception: {e}", flush=True)
+            break
+        
+        if cmd[0] == "WRITE":
+            _, chunk_id, stream_id, offset_in_stream, chunk_size, parall_iter, num_threads = cmd
+            
+            # 计算共享内存中的源数据指针
+            src_ptr = shm_base_ptr + chunk_id * chunk_size_floats * 4
+            
+            # 调用 C 库的 write_stream_chunk 进行高速 memcpy（mmap 写入）
+            lib.write_stream_chunk(
+                c_void_p(writer_obj), stream_id, c_void_p(src_ptr),
+                c_size_t(offset_in_stream), c_size_t(chunk_size),
+                parall_iter, num_threads
+            )
+            
+            # 归还 chunk 到共享池
+            free_queue.put(chunk_id)
+        
+        elif cmd[0] == "SYNC":
+            _, parall_iter, start_time = cmd
+            
+            # 通过 C 库 msync 数据到磁盘（不更新元数据 CAS）
+            lib.sync_data_only(c_void_p(writer_obj), parall_iter)
+            
+            total_time = time.time() - start_time
+            throughput = (total_data_bytes / 1e9) / total_time if total_time > 0 else 0
+            sync_done_queue.put(("SYNC_DONE", parall_iter, total_time, throughput))
+        
+        elif cmd[0] == "STOP":
+            break
+    
+    # 清理
+    lib.close_writer(c_void_p(writer_obj))
+    shm.close()
+    print(f"[WriterProcess] Exited cleanly", flush=True)
+
 
 class MultiStreamOptimizer:
     def __init__(
@@ -590,64 +809,98 @@ class MultiStreamCheckpoint:
 
         if self.metadata_path is None and isinstance(resolved_filename, str):
             self.metadata_path = resolved_filename + ".metadata.json"
+        # ✅ 主进程仍然需要 MultiStreamWriter 来做 registerCheck（槽位管理）
+        # 传最小 DRAMAlloc 参数（chunk_size=1, num_chunks=1）避免浪费内存
+        # 实际的 chunk 管理已由 SharedChunkPool 接管
         self.writer = MultiStreamWriter(
             fname_bytes,
             lib_path,
             max_async,
             num_streams,
             self.stream_sizes,
-            chunk_size=self.chunk_size,
-            num_chunks=self.num_chunks,
+            chunk_size=1,
+            num_chunks=1,
             is_distributed=distributed,
             rank=rank,
             world_size=world_size
         )
+        self._fname_bytes = fname_bytes  # 保存供后台进程使用
         
         self.cuda_streams = []
         for i in range(max_async + 1):  # max_async+1个槽位（0到max_async）
             self.cuda_streams.append([torch.cuda.Stream() for _ in range(num_streams)])
         print(f"  ✓ Created CUDA streams: {max_async + 1} slots × {num_streams} streams = {(max_async + 1) * num_streams} streams (reusable)")
         
-        # 创建双线程池架构：
-        # 1. copy_thread_pool: 专门处理 GPU→CPU 拷贝（等待 CUDA stream 同步）
-        # 2. ssd_thread_pool: 专门处理 SSD 写入（IO 密集型，不阻塞拷贝）
-        import os
-        cpu_count = os.cpu_count() or 16
+        # =====================================================================
+        # 独立进程架构（替代原双线程池，消除 GIL 竞争）：
+        # 1. copy_thread_pool: 主进程线程池，负责 GPU→CPU 拷贝（需要 CUDA context）
+        # 2. WriterProcess: 独立进程，负责 SSD 写入（memcpy→mmap + msync）
+        # =====================================================================
         
-        # GPU→CPU 拷贝线程池：每个流一个线程足够（瓶颈在 PCIe 带宽）
+        # GPU→CPU 拷贝线程池（保留在主进程中）
         copy_pool_workers = num_streams * (max_async + 1)
         self.copy_thread_pool = ThreadPoolExecutor(max_workers=copy_pool_workers, thread_name_prefix="copy_worker")
+        self.thread_pool = self.copy_thread_pool  # 兼容旧名称
         
-        # SSD 写入线程池：IO 密集型，可以多一些线程
-        ssd_pool_workers = min(num_streams * max_async * 2, cpu_count)
-        self.ssd_thread_pool = ThreadPoolExecutor(max_workers=ssd_pool_workers, thread_name_prefix="ssd_worker")
+        # 独立的 finalize 线程池（避免与 copy 线程池竞争导致优先级反转）
+        self._finalize_pool = ThreadPoolExecutor(max_workers=max_async, thread_name_prefix="finalize_worker")
         
-        # 保留旧名称以兼容性（指向 copy_thread_pool）
-        self.thread_pool = self.copy_thread_pool
+        # 共享 chunk 内存池（替代 DRAMAlloc 的 borrow/return_chunk）
+        self.chunk_pool = SharedChunkPool(self.num_chunks, self.chunk_size)
         
-        print(f"  ✓ Created dual thread pools:")
-        print(f"      Copy pool: {copy_pool_workers} workers (for GPU→CPU)")
-        print(f"      SSD pool:  {ssd_pool_workers} workers (for SSD writes)")
+        # ✅ 使用 spawn 上下文：避免 fork 后继承损坏的 CUDA 上下文
+        _spawn_ctx = mp.get_context('spawn')
+        
+        # 跨进程通信队列
+        self._task_queue = _spawn_ctx.Queue()           # 主进程 → 后台进程：WRITE/SYNC/STOP 命令
+        self._sync_done_queue = _spawn_ctx.Queue()      # 后台进程 → 主进程：SYNC_DONE 通知
+        
+        # 选择后台进程的 CPU 亲和核心（避开 CPU 0）
+        try:
+            avail_cpus = sorted(os.sched_getaffinity(0))
+            writer_cpu = avail_cpus[1] if len(avail_cpus) > 1 else 0
+        except Exception:
+            writer_cpu = 1
+        
+        # 启动后台 SSD 写入进程（使用 C 库 memcpy，通过 writer_process_init 不截断文件）
+        self._writer_process = _spawn_ctx.Process(
+            target=_writer_process_loop,
+            args=(
+                self._task_queue,
+                self._sync_done_queue,
+                self.chunk_pool.shm_name,
+                self.chunk_size,
+                self.num_chunks,
+                self.chunk_pool.free_queue,
+                fname_bytes,
+                max_async,
+                num_streams,
+                [int(s) for s in self.stream_sizes],
+                writer_cpu,
+                os.path.abspath(lib_path),
+            ),
+            daemon=True,
+        )
+        self._writer_process.start()
+        
+        print(f"  ✓ Writer process started (PID={self._writer_process.pid}, CPU={writer_cpu})")
+        print(f"      Copy thread pool: {copy_pool_workers} workers (for GPU→CPU)")
+        print(f"      Shared chunk pool: {self.num_chunks} chunks × {self.chunk_size*4/1e6:.1f} MB")
         
         # 统计信息
         self.save_times = []
         
         # IO统计回调
         self.io_callback = None
-        self._inflight_ssd_tasks = 0
-        self._inflight_ssd_lock = Lock()
         
-        # ✅ 修复：槽位管理器（支持多个并行检查点）
-        # 使用字典跟踪每个槽位的状态：{parall_iter: {'futures': [...], 'start_time': ...}}
-        self._checkpoint_slots = {}  # 当前活跃的检查点槽位
-        self._slot_lock = Lock()  # 保护槽位操作的锁
+        # ✅ 槽位管理器（支持多个并行检查点）
+        self._checkpoint_slots = {}  # {parall_iter: {'futures': [...], 'start_time': ...}}
+        self._slot_lock = Lock()
         self._max_async = max_async
-        self._slot_available_event = threading.Event()  # 槽位释放通知
+        self._slot_available_event = threading.Event()
         self._slot_available_event.set()  # 初始状态：有可用槽位
         
         # ✅ 跨检查点同步：记录每个层组的拷贝完成事件
-        # _layer_copy_events[group_idx] = [event0, event1, event2, event3] (每个流一个事件)
-        # 新检查点更新该层组之前，需要等待所有 4 个事件
         self._layer_copy_events = {}  # {group_idx: [events]}
         self._layer_copy_events_lock = Lock()
         print(f"  ✓ Cross-checkpoint layer synchronization enabled")
@@ -976,110 +1229,46 @@ class MultiStreamCheckpoint:
     
     def _save_stream_for_layers(self, stream_id, param_type, layer_group_ids, parall_iter, sync_event=None, copy_done_event=None, group_idx=None):
         """
-        保存指定层组的某一类参数
+        保存指定层组的某一类参数（独立进程架构）
         
-        优化设计：
-        1. GPU→CPU 拷贝完成后立即记录 copy_done_event，允许新 checkpoint 开始
-        2. SSD 写入在后台异步完成，不阻塞新的拷贝操作
-        3. 移除复杂的流水线设计，简化逻辑
-        
-        Args:
-            stream_id: 流ID
-            param_type: 参数类型 (param/grad/exp_avg/exp_avg_sq)
-            layer_group_ids: 层ID列表
-            parall_iter: 并行迭代槽位（由registerCheck返回）
-            sync_event: CUDA同步事件，用于确保参数更新完成后再开始拷贝
-            copy_done_event: 拷贝完成事件，用于跨检查点同步
-            group_idx: 层组索引
+        GPU→CPU 拷贝在主进程完成，然后通过 task_queue 发送 WRITE 命令到后台写入进程。
+        后台进程执行 memcpy→mmap，完全无 GIL 竞争。
         """
         try:
-            import ctypes
             import numpy as np
             
             stream_index = parall_iter % (self._max_async + 1)
             current_stream = self.cuda_streams[stream_index][stream_id]
 
             with torch.cuda.stream(current_stream):
-                # 等待默认流上的参数更新完成
                 if sync_event is not None:
                     sync_event.wait(current_stream)
                 
-                # 计算该组在当前流中的偏移
                 offset_in_stream = 0
                 for i in range(min(layer_group_ids[0], len(self.param_layout))):
                     layer_info = self.param_layout[i]
                     offset_in_stream += layer_info.get(f'{param_type}_size', 0)
                 
-                # 预先计算需要处理的层信息
                 layers_to_process = []
                 total_elements = 0
                 
                 for layer_id in layer_group_ids:
                     if layer_id >= len(self.param_layout):
                         continue
-                    
                     layer_info = self.param_layout[layer_id]
                     gpu_offset = layer_info.get(f'{param_type}_offset', 0)
                     size = layer_info.get(f'{param_type}_size', 0)
-                    
                     gpu_buffer = self.gpu_buffers[stream_id]
                     if size > 0 and gpu_buffer is not None and gpu_offset + size <= len(gpu_buffer):
                         layers_to_process.append((gpu_offset, size))
                         total_elements += size
                 
                 if not layers_to_process:
-                    # 即使没有数据，也要记录事件（保持一致性）
                     if copy_done_event is not None:
                         copy_done_event.record(current_stream)
                     return
 
-                # ========== 阶段2：异步写入 SSD ==========
-                # ✅ 供“按 chunk 流式提交”使用：避免 pinned chunk 池不足导致 borrow_chunk 阻塞/死锁（H6）
-                def ssd_write_task(chunks, stream_id, offset_in_stream, parall_iter, num_threads, writer):
-                    try:
-                        total_chunk_elems = 0
-                        try:
-                            total_chunk_elems = int(sum(c[1] for c in chunks))
-                        except Exception:
-                            total_chunk_elems = 0
-                        for chunk_ptr, chunk_size, offset in chunks:
-                            float_ptr = cast(chunk_ptr, POINTER(c_float))
-                            writer.write_stream_chunk(
-                                stream_id,
-                                float_ptr,
-                                offset_in_stream + offset,
-                                chunk_size,
-                                parall_iter,
-                                num_threads,
-                            )
-                    except Exception as e:
-                        print(f"[ERROR] SSD write failed for stream {stream_id}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    finally:
-                        for chunk_ptr, _, _ in chunks:
-                            writer.return_chunk(chunk_ptr)
-                        with self._inflight_ssd_lock:
-                            self._inflight_ssd_tasks -= 1
-                            inflight_after = int(self._inflight_ssd_tasks)
-
-                def _submit_ssd(chunks):
-                    with self._inflight_ssd_lock:
-                        self._inflight_ssd_tasks += 1
-                        inflight_before_submit = int(self._inflight_ssd_tasks)
-                    fut = self.writer._submit_with_affinity(
-                        self.ssd_thread_pool,
-                        ssd_write_task,
-                        chunks,
-                        stream_id,
-                        offset_in_stream,
-                        parall_iter,
-                        self.num_threads,
-                        self.writer,
-                    )
-                    self._register_layer_group_futures(parall_iter, [fut])
-
-                # ========== 阶段1：GPU→CPU 拷贝（按 chunk 流式提交 SSD 写入） ==========
+                # ========== GPU→CPU 拷贝 + 发送 WRITE 命令到后台进程 ==========
                 current_offset = 0
                 current_layer_idx = 0
                 offset_in_current_layer = 0
@@ -1087,27 +1276,11 @@ class MultiStreamCheckpoint:
                 while current_offset < total_elements:
                     elements_to_process = min(self.chunk_size, total_elements - current_offset)
 
-                    chunk_ptr = self.writer.borrow_chunk()
-                    
-                    if chunk_ptr is None or chunk_ptr == 0:
-                        raise RuntimeError(f"borrow_chunk() returned invalid pointer: {chunk_ptr}")
-
-                    chunk_array = np.ctypeslib.as_array((ctypes.c_float * self.chunk_size).from_address(chunk_ptr))
-                    # ✅ 修复段错误：使用 detach() 彻底断开 autograd 图
-                    # 
-                    # 问题根因：
-                    # 1. torch.from_numpy() 创建的 tensor 与 numpy 数组共享底层内存
-                    # 2. 对 tensor 进行 slice 会创建 SliceBackward0 autograd 节点
-                    # 3. 当 chunk 被归还到 DRAMAlloc 池后，autograd 节点仍持有对该内存的引用
-                    # 4. 在 Python GC 清理时，autograd::deleteNode() 会访问已失效的内存 → 段错误
-                    # 
-                    # 解决方案：
-                    # - 使用 detach() 断开所有 autograd 连接
-                    # - torch.no_grad() 只能阻止新梯度被记录，无法阻止已有的 storage 引用
+                    # 从共享内存池借用 chunk（替代 writer.borrow_chunk()）
+                    chunk_id, chunk_array = self.chunk_pool.borrow()
                     chunk_tensor = torch.from_numpy(chunk_array).detach()
                     cpu_buffer_slice = chunk_tensor[:elements_to_process].detach()
 
-                    # ✅ H5: 禁用 autograd，避免 CopySlices/SliceBackward 在后台线程构建
                     dest_offset = 0
                     with torch.no_grad():
                         while dest_offset < elements_to_process:
@@ -1131,11 +1304,17 @@ class MultiStreamCheckpoint:
                     chunk_offset = current_offset
                     current_offset += elements_to_process
 
-                    # 确保该 chunk 拷贝完成后再交给 SSD 线程（SSD 线程不触发 CUDA）
+                    # 确保 GPU→CPU 拷贝完成
                     current_stream.synchronize()
-                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset)])
 
-                # ✅ 所有 GPU→CPU 拷贝命令已完成/已提交，记录跨检查点同步事件
+                    # 发送 WRITE 命令到后台写入进程
+                    self._task_queue.put((
+                        "WRITE", chunk_id, stream_id,
+                        offset_in_stream + chunk_offset,
+                        elements_to_process, parall_iter, self.num_threads
+                    ))
+
+                # 所有 GPU→CPU 拷贝完成，记录跨检查点同步事件
                 if copy_done_event is not None:
                     copy_done_event.record(current_stream)
                 
@@ -1143,6 +1322,7 @@ class MultiStreamCheckpoint:
             print(f"[ERROR] Stream {stream_id} ({param_type}) failed: {e}")
             import traceback
             traceback.print_exc()
+
     
     def set_io_callback(self, callback):
         """
@@ -1462,7 +1642,7 @@ class MultiStreamCheckpoint:
     
     def finalize_checkpoint(self, parall_iter, wait=True):
         """
-        完成检查点保存流程
+        完成检查点保存流程（独立进程架构）
         
         Args:
             parall_iter: 检查点槽位ID（由begin_checkpoint返回）
@@ -1478,20 +1658,22 @@ class MultiStreamCheckpoint:
             slot_info = self._checkpoint_slots[parall_iter]
             futures = slot_info['futures']
             start_time = slot_info['start_time']
-
-        with self._inflight_ssd_lock:
-            inflight_ssd = int(self._inflight_ssd_tasks)
             
         if wait:
             # 同步模式：等待所有保存完成
-            # 等待所有异步保存任务完成
+            # 等待所有异步保存任务完成（GPU→CPU 拷贝 + WRITE 命令已发送）
             print(f"\n  Waiting for all layer groups to complete (parall_iter: {parall_iter})...")
             for future in futures:
                 future.result()
             
-            # 同步所有流到磁盘
+            # 通过 task_queue 发送 SYNC 命令到后台写入进程
             print(f"\n  Syncing all streams to disk (parall_iter: {parall_iter})...")
             sync_start = time.time()
+            self._task_queue.put(("SYNC", parall_iter, sync_start))
+            # 等待后台进程完成 sync
+            sync_result = self._sync_done_queue.get()
+            # ✅ 元数据 CAS 更新（在主进程中执行，避免跨进程静态变量冲突）
+            # msync 已由 writer 进程完成（此处 re-msync 是 no-op），仅执行 CAS
             self.writer.sync_all_streams(parall_iter)
             sync_time = time.time() - sync_start
             
@@ -1522,12 +1704,16 @@ class MultiStreamCheckpoint:
             # 异步模式：立即返回，后台继续保存
             def async_finalize():
                 try:  
-                    # 等待所有异步保存任务完成（GPU→CPU拷贝）
+                    # 等待所有异步保存任务完成（GPU→CPU拷贝 + WRITE 命令已发送）
                     for future in futures:
                         future.result()
                     
-                    # 同步所有流到磁盘
+                    # 通过 task_queue 发送 SYNC 命令到后台写入进程
                     sync_streams_start = time.time()
+                    self._task_queue.put(("SYNC", parall_iter, sync_streams_start))
+                    # 等待后台进程完成 sync
+                    sync_result = self._sync_done_queue.get()
+                    # ✅ 元数据 CAS 更新（在主进程中执行）
                     self.writer.sync_all_streams(parall_iter)
                     
                     sync_streams_time = time.time() - sync_streams_start
@@ -1546,7 +1732,7 @@ class MultiStreamCheckpoint:
                     if self.io_callback is not None:
                         self.io_callback(total_time, throughput)
                     
-                    # ✅ 修复：释放槽位（sync_all_streams完成后）
+                    # ✅ 修复：释放槽位（sync完成后）
                     with self._slot_lock:
                         if parall_iter in self._checkpoint_slots:
                             del self._checkpoint_slots[parall_iter]
@@ -1560,8 +1746,8 @@ class MultiStreamCheckpoint:
                         self._checkpoint_slots.pop(parall_iter, None)
                     self._slot_available_event.set()  # 通知等待的 begin_checkpoint
             
-            # 提交到线程池
-            self.thread_pool.submit(async_finalize)
+            # 提交到独立的 finalize 线程池（避免与 copy 线程池竞争）
+            self._finalize_pool.submit(async_finalize)
             
             # 立即返回（不阻塞）
             submit_time = time.time() - start_time
@@ -1570,48 +1756,72 @@ class MultiStreamCheckpoint:
             return submit_time
 
     def drain(self):
-        """等待所有尚未完成的异步 checkpoint 完成并落盘。
+        """等待所有尚未完成的异步 checkpoint 完成并落盘（独立进程架构）。
 
         目的：
         - 让 benchmark 的时间统计包含尾部异步写入/flush，避免吞吐被高估或出现非单调异常。
-        - 避免后台线程池继续占用 CPU/SSD 带宽，干扰后续 step 或后续实验。
+        - 避免后台写入进程继续占用 CPU/SSD 带宽，干扰后续 step 或后续实验。
         """
         print("Draining multistream checkpoint: waiting for all background tasks...")
         
-        # 等待所有SSD写入任务完成
+        # 等待所有活跃的 checkpoint 槽位被释放
         max_wait_time = 60
         wait_start = time.time()
         
         while True:
-            with self._inflight_ssd_lock:
-                inflight = self._inflight_ssd_tasks
+            with self._slot_lock:
+                active_slots = len(self._checkpoint_slots)
             
-            if inflight == 0:
+            if active_slots == 0:
                 print(f"✓ All background tasks completed")
                 break
             
             if time.time() - wait_start > max_wait_time:
-                print(f"⚠ Warning: drain timeout after {max_wait_time}s, {inflight} tasks still running")
+                print(f"⚠ Warning: drain timeout after {max_wait_time}s, {active_slots} slots still active")
                 break
+            
+            time.sleep(0.1)
     
     def shutdown(self):
-        """关闭线程池，释放资源"""
-        # 在关闭线程池之前，先确保没有未完成的异步 checkpoint。
-        # 否则 ThreadPoolExecutor.shutdown(wait=True) 只保证任务执行完，
-        # 但我们的槽位状态/统计可能还没走完 finalize 的释放逻辑。
+        """关闭写入进程和线程池，释放资源"""
         try:
             self.drain()
         except Exception as e:
             print(f"[WARN] MultiStreamCheckpoint.drain() failed during shutdown: {e}")
+        
+        # 发送 STOP 命令并等待写入进程退出
+        if hasattr(self, '_task_queue') and hasattr(self, '_writer_process'):
+            try:
+                self._task_queue.put(("STOP",))
+                self._writer_process.join(timeout=30)
+                if self._writer_process.is_alive():
+                    print("[WARN] Writer process did not exit gracefully, terminating...")
+                    self._writer_process.terminate()
+                    self._writer_process.join(timeout=5)
+                print("✓ Writer process shutdown")
+            except Exception as e:
+                print(f"[WARN] Writer process shutdown failed: {e}")
+        
+        # 关闭拷贝线程池
         if hasattr(self, 'copy_thread_pool'):
             self.copy_thread_pool.shutdown(wait=True)
             print("✓ Copy thread pool shutdown")
-        if hasattr(self, 'ssd_thread_pool'):
-            self.ssd_thread_pool.shutdown(wait=True)
-            print("✓ SSD thread pool shutdown")
+        
+        # 关闭 finalize 线程池
+        if hasattr(self, '_finalize_pool'):
+            self._finalize_pool.shutdown(wait=True)
+            print("✓ Finalize thread pool shutdown")
+        
+        # 关闭共享内存池
+        if hasattr(self, 'chunk_pool'):
+            try:
+                self.chunk_pool.close()
+                print("✓ Shared chunk pool closed")
+            except Exception as e:
+                print(f"[WARN] Chunk pool close failed: {e}")
     
     def __del__(self):
-        """析构时自动关闭线程池"""
+        """析构时自动关闭"""
         self.shutdown()
 
 

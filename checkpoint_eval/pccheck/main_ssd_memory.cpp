@@ -372,6 +372,34 @@ static void initialize_for_read(const char *filename, int max_async)
 
 //====================================================================
 
+// Writer进程专用初始化：打开已有文件做mmap，不截断、不初始化元数据和DRAMAlloc
+// 用于独立写入进程，避免 O_TRUNC 破坏主进程的 mmap 和静态变量冲突
+static void initialize_for_writer(const char *filename, int max_async)
+{
+    fd = open(filename, O_RDWR, (mode_t)0666);
+    if (fd < 0)
+    {
+        perror("open for writer");
+        exit(1);
+    }
+
+    uint64_t region_size = getFileSize(filename, fd);
+    MAPPED_SIZE = region_size;
+    mapPersistentRegion(filename, PR_ADDR, region_size, false, fd);
+
+    PEER_CHECK_ADDR = PR_ADDR + OFFSET_SIZE;
+    PR_ADDR_DATA = PR_ADDR + (max_async + 3) * OFFSET_SIZE;
+
+    printf("[WriterProcess] PR_ADDR_DATA is %p, PR_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR);
+
+    // 不初始化 counter、free_space、DRAMAlloc —— 这些由主进程管理
+    is_distributed = false;
+    my_rank = 0;
+    world_size = 1;
+}
+
+//====================================================================
+
 /* Provides ways to write data to a dedicated address within PR_ADDR_DATA.
  * savenvm_thread_flush and savenvm_thread_nd writes and persists the
  * data to a dedicated address. These methods are called by every parallel
@@ -741,6 +769,38 @@ public:
         }
     }
     
+    // 仅同步数据区域到磁盘（不更新元数据），供 writer 进程使用
+    void sync_data_only(int parall_iter) {
+        if (checkpoint_stride_floats == 0) {
+            fprintf(stderr, "[ERROR] checkpoint_stride_floats not initialized! Call init_streams first.\n");
+            exit(1);
+        }
+
+        float* checkpoint_base = checkpoint_base_ptr(parall_iter);
+        size_t total_sync_bytes = total_checkpoint_size * sizeof(float);
+
+        size_t page_size = 4096;
+        uintptr_t addr_int = (uintptr_t)checkpoint_base;
+        uintptr_t page_start = (addr_int / page_size) * page_size;
+        size_t offset_in_page = addr_int - page_start;
+        size_t aligned_size = ((offset_in_page + total_sync_bytes + page_size - 1) / page_size) * page_size;
+        void* aligned_addr = (void*)page_start;
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        int msync_res = msync(aligned_addr, aligned_size, MS_SYNC);
+        auto t2 = std::chrono::high_resolution_clock::now();
+
+        if (msync_res == -1) {
+            perror("msync - sync_data_only");
+            exit(1);
+        }
+
+        std::chrono::duration<double, std::milli> ms_double = t2 - t1;
+        printf("[WriterProcess] sync_data_only: %.2f GB in %.2f ms (%.2f GB/s)\n",
+               total_sync_bytes / 1e9, ms_double.count(),
+               (total_sync_bytes / 1e9) / (ms_double.count() / 1000.0));
+    }
+
     // ✅ DRAM槽位管理：借用和归还pinned内存（用于多流pccheck内存复用）
     // 从DRAMAlloc借用一块pinned buffer
     float* borrow_chunk() {
@@ -1087,6 +1147,19 @@ extern "C" // 生成的.so文件暴露出来的接口
         NVM_write *nvmobj = new NVM_write();
         initialize_for_read(filename, max_async);
         return nvmobj;
+    }
+
+    // Writer进程专用初始化（不截断文件、不初始化元数据/DRAMAlloc）
+    NVM_write *writer_process_init(const char *filename, int max_async)
+    {
+        NVM_write *nvmobj = new NVM_write();
+        initialize_for_writer(filename, max_async);
+        return nvmobj;
+    }
+
+    // 仅同步数据区域（不更新元数据），供 writer 进程使用
+    void sync_data_only(NVM_write *t, int parall_iter) {
+        t->sync_data_only(parall_iter);
     }
 
     float *readfromnvm(NVM_write *t, float *ar, int sz)
