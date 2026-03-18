@@ -6,14 +6,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 home_dir = os.path.expanduser("~")
-<<<<<<< Updated upstream
-lib_path = f"{home_dir}/data/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
-=======
-lib_path = f"{home_dir}/download/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
-lib_path_stream = f"{home_dir}/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
->>>>>>> Stashed changes
-script_dir = f"{home_dir}/code/transformers/examples/pytorch/language-modeling"
-this_dir = f"{home_dir}/code/pccheck/artifact_evaluation/evaluation/throughput"
+lib_path = f"{home_dir}/pccheck/checkpoint_eval/pccheck/libtest_ssd.so"
+script_dir = f"{home_dir}/transformers/examples/pytorch/language-modeling"
+this_dir = f"{home_dir}/pccheck/artifact_evaluation/evaluation/throughput"
 cfreqs = [10]
 iters = 50
 WARMUP = 3
@@ -28,11 +23,7 @@ label_dict = {
 
 ms_checkpoint_dir = f"{home_dir}/ms_checkpoints_bench"
 
-<<<<<<< Updated upstream
-def create_files(ip1, ip2):
-=======
 def create_files(ip1):
->>>>>>> Stashed changes
 
     with open(f"{script_dir}/hostfile", "w") as f:
         f.write(f"{ip1} slots=4\n")
@@ -46,15 +37,6 @@ def create_files(ip1):
 
 
 def run(ip1):
-<<<<<<< Updated upstream
-    os.makedirs("opt_27", exist_ok=True)
-    # # run cfreq
-    print("Run for CheckFreq")
-    for cf in cfreqs:
-        print(f"Checkpoint Frequency {cf}")
-        proc = f"cd {script_dir} && deepspeed --num_gpus=1 --num_nodes 2 --hostfile hostfile --master_addr {ip1} --master_port 1234  run_clm_pp_cfreq.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} > {this_dir}/opt_27/log_opt27_cfreq_{cf}.txt"
-        os.system(proc)
-=======
     os.makedirs(f"{this_dir}/opt_27", exist_ok=True)
 
     def run_and_log(cmd, log_path):
@@ -78,7 +60,6 @@ def run(ip1):
     #     print(f"Checkpoint Frequency {cf}")
     #     proc = f"cd {script_dir} && {sys.executable} -m deepspeed.launcher.runner --num_gpus=4 run_clm_pp_cfreq.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-2.7b --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters}"
     #     run_and_log(proc, f"{this_dir}/opt_27/log_opt27_cfreq_{cf}.txt")
->>>>>>> Stashed changes
 
     # # run gpm
     # print("Run for GPM")
@@ -96,11 +77,11 @@ def run(ip1):
 
 
     # # run pccheck
-    # print("Run for PCCheck")
-    # for cf in cfreqs:
-    #     print(f"Checkpoint Frequency {cf}")
-    #     proc = f"cd {script_dir} && {sys.executable} -m deepspeed.launcher.runner --num_gpus=4 run_clm_pp_pccheck.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-350m --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} --max_async 2 --num_threads 2"
-    #     run_and_log(proc, f"{this_dir}/opt_27/log_opt27_pccheck_{cf}.txt")
+    print("Run for PCCheck")
+    for cf in cfreqs:
+    print(f"Checkpoint Frequency {cf}")
+    proc = f"export PYTHONPATH=/root/pccheck && cd {script_dir} && {sys.executable} -m deepspeed.launcher.runner --num_gpus=4 run_clm_pp_pccheck.py --deepspeed /root/pccheck/checkpoint_eval/models/llm_distr/ds_config.json --ds_config /root/pccheck/checkpoint_eval/models/llm_distr/ds_config.json --model_name_or_path facebook/opt-2.7b --output_dir ./output_opt27_4gpu --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} --max_async 2 --num_threads 2"
+    run_and_log(proc, f"{this_dir}/opt_27/log_opt27_pccheck_{cf}.txt")
 
     # # run multistream
     print("Run for MultiStream")
@@ -111,10 +92,6 @@ def run(ip1):
 
     # # run multistream
     print("Run for MultiStream")
-    for cf in cfreqs:
-        print(f"Checkpoint Frequency {cf}")
-        proc = f"cd {script_dir} && deepspeed --num_gpus=1 --num_nodes 2 --hostfile hostfile --master_addr {ip1} --master_port 1234  run_clm_pp_multistream.py --deepspeed ds_config.json --ds_config ds_config.json --model_name_or_path facebook/opt-350m --output_dir output --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1  --do_train --per_device_train_batch_size 1 --cfreq {cf} --bench_total_steps {iters} --c_lib_path {lib_path} --max_async 2 --num_threads 2 --checkpoint_dir {ms_checkpoint_dir} > {this_dir}/opt_27/log_opt27_multistream_{cf}.txt"
-        os.system(proc)
 
 
 def collect():
@@ -141,11 +118,7 @@ def collect():
     throughput_dict = {}
     throughput_list = []
 
-<<<<<<< Updated upstream
     for baseline in ["cfreq", "gpm", "gemini", "pccheck", "multistream"]:
-=======
-    for baseline in ["cfreq", "multistream"]: # "gpm", "gemini", "pccheck", 
->>>>>>> Stashed changes
         baseline_thr = []
         for cf in cfreqs:
             input_file = f"{this_dir}/opt_27/log_opt27_{baseline}_{cf}.txt"
@@ -156,11 +129,7 @@ def collect():
 
     print(throughput_list)
     column_header = [str(x) for x in cfreqs]
-<<<<<<< Updated upstream
     index_header = ["CheckFreq", "GPM", "Gemini", "PCcheck", "MultiStream"]
-=======
-    index_header = ["CheckFreq", "MultiStream"] # "GPM", "Gemini", "PCcheck", 
->>>>>>> Stashed changes
     df = pd.DataFrame(throughput_list, columns = column_header, index = index_header)
     df.to_csv(f'fig8_opt27.csv')
     return throughput_dict
@@ -172,11 +141,7 @@ def plot(data):
     num_methods = len(data)
     width = 0.8 / max(num_methods, 1)
     fig, ax = plt.subplots(figsize=(16, 8))
-<<<<<<< Updated upstream
-    x = np.arange(len(cfreqs[1:]))
-=======
     x = np.arange(len(cfreqs))
->>>>>>> Stashed changes
     bars = []
 
     for method_id, (method_key, method_data) in enumerate(data.items()):
@@ -190,13 +155,8 @@ def plot(data):
 
     plt.yticks(fontsize=label_font_size)
 
-<<<<<<< Updated upstream
-    ax.plot(x + 2 * width, [data["PCcheck"][0]] * len(x), color='black', marker="s", linewidth=3, markersize=8, label="PCcheck (cfreq=10)")
-    if "MultiStream" in data:
-=======
     # 仅在存在多个 checkpoint interval 时，绘制 cfreq=10 的参考线
     if len(cfreqs) > 1 and "MultiStream" in data:
->>>>>>> Stashed changes
         ax.plot(x + 2 * width, [data["MultiStream"][0]] * len(x), color='#C75B7A', marker="^", linewidth=3, markersize=8, linestyle='--', label="MultiStream (cfreq=10)")
 
     x_tick_positions = x + width * num_methods / 2
