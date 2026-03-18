@@ -284,13 +284,6 @@ class ModelArguments:
             "help": ("Debug switch: skip set_storage(model, [optimizer], gpu_ar) before checkpointing.")
         }
     )
-    optimizer_mode: str = field(
-        default="auto",
-        metadata={
-            "help": ("Optimizer mode for DS AdamW backend: auto|fused|torch. "
-                     "auto forces torch_adam when cfreq>0 and set_storage is enabled.")
-        }
-    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -593,8 +586,7 @@ def main():
     if "bloom" in model_name_lower:
         pp_stages = max(int(model_args.pipeline_stages), 1)
         logger.info(f"Using BLOOM pipeline stages: {pp_stages}")
-        model = convert("bloom", model, config, pp_stages,
-                        gradient_checkpointing=training_args.gradient_checkpointing)
+        model = convert("bloom", model, config, pp_stages)
     elif "opt" in model_name_lower:
         model = convert("opt", model, config, 2)
     else:
@@ -707,26 +699,6 @@ def main():
     # CHECKPOINT-RELATED
     bench_total_steps = model_args.bench_total_steps
     cfreq = model_args.cfreq
-    optimizer_mode = model_args.optimizer_mode.lower().strip()
-    if optimizer_mode not in ("auto", "fused", "torch"):
-        raise ValueError(f"Invalid --optimizer_mode={model_args.optimizer_mode}. Expected one of: auto|fused|torch")
-
-    set_storage_enabled = (cfreq > 0) and (not model_args.disable_set_storage)
-    if optimizer_mode == "auto":
-        force_torch_adam = set_storage_enabled
-        mode_reason = "auto(set_storage path)" if force_torch_adam else "auto(default fused)"
-    elif optimizer_mode == "torch":
-        force_torch_adam = True
-        mode_reason = "manual torch"
-    else:
-        force_torch_adam = False
-        mode_reason = "manual fused"
-
-    deepspeed_config.setdefault("optimizer", {})
-    deepspeed_config["optimizer"].setdefault("params", {})
-    deepspeed_config["optimizer"]["params"]["torch_adam"] = force_torch_adam
-    print(f"[OPTIMIZER] mode={optimizer_mode}, torch_adam={force_torch_adam}, reason={mode_reason}, "
-          f"cfreq={cfreq}, set_storage_enabled={set_storage_enabled}")
 
     mp.set_start_method("spawn", force=True)
     chk_monitor = None
@@ -758,25 +730,32 @@ def main():
             if (cfreq>0):
                 if chk_monitor is None:
                     # total_size = get_total_size(model, [self.optimizer])
-                    storage_optimizer_list = []
                     gpu_ar, total_size = initialize(
-                        model, storage_optimizer_list, do_opt_step=False)
+                        model, [optimizer], do_opt_step=False)
                     print(f"----------------- total size is {total_size}, rank: {rank}, world_size: {world_size}")
                     if model_args.disable_set_storage:
                         print("[DEBUG] disable_set_storage=True -> skip set_storage()")
                     else:
-                        # Keep set_storage enabled for the model tensors, but avoid
-                        # optimizer/grad storage rebinding due to post-checkpoint
-                        # illegal memory access in optimizer.step().
-                        set_storage(model, storage_optimizer_list, gpu_ar)
+                        set_storage(model, [optimizer], gpu_ar)
                     torch.cuda.empty_cache()
                     chk_monitor = Chk_monitor(model_args.c_lib_path, total_size, model_args.num_threads, model_args.max_async, True,
                                             gpu_ar=gpu_ar, bsize=total_size//5, model=model.state_dict(), optimizer=optimizer.state_dict(), memory_saving=True,
-                                            is_distributed=False, rank=rank, world_size=world_size)
+                                            is_sync=True, is_distributed=False, rank=rank, world_size=world_size)
                     model_engine.chk_monitor = chk_monitor
 
                 print("save checkpoint!!!")
+                if world_size > 1:
+                    # Keep pipeline/data-parallel ranks in lockstep around checkpointing.
+                    torch.distributed.barrier()
+                torch.cuda.synchronize()
                 chk_monitor.save()
+                # Stability mode: wait for background checkpoint work to finish before
+                # continuing with the next train step to avoid async races.
+                while chk_monitor.checkpoint_in_progress() or chk_monitor.gpu_copy_in_progress():
+                    time.sleep(0.001)
+                torch.cuda.synchronize()
+                if world_size > 1:
+                    torch.distributed.barrier()
                 steps_since_checkp = 0
                 checkpoints += 1
             if step == warmup:
@@ -805,4 +784,3 @@ def _mp_fn(index):
 
 if __name__ == "__main__":
     main()
-

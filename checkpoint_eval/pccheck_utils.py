@@ -29,9 +29,14 @@ def set_storage(model, optimizer_list, gpu_ar):
         my_ar = gpu_ar[start_idx:end_idx]
         prev_shape = ref.size()
         with torch.no_grad():
-            temp = ref.clone()
+            # Avoid clone()-based transient peak memory by copying parameter data
+            # directly into the preallocated contiguous checkpoint buffer.
+            my_ar.copy_(ref.view(-1))
             ref.set_(my_ar, 0, tuple(prev_shape))
+<<<<<<< Updated upstream
             ref.copy_(temp)
+=======
+>>>>>>> Stashed changes
         start_idx += ref.numel()
         model_size += ref.numel()
 

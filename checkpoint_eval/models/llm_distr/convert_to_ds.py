@@ -41,7 +41,7 @@ class LMLoss(nn.Module):
         return loss
 
 
-def convert_bloom(model, config, num_stages):
+def convert_bloom(model, config, num_stages, gradient_checkpointing=False):
     state = model.state_dict()
     for k,v in state.items():
         print(k)
@@ -78,7 +78,7 @@ def convert_bloom(model, config, num_stages):
     res.update(last)
 
     # convert
-    layers = get_bloom_causal_lm_specs(config, res)
+    layers = get_bloom_causal_lm_specs(config, res, grad_ckpt=gradient_checkpointing)
 
     model = PipelineModule(layers, loss_fn=LMLoss(False), num_stages=num_stages)
 
@@ -122,8 +122,8 @@ def convert_opt(model, config, num_stages):
     model = PipelineModule(layers, loss_fn=LMLoss(True), num_stages=num_stages)
     return model
 
-def convert(model_name, model, config, num_stages):
+def convert(model_name, model, config, num_stages, gradient_checkpointing=False):
     if 'bloom' in model_name:
-        return convert_bloom(model, config, num_stages)
+        return convert_bloom(model, config, num_stages, gradient_checkpointing=gradient_checkpointing)
     elif 'opt' in model_name:
         return convert_opt(model, config, num_stages)

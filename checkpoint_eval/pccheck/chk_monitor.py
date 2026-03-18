@@ -34,7 +34,7 @@ class Chk_monitor:
     ):
 
         # only 1 background process
-        basic_path = "pccheck_checkpoint.chk"
+        basic_path = f"pccheck_checkpoint_rank{rank}.chk"
         self.lock = Lock()
         self.cp_in_progress = Value("i", 0)
         self.start = Value("i", 0)

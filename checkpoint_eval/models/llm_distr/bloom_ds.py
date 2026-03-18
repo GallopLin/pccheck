@@ -4,10 +4,25 @@ import os.path as osp
 from typing import Optional, Tuple, Union
 import torch
 from torch import nn
-from transformers.models.bloom.modeling_bloom import *
+from transformers.models.bloom import modeling_bloom as bloom_modeling
 from transformers.models.bloom.modeling_bloom import _make_causal_mask, _expand_mask
 
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+
+F = bloom_modeling.F
+dropout_add = bloom_modeling.dropout_add
+BloomAttention = bloom_modeling.BloomAttention
+BloomConfig = bloom_modeling.BloomConfig
+
+# Some transformers versions do not export BloomBlock via `import *`.
+BloomBlockBase = getattr(bloom_modeling, "BloomBlock", None)
+if BloomBlockBase is None:
+    for _name in dir(bloom_modeling):
+        if _name.startswith("Bloom") and _name.endswith("Block"):
+            BloomBlockBase = getattr(bloom_modeling, _name)
+            break
+if BloomBlockBase is None:
+    raise ImportError("Cannot find BLOOM transformer block class in modeling_bloom.")
 
 
 def init_weights(model, std):
@@ -137,7 +152,7 @@ class BloomAttentionFast(BloomAttention):
 
 
 
-class BloomBlockTupleIO(BloomBlock):
+class BloomBlockTupleIO(BloomBlockBase):
 
     def __init__(self, config, res=None, ind=0, gradient_checkpointing=False):
         self.config = config
@@ -283,7 +298,7 @@ def get_bloom_causal_lm_specs(config, res={}, grad_ckpt=False,
     specs.append(BloomTerminal(config, is_first=True, res=res, ind=0))
 
     for i in range(1, config.num_hidden_layers + 1):
-        specs.append(LayerSpec(BloomBlockTupleIO, config, res=res, ind=i))
+        specs.append(LayerSpec(BloomBlockTupleIO, config, res=res, ind=i, gradient_checkpointing=grad_ckpt))
 
     ind = config.num_hidden_layers + 1
     specs.append(BloomTerminal(config, is_first=False, res=res, ind=ind))
