@@ -15,4 +15,6 @@ __pycache__/
 *.pdf
 *.bin
 *.json
-*.csv
+*.csv*.bak_*
+*\ copy.py
+*无异步*
