@@ -14,6 +14,8 @@ import math
 import time
 import os
 import sys
+import importlib
+from pathlib import Path
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
@@ -56,6 +58,18 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+def _import_multistream_utils():
+    """导入 pccheck multistream 工具；必要时补充路径。"""
+    try:
+        return importlib.import_module("checkpoint_eval.pccheck.multistream_pipeline_utils")
+    except ImportError:
+        code_root = Path(__file__).resolve().parents[4]
+        pccheck_root = code_root / "pccheck"
+        if pccheck_root.exists() and str(pccheck_root) not in sys.path:
+            sys.path.insert(0, str(pccheck_root))
+        return importlib.import_module("checkpoint_eval.pccheck.multistream_pipeline_utils")
 
 
 class HuggingFaceDatasetWrapper(Dataset):
@@ -388,6 +402,62 @@ def main():
         checkp_params=checkp_params,
     )
 
+    # 某些环境下 deepspeed.initialize() 可能仍返回 PipelineEngine，缺少 multistream API。
+    has_native_ms_api = hasattr(model_engine, "save_multistream_checkpoint") and hasattr(
+        model_engine, "shutdown_multistream")
+    ms_fallback = None
+    if not has_native_ms_api:
+        logger.warning(
+            "Engine %s does not expose multistream APIs; using pccheck fallback.",
+            type(model_engine).__name__,
+        )
+        ms_utils = _import_multistream_utils()
+        ms_ckpt, ms_gpu_buffer, ms_param_layout = ms_utils.create_stage_checkpoint(
+            model=model_engine.module,
+            optimizer=model_engine.optimizer,
+            checkpoint_dir=model_args.checkpoint_dir,
+            lib_path=model_args.c_lib_path,
+            rank=model_engine.global_rank,
+            world_size=world_size,
+            max_async=model_args.max_async,
+            num_layer_groups=model_args.num_layer_groups,
+            num_threads=model_args.num_threads,
+        )
+        ms_fallback = {
+            "utils": ms_utils,
+            "ckpt": ms_ckpt,
+            "gpu_buffer": ms_gpu_buffer,
+            "param_layout": ms_param_layout,
+        }
+
+    def _save_multistream_checkpoint(step: int, sync: bool = False):
+        if has_native_ms_api:
+            return model_engine.save_multistream_checkpoint(step=step, sync=sync)
+
+        elapsed = ms_fallback["utils"].save_stage_checkpoint(
+            ms_ckpt=ms_fallback["ckpt"],
+            gpu_buffer=ms_fallback["gpu_buffer"],
+            param_layout=ms_fallback["param_layout"],
+            model=model_engine.module,
+            optimizer=model_engine.optimizer,
+            checkpoint_dir=model_args.checkpoint_dir,
+            rank=model_engine.global_rank,
+            step=step,
+            sync=sync,
+        )
+        if model_engine.global_rank == 0:
+            ms_fallback["utils"].save_global_training_state(
+                model_args.checkpoint_dir, step)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return elapsed
+
+    def _shutdown_multistream():
+        if has_native_ms_api:
+            model_engine.shutdown_multistream()
+        elif ms_fallback is not None and ms_fallback["ckpt"] is not None:
+            ms_fallback["ckpt"].shutdown()
+
     # ------------------------------------------------ training loop
     steps_since_checkp = 0
     checkpoints = 0
@@ -400,7 +470,7 @@ def main():
         if (step == warmup) or (cfreq > 0 and steps_since_checkp == cfreq - 1):
             if cfreq > 0:
                 print("save checkpoint (multistream)!!!")
-                model_engine.save_multistream_checkpoint(step=step, sync=False)
+                _save_multistream_checkpoint(step=step, sync=False)
                 steps_since_checkp = 0
                 checkpoints += 1
             if step == warmup:
@@ -411,7 +481,7 @@ def main():
         print(f"Step {step} took {time.time()-starts}")
         starts = time.time()
 
-    model_engine.shutdown_multistream()
+    _shutdown_multistream()
     total_train_time = time.time() - start_training
 
     print(

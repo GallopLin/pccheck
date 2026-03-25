@@ -331,7 +331,16 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     if (is_distributed) {
 
         char const* tmp = getenv("PCCHECK_COORDINATOR");
-        std::string server_ip(tmp);
+        std::string server_ip;
+        if (tmp != nullptr && tmp[0] != '\0') {
+            server_ip = tmp;
+        } else {
+            // 单机多卡默认走本机回环地址，避免 std::string(nullptr) 崩溃
+            server_ip = "127.0.0.1";
+            fprintf(stderr,
+                    "[WARN] PCCHECK_COORDINATOR is not set, fallback to %s\n",
+                    server_ip.c_str());
+        }
 
         printf("My rank is %d\n", my_rank);
         if (my_rank==0) {

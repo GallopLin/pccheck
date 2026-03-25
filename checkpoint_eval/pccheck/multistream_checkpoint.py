@@ -705,8 +705,13 @@ class MultiStreamCheckpoint:
         """将 gpu_ar（tensor 或 dict）转换为 List[Tensor]，长度 = num_streams。"""
         _KEYS = ['param', 'grad', 'exp_avg', 'exp_avg_sq']
         if isinstance(gpu_ar, dict):
-            return [self._detach_buf(gpu_ar.get(k) or gpu_ar.get(i))
-                    for i, k in enumerate(_KEYS)]
+            bufs = []
+            for i, k in enumerate(_KEYS):
+                v = gpu_ar.get(k, None)
+                if v is None:
+                    v = gpu_ar.get(i, None)
+                bufs.append(self._detach_buf(v))
+            return bufs
         # legacy: 使用 stream_sizes 精确拆分（兼容 total_size 不一致的场景）
         offset = 0
         buffers = []
@@ -1042,7 +1047,9 @@ class MultiStreamCheckpoint:
                             total_chunk_elems = int(sum(c[1] for c in chunks))
                         except Exception:
                             total_chunk_elems = 0
-                        for chunk_ptr, chunk_size, offset in chunks:
+                        for chunk_ptr, chunk_size, offset, ready_event in chunks:
+                            if ready_event is not None:
+                                ready_event.synchronize()
                             float_ptr = cast(chunk_ptr, POINTER(c_float))
                             writer.write_stream_chunk(
                                 stream_id,
@@ -1057,7 +1064,7 @@ class MultiStreamCheckpoint:
                         import traceback
                         traceback.print_exc()
                     finally:
-                        for chunk_ptr, _, _ in chunks:
+                        for chunk_ptr, _, _, _ in chunks:
                             writer.return_chunk(chunk_ptr)
                         with self._inflight_ssd_lock:
                             self._inflight_ssd_tasks -= 1
@@ -1131,9 +1138,10 @@ class MultiStreamCheckpoint:
                     chunk_offset = current_offset
                     current_offset += elements_to_process
 
-                    # 确保该 chunk 拷贝完成后再交给 SSD 线程（SSD 线程不触发 CUDA）
-                    current_stream.synchronize()
-                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset)])
+                    # 记录chunk就绪事件；SSD线程在事件完成后再写盘，避免阻塞拷贝线程
+                    chunk_ready_event = torch.cuda.Event()
+                    chunk_ready_event.record(current_stream)
+                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset, chunk_ready_event)])
 
                 # ✅ 所有 GPU→CPU 拷贝命令已完成/已提交，记录跨检查点同步事件
                 if copy_done_event is not None:
@@ -1583,6 +1591,10 @@ class MultiStreamCheckpoint:
         wait_start = time.time()
         
         while True:
+            if (not hasattr(self, '_inflight_ssd_lock')) or (not hasattr(self, '_inflight_ssd_tasks')):
+                # 可能在 __init__ 尚未完整结束时触发 shutdown/dtor，直接返回即可。
+                return
+
             with self._inflight_ssd_lock:
                 inflight = self._inflight_ssd_tasks
             

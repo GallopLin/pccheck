@@ -662,6 +662,7 @@ def main():
     checkpoints = 0
     warmup = 3
 
+    start_training = time.time()
     for step in range(bench_total_steps):
         print(f"Train for step {step}")
         model_engine.train_batch()
@@ -670,7 +671,8 @@ def main():
             if cfreq > 0:
                 print("save checkpoint!!!")
                 if chk is None:
-                    chk = CFCheckpoint(model=model_engine.module.state_dict(), optimizer=optimizer.state_dict())
+                    # 跟踪实时对象，确保每次checkpoint都抓取最新的完整state_dict
+                    chk = CFCheckpoint(model=model_engine.module, optimizer=optimizer)
                 save_checkpoint("./checkpoint-{epoch}-{it}.chk", path_to_pmem,filepath, additional_snapshot, chk, active_snapshot, in_progress_snapshot, lock, \
                     0, step, last_chk_it, change, profile_snap, sync=False)
                 steps_since_checkp = 0
@@ -682,7 +684,15 @@ def main():
             steps_since_checkp += 1
 
     if chk is not None and chk.chk_process is not None:
-        chk.chk_process.kill()
+        # 等待尾部异步checkpoint完成，避免吞吐统计高估
+        wait_start = time.time()
+        while (change.value == 1 or in_progress_snapshot.value == 1 or active_snapshot.value == 1):
+            if time.time() - wait_start > 120:
+                print("[WARN] Timeout waiting for final CheckFreq async checkpoint completion.")
+                break
+            time.sleep(0.01)
+
+        chk.chk_process.terminate()
         chk.chk_process.join()
 
     total_train_time = time.time()-start_training

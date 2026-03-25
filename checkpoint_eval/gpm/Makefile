@@ -1,7 +1,7 @@
-CC = /usr/local/cuda-12.1/bin/nvcc
+CC = /usr/local/cuda-12.6/bin/nvcc
 CC_FLAGS = -rdc=true -O3 -lpthread -lnvidia-ml -arch=sm_80 -lcudnn -lcudadevrt -lcudart_static -lrt -ldl -lcublas -lpmem -Xcompiler -fopenmp -lpci
 CUDA_SDK_PATH := $(SDK_DIR)
-CUDA_PATH := /usr/local/cuda-12.1
+CUDA_PATH := /usr/local/cuda-12.6
 
 INCLUDES := -I$(CUDA_PATH)/include
 
