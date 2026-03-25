@@ -705,8 +705,7 @@ class MultiStreamCheckpoint:
         """将 gpu_ar（tensor 或 dict）转换为 List[Tensor]，长度 = num_streams。"""
         _KEYS = ['param', 'grad', 'exp_avg', 'exp_avg_sq']
         if isinstance(gpu_ar, dict):
-            return [self._detach_buf(gpu_ar.get(k) or gpu_ar.get(i))
-                    for i, k in enumerate(_KEYS)]
+            return [self._detach_buf(gpu_ar[k]) for k in _KEYS]
         # legacy: 使用 stream_sizes 精确拆分（兼容 total_size 不一致的场景）
         offset = 0
         buffers = []

@@ -839,7 +839,7 @@ def train(
     checkpoints = 0
     start_train_time = time.time()
     start_iter = time.time()
-    warmup = 50  # 增加 warmup：大模型需要更多步来让 CUDA 内存分配器稳定
+    warmup = 3  # 增加 warmup：大模型需要更多步来让 CUDA 内存分配器稳定
 
     for batch, (data, target, seq_len, _) in enumerate(
         train_iter, start=last_batch + 1
