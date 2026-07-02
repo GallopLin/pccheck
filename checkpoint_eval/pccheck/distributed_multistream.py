@@ -383,6 +383,8 @@ class DistributedMultiStreamCheckpoint:
         
         # 使用 MultiStream 高效保存
         parall_iter, finalize_metric = self._save_local_checkpoint(sync)
+        self._local_checkpoint._pending_model = self.model
+        self._local_checkpoint.export_metadata(optimizer=self.optimizer)
         self._write_rank_metadata(iteration, parall_iter, finalize_metric)
         
         # rank 0 保存全局元数据（描述拓扑、参数切片等）
@@ -655,6 +657,8 @@ class DistributedOptimizerWrapper:
         """
         # 委托给本地包装器完成检查点
         metric = self.local_wrapper.finalize_checkpoint(wait=wait)
+        self.dist_ckpt._local_checkpoint._pending_model = self.model
+        self.dist_ckpt._local_checkpoint.export_metadata(optimizer=self.optimizer)
         
         # 写入 Rank 元数据
         self.dist_ckpt._write_rank_metadata(

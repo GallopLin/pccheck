@@ -373,7 +373,9 @@ class MultistreamTrainer:
         num_threads=1,
         num_layer_groups=6,
         psize=1,
-        dram_ratio=2.0
+        dram_ratio=2.0,
+        multistream_checkpoint_file="multistream_checkpoint.chk",
+        multistream_metadata_file=None,
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -399,6 +401,12 @@ class MultistreamTrainer:
         self.num_layer_groups = num_layer_groups
         self.psize = psize
         self.dram_ratio = dram_ratio
+        self.multistream_checkpoint_file = multistream_checkpoint_file
+        self.multistream_metadata_file = (
+            multistream_metadata_file
+            if multistream_metadata_file is not None
+            else str(multistream_checkpoint_file) + ".metadata.json"
+        )
         self._ms_checkpoint = None
         print(f"DRAM RATIO IS {dram_ratio}, NUM_LAYER_GROUPS IS {num_layer_groups}")
 
@@ -2207,6 +2215,7 @@ class MultistreamTrainer:
                     )
 
                 with self.accelerator.accumulate(model):
+                    self._cur_train_step = int(step)
                     tr_loss_step = self.training_step(model, inputs)
 
                 if (
@@ -2293,8 +2302,9 @@ class MultistreamTrainer:
                                     num_threads=self.num_threads,
                                     num_layer_groups=self.num_layer_groups,
                                     lib_path=self.c_lib_path,
-                                    filename="multistream_checkpoint.chk",
-                                    max_async=self.max_async
+                                    filename=self.multistream_checkpoint_file,
+                                    max_async=self.max_async,
+                                    metadata_path=self.multistream_metadata_file,
                                 )
                                 self._ms_checkpoint = ms_checkpoint
                                 ms_optimizer = ms_checkpoint.create_optimizer(self.optimizer, model)
@@ -2305,6 +2315,13 @@ class MultistreamTrainer:
                             
                             if os.environ.get("PCCHECK_VERBOSE", "0") == "1":
                                 print(f"Save checkpoint at step {step}")
+
+                            if hasattr(ms_checkpoint, "set_profile_context"):
+                                ms_checkpoint.set_profile_context(
+                                    training_step=int(step),
+                                    cfreq=int(self.cfreq),
+                                    checkpoint_index=int(checkpoints),
+                                )
                             
                             # 使用 step_with_callback 替代 optimizer.step()
                             if self.do_grad_scaling:
@@ -2380,6 +2397,9 @@ class MultistreamTrainer:
                                 self.lr_scheduler.step()
 
                     model.zero_grad()
+                    # Flush buffered forward/backward CUDA timings onto the profiler
+                    # timeline (no-op unless CascadeSave profiling is enabled).
+                    self._flush_train_phase_profile()
                     self.state.global_step += 1
                     self.state.epoch = (
                         epoch + (step + 1 + steps_skipped) / steps_in_epoch
@@ -3361,11 +3381,33 @@ class MultistreamTrainer:
             )
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
+        # CascadeSave profiling: time forward/backward on the GPU so they land on the same
+        # CUDA-elapsed timeline as the D2H copies. CPU launch times would be near-zero for
+        # async kernels and misrepresent the compute/transfer overlap, so we use CUDA events
+        # and resolve them to the CPU timeline after the step's existing sync point.
+        prof_enabled = (
+            getattr(self, "_ms_checkpoint", None) is not None
+            and getattr(self._ms_checkpoint, "profiler_enabled", False)
+            and torch.cuda.is_available()
+        )
+        if prof_enabled:
+            ev_fwd_start = torch.cuda.Event(enable_timing=True)
+            ev_fwd_end = torch.cuda.Event(enable_timing=True)
+            ev_bwd_end = torch.cuda.Event(enable_timing=True)
+            # Capture the CPU launch time as the timeline anchor: the GPU forward begins
+            # ~immediately after launch (queue is short here), so this aligns fwd/bwd with
+            # the perf_counter_ns timeline that D2H copies are also placed on.
+            cpu_fwd_start_ns = time.perf_counter_ns()
+            ev_fwd_start.record()
+
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if prof_enabled:
+            ev_fwd_end.record()
 
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
@@ -3375,7 +3417,51 @@ class MultistreamTrainer:
         else:
             self.accelerator.backward(loss)
 
+        if prof_enabled:
+            ev_bwd_end.record()
+            # Defer the synchronize+readout to the step's existing sync point so we add no
+            # extra stall on the hot path. Stash the events for _flush_train_phase_profile.
+            if not hasattr(self, "_pending_train_phase_events"):
+                self._pending_train_phase_events = []
+            self._pending_train_phase_events.append(
+                (int(getattr(self, "_cur_train_step", -1)), cpu_fwd_start_ns,
+                 ev_fwd_start, ev_fwd_end, ev_bwd_end)
+            )
+
         return loss.detach() / self.args.gradient_accumulation_steps
+
+    def _flush_train_phase_profile(self):
+        """Resolve buffered forward/backward CUDA events onto the CPU profiler timeline.
+
+        Called once per step after the optimizer/checkpoint sync, when the GPU work has
+        completed. ``elapsed_time`` returns milliseconds between events; we anchor each
+        step's forward start to the CPU timestamp captured at launch so the emitted
+        intervals align with the perf_counter_ns timeline used elsewhere.
+        """
+        pending = getattr(self, "_pending_train_phase_events", None)
+        if not pending:
+            return
+        ms_ckpt = getattr(self, "_ms_checkpoint", None)
+        if ms_ckpt is None or not getattr(ms_ckpt, "profiler_enabled", False):
+            self._pending_train_phase_events = []
+            return
+        torch.cuda.synchronize()
+        for step_idx, anchor_ns, ev_fwd_start, ev_fwd_end, ev_bwd_end in pending:
+            try:
+                fwd_ms = ev_fwd_start.elapsed_time(ev_fwd_end)
+                fb_ms = ev_fwd_start.elapsed_time(ev_bwd_end)
+            except RuntimeError:
+                continue
+            fwd_start_ns = anchor_ns
+            fwd_end_ns = anchor_ns + int(fwd_ms * 1e6)
+            bwd_end_ns = anchor_ns + int(fb_ms * 1e6)
+            ms_ckpt.profile_interval(
+                "train_forward", fwd_start_ns, fwd_end_ns, training_step=step_idx,
+            )
+            ms_ckpt.profile_interval(
+                "train_backward", fwd_end_ns, bwd_end_ns, training_step=step_idx,
+            )
+        self._pending_train_phase_events = []
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """

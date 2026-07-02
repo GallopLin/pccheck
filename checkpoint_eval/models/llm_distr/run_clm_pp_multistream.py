@@ -72,6 +72,79 @@ def _import_multistream_utils():
         return importlib.import_module("checkpoint_eval.pccheck.multistream_pipeline_utils")
 
 
+def _write_step_breakdown_record(record, breakdown_dir, rank):
+    os.makedirs(breakdown_dir, exist_ok=True)
+    path = os.path.join(breakdown_dir, f"step_wall_breakdown_rank{rank}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _metadata_barrier_ms(checkpoint_breakdown):
+    if not isinstance(checkpoint_breakdown, dict):
+        return 0.0
+    if "metadata_barrier_ms" in checkpoint_breakdown:
+        return float(checkpoint_breakdown.get("metadata_barrier_ms") or 0.0)
+    return (
+        float(checkpoint_breakdown.get("metadata_ms") or 0.0)
+        + float(checkpoint_breakdown.get("stage_state_ms") or 0.0)
+        + float(checkpoint_breakdown.get("global_state_ms") or 0.0)
+        + float(checkpoint_breakdown.get("barrier_ms") or 0.0)
+    )
+
+
+def _build_step_breakdown_record(
+    *,
+    rank,
+    world_size,
+    step,
+    cfreq,
+    sync,
+    step_wall_ms,
+    train_batch_ms,
+    checkpoint_breakdown,
+):
+    checkpoint_submit_ms = 0.0
+    if isinstance(checkpoint_breakdown, dict):
+        checkpoint_submit_ms = float(
+            checkpoint_breakdown.get("checkpoint_submit_ms") or 0.0)
+    metadata_barrier_ms = _metadata_barrier_ms(checkpoint_breakdown)
+
+    misc_ms = step_wall_ms - train_batch_ms - checkpoint_submit_ms - metadata_barrier_ms
+    if misc_ms < 0:
+        # Keep the stacked bar non-negative and exactly closed. Small negative
+        # values come from nested timer rounding; large ones indicate that the
+        # checkpoint helper measured slightly wider than the outer step timer.
+        metadata_barrier_ms = max(0.0, metadata_barrier_ms + misc_ms)
+        misc_ms = step_wall_ms - train_batch_ms - checkpoint_submit_ms - metadata_barrier_ms
+    if misc_ms < 0:
+        checkpoint_submit_ms = max(0.0, checkpoint_submit_ms + misc_ms)
+        misc_ms = step_wall_ms - train_batch_ms - checkpoint_submit_ms - metadata_barrier_ms
+    misc_ms = max(0.0, misc_ms)
+
+    buckets = {
+        "train_batch_ms": train_batch_ms,
+        "checkpoint_submit_ms": checkpoint_submit_ms,
+        "metadata_barrier_ms": metadata_barrier_ms,
+        "misc_ms": misc_ms,
+    }
+    return {
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "step": int(step),
+        "cfreq": int(cfreq),
+        "sync": bool(sync),
+        "selected": True,
+        "step_wall_ms": float(step_wall_ms),
+        "bucket_sum_ms": float(sum(buckets.values())),
+        "buckets": buckets,
+        "checkpoint_breakdown": checkpoint_breakdown or {},
+        "note": (
+            "Main buckets are foreground wall time only; async D2H/SSD work "
+            "is not added to this stacked bar."
+        ),
+    }
+
+
 class HuggingFaceDatasetWrapper(Dataset):
     def __init__(self, hf_dataset, tokenizer):
         self.hf_dataset = hf_dataset
@@ -149,6 +222,18 @@ class ModelArguments:
     bench_total_steps: int = field(default=100, metadata={"help": "Total benchmark steps"})
     num_layer_groups: int = field(default=8, metadata={"help": "Layer groups for multistream"})
     checkpoint_dir: str = field(default='./ms_checkpoints', metadata={"help": "Checkpoint directory"})
+    step_breakdown: bool = field(
+        default=False,
+        metadata={"help": "Collect one checkpoint-step foreground wall-time breakdown"}
+    )
+    breakdown_step: int = field(
+        default=-1,
+        metadata={"help": "Step to record; -1 selects the first checkpoint step after warmup"}
+    )
+    breakdown_dir: str = field(
+        default="",
+        metadata={"help": "Directory for step wall-time breakdown JSONL output"}
+    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (
@@ -430,11 +515,15 @@ def main():
             "param_layout": ms_param_layout,
         }
 
-    def _save_multistream_checkpoint(step: int, sync: bool = False):
+    def _save_multistream_checkpoint(step: int, sync: bool = False, return_breakdown: bool = False):
         if has_native_ms_api:
-            return model_engine.save_multistream_checkpoint(step=step, sync=sync)
+            return model_engine.save_multistream_checkpoint(
+                step=step,
+                sync=sync,
+                return_breakdown=return_breakdown,
+            )
 
-        elapsed = ms_fallback["utils"].save_stage_checkpoint(
+        stage_result = ms_fallback["utils"].save_stage_checkpoint(
             ms_ckpt=ms_fallback["ckpt"],
             gpu_buffer=ms_fallback["gpu_buffer"],
             param_layout=ms_fallback["param_layout"],
@@ -444,12 +533,44 @@ def main():
             rank=model_engine.global_rank,
             step=step,
             sync=sync,
+            return_breakdown=return_breakdown,
         )
+        if return_breakdown:
+            breakdown = dict(stage_result)
+            elapsed = float(breakdown.get("elapsed_sec", 0.0))
+        else:
+            elapsed = stage_result
+
+        global_state_ms = 0.0
         if model_engine.global_rank == 0:
+            global_state_t0 = time.perf_counter()
             ms_fallback["utils"].save_global_training_state(
                 model_args.checkpoint_dir, step)
+            global_state_ms = (time.perf_counter() - global_state_t0) * 1000.0
+
+        barrier_ms = 0.0
         if torch.distributed.is_initialized():
+            barrier_t0 = time.perf_counter()
             torch.distributed.barrier()
+            barrier_ms = (time.perf_counter() - barrier_t0) * 1000.0
+
+        if return_breakdown:
+            metadata_barrier_ms = (
+                float(breakdown.get("metadata_ms", 0.0))
+                + float(breakdown.get("stage_state_ms", 0.0))
+                + global_state_ms
+                + barrier_ms
+            )
+            total_ms = float(breakdown.get("total_ms", elapsed * 1000.0))
+            total_ms += global_state_ms + barrier_ms
+            breakdown.update({
+                "elapsed_sec": total_ms / 1000.0,
+                "total_ms": total_ms,
+                "global_state_ms": global_state_ms,
+                "barrier_ms": barrier_ms,
+                "metadata_barrier_ms": metadata_barrier_ms,
+            })
+            return breakdown
         return elapsed
 
     def _shutdown_multistream():
@@ -461,16 +582,39 @@ def main():
     # ------------------------------------------------ training loop
     steps_since_checkp = 0
     checkpoints = 0
+    breakdown_dir = model_args.breakdown_dir or os.path.join(
+        model_args.checkpoint_dir, "step_breakdown")
+    breakdown_recorded = False
+    breakdown_target_step = int(model_args.breakdown_step)
+    if model_args.step_breakdown and cfreq <= 0 and rank == 0:
+        logger.warning("Step breakdown requested, but cfreq <= 0 so no checkpoint step exists.")
 
     starts = time.time()
     for step in range(bench_total_steps):
+        step_wall_t0 = time.perf_counter()
         print(f"Train for step {step}")
-        model_engine.train_batch()
 
-        if (step == warmup) or (cfreq > 0 and steps_since_checkp == cfreq - 1):
+        train_t0 = time.perf_counter()
+        model_engine.train_batch()
+        train_batch_ms = (time.perf_counter() - train_t0) * 1000.0
+
+        checkpoint_breakdown = None
+        is_checkpoint_step = (step == warmup) or (cfreq > 0 and steps_since_checkp == cfreq - 1)
+        should_record_breakdown = False
+        if model_args.step_breakdown and is_checkpoint_step and cfreq > 0:
+            if breakdown_target_step >= 0:
+                should_record_breakdown = (step == breakdown_target_step)
+            else:
+                should_record_breakdown = (step > warmup and not breakdown_recorded)
+
+        if is_checkpoint_step:
             if cfreq > 0:
                 print("save checkpoint (multistream)!!!")
-                _save_multistream_checkpoint(step=step, sync=False)
+                checkpoint_breakdown = _save_multistream_checkpoint(
+                    step=step,
+                    sync=False,
+                    return_breakdown=should_record_breakdown,
+                )
                 steps_since_checkp = 0
                 checkpoints += 1
             if step == warmup:
@@ -478,10 +622,40 @@ def main():
                 start_training = time.time()
         else:
             steps_since_checkp += 1
+
+        step_wall_ms = (time.perf_counter() - step_wall_t0) * 1000.0
+        if should_record_breakdown and isinstance(checkpoint_breakdown, dict):
+            record = _build_step_breakdown_record(
+                rank=rank,
+                world_size=world_size,
+                step=step,
+                cfreq=cfreq,
+                sync=False,
+                step_wall_ms=step_wall_ms,
+                train_batch_ms=train_batch_ms,
+                checkpoint_breakdown=checkpoint_breakdown,
+            )
+            _write_step_breakdown_record(record, breakdown_dir, rank)
+            breakdown_recorded = True
+            print(
+                f"[StepBreakdown] rank {rank} recorded step {step} "
+                f"to {breakdown_dir}"
+            )
+
         print(f"Step {step} took {time.time()-starts}")
         starts = time.time()
 
     _shutdown_multistream()
+    if model_args.step_breakdown and not breakdown_recorded:
+        if breakdown_target_step >= 0:
+            raise RuntimeError(
+                f"No checkpoint-step breakdown was recorded for step {breakdown_target_step}. "
+                "Please choose a step that triggers checkpointing."
+            )
+        raise RuntimeError(
+            "No post-warmup checkpoint-step breakdown was recorded. "
+            "Increase --bench_total_steps or pass --breakdown_step to a checkpoint step."
+        )
     total_train_time = time.time() - start_training
 
     print(

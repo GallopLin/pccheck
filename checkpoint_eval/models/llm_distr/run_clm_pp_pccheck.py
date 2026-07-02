@@ -85,6 +85,56 @@ MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+def _infer_model_family(model_args, config) -> str:
+    candidates = [
+        model_args.model_family,
+        model_args.model_name_or_path,
+        model_args.model_type,
+        getattr(config, "model_type", None),
+        getattr(config, "architectures", None),
+    ]
+    joined = " ".join(str(candidate).lower() for candidate in candidates if candidate)
+    if "bloom" in joined:
+        return "bloom"
+    if "opt" in joined:
+        return "opt"
+    raise ValueError(
+        "Could not infer pipeline conversion family. "
+        "Pass --model_family bloom or --model_family opt explicitly."
+    )
+
+
+def _default_pp_degree(model_family: str) -> int:
+    if model_family == "bloom":
+        return 4
+    if model_family == "opt":
+        return 2
+    raise ValueError(f"Unsupported model family for pipeline conversion: {model_family}")
+
+
+def _patch_train_batch_size_for_pipeline(
+    deepspeed_config: dict,
+    global_world_size: int,
+    pipe_parallel_size: int,
+    rank: int = 0,
+) -> None:
+    micro = int(deepspeed_config.get("train_micro_batch_size_per_gpu", 1))
+    grad_acc = int(deepspeed_config.get("gradient_accumulation_steps", 1))
+    pipe_parallel_size = max(1, int(pipe_parallel_size))
+    data_parallel_size = max(1, int(global_world_size) // pipe_parallel_size)
+    expected_train_batch = micro * grad_acc * data_parallel_size
+    current_train_batch = deepspeed_config.get("train_batch_size")
+    if current_train_batch != expected_train_batch:
+        deepspeed_config["train_batch_size"] = expected_train_batch
+        if rank == 0:
+            print(
+                "[PCcheck PP] Patched deepspeed train_batch_size: "
+                f"{current_train_batch} -> {expected_train_batch} "
+                f"(micro={micro}, grad_acc={grad_acc}, "
+                f"dp={data_parallel_size}, pp={pipe_parallel_size}, world={global_world_size})"
+            )
+
+
 class HuggingFaceDatasetWrapper(Dataset):
     def __init__(self, hf_dataset, tokenizer):
         self.hf_dataset = hf_dataset
@@ -271,6 +321,18 @@ class ModelArguments:
         metadata={
             "help": ("Number of steps to train for")
         }
+    )
+    pp_degree: Optional[int] = field(
+        default=None,
+        metadata={"help": "Pipeline parallel degree. Defaults to 4 for BLOOM and 2 for OPT."},
+    )
+    model_family: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pipeline conversion family. Inferred from model/config when omitted: bloom or opt."},
+    )
+    checkpoint_dir: str = field(
+        default="./pccheck_checkpoints",
+        metadata={"help": "Directory root for rank-local PCcheck checkpoint files."},
     )
 
     def __post_init__(self):
@@ -570,7 +632,14 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    model = convert("opt", model, config, 2)
+    model_family = _infer_model_family(model_args, config)
+    pp_degree = int(model_args.pp_degree or _default_pp_degree(model_family))
+    if pp_degree <= 0:
+        raise ValueError(f"--pp_degree must be positive, got {pp_degree}")
+    model_args.model_family = model_family
+    model_args.pp_degree = pp_degree
+    logger.info("Using %s pipeline degree: %s", model_family, pp_degree)
+    model = convert(model_family, model, config, pp_degree)
 
     # # Preprocessing the datasets.
     # # First we tokenize all the texts.
@@ -681,11 +750,15 @@ def main():
     chk_monitor = None
 
     deepspeed.init_distributed(dist_backend='nccl')
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    _patch_train_batch_size_for_pipeline(deepspeed_config, world_size, pp_degree, rank)
+
     model_engine, optimizer, train_loader, lr_schdlr = deepspeed.initialize(
         args=training_args, model=model,
         training_data=train_dataset,
         config=deepspeed_config,
-        checkp_type='PCCHECK',
+        checkp_type='PCCheck',
         checkp_params={
             'chk_monitor': chk_monitor
         }
@@ -695,11 +768,11 @@ def main():
     checkpoints = 0
     warmup = 3
 
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-
     starts = time.time()
+    start_training = None
+    last_step = -1
     for step in range(bench_total_steps):
+        last_step = step
         print(f"Train for step {step}")
         model_engine.train_batch()
 
@@ -710,15 +783,31 @@ def main():
                     gpu_ar, total_size = initialize(
                         model, [optimizer], do_opt_step=False)
                     print(f"----------------- total size is {total_size}, rank: {rank}, world_size: {world_size}")
-                    set_storage(model, [optimizer], gpu_ar)
+                    # initialize() 已完成低峰值的 CPU 暂存 + storage remap，这里不要再二次 set_storage()。
                     torch.cuda.empty_cache()
+                    stage_dir = os.path.join(model_args.checkpoint_dir, f"stage_{rank}")
+                    os.makedirs(stage_dir, exist_ok=True)
+                    checkpoint_file = os.path.join(stage_dir, f"pccheck_checkpoint_rank{rank}.chk")
+                    recovery_metadata_file = os.path.join(stage_dir, "recovery_metadata.json")
                     chk_monitor = Chk_monitor(model_args.c_lib_path, total_size, model_args.num_threads, model_args.max_async, True,
                                             gpu_ar=gpu_ar, bsize=total_size//5, model=model.state_dict(), optimizer=optimizer.state_dict(), memory_saving=True,
-                                            is_distributed=False, rank=rank, world_size=world_size)
+                                            is_distributed=False, rank=rank, world_size=world_size,
+                                            checkpoint_file=checkpoint_file,
+                                            recovery_metadata_file=recovery_metadata_file,
+                                            recovery_checkpoint_file=os.path.basename(checkpoint_file))
                     model_engine.chk_monitor = chk_monitor
 
                 print("save checkpoint!!!")
-                chk_monitor.save()
+                chk_monitor.save(
+                    completed_steps=step,
+                    extra_metadata={
+                        "checkpoint_backend": "pccheck",
+                        "model_family": model_args.model_family,
+                        "pp_degree": model_args.pp_degree,
+                        "rank": rank,
+                        "world_size": world_size,
+                    },
+                )
                 steps_since_checkp = 0
                 checkpoints += 1
             if step == warmup:
@@ -731,10 +820,12 @@ def main():
 
     if chk_monitor is not None:
         chk_monitor.kill_checkpoint()
+    if start_training is None:
+        start_training = time.time()
     total_train_time = time.time() - start_training
 
     print(
-        f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {step}, Number of checkpoints: {checkpoints}"
+        f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {last_step}, Number of checkpoints: {checkpoints}"
     )
     print(f"EXECUTION TIME: {total_train_time} sec")
 

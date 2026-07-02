@@ -51,12 +51,12 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     HfArgumentParser,
-    MultistreamTrainer,
     TrainingArguments,
     default_data_collator,
     is_torch_tpu_available,
     set_seed,
 )
+from transformers.trainer_multistream import MultistreamTrainer
 from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
@@ -630,6 +630,13 @@ def main():
             preds = preds[:, :-1].reshape(-1)
             return metric.compute(predictions=preds, references=labels)
 
+    multistream_checkpoint_file = model_args.multistream_checkpoint_file
+    if multistream_checkpoint_file and not os.path.isabs(multistream_checkpoint_file):
+        multistream_checkpoint_file = os.path.join(training_args.output_dir, multistream_checkpoint_file)
+    multistream_metadata_file = model_args.multistream_metadata_file
+    if multistream_metadata_file and not os.path.isabs(multistream_metadata_file):
+        multistream_metadata_file = os.path.join(training_args.output_dir, multistream_metadata_file)
+
     # Initialize our Trainer
     trainer = MultistreamTrainer(
         model=model,
@@ -650,7 +657,9 @@ def main():
         num_threads = model_args.num_threads,
         num_layer_groups = model_args.num_layer_groups,
         psize = model_args.psize,
-        dram_ratio = model_args.dram_ratio
+        dram_ratio = model_args.dram_ratio,
+        multistream_checkpoint_file=multistream_checkpoint_file,
+        multistream_metadata_file=multistream_metadata_file,
     )
 
     # Training

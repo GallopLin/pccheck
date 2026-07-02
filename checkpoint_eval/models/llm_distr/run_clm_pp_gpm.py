@@ -668,6 +668,22 @@ def main():
     mp.set_start_method("spawn", force=True)
     chk = None
 
+    def _estimate_payload_bytes(payload):
+        total = 0
+
+        def _walk(obj):
+            nonlocal total
+            if torch.is_tensor(obj):
+                total += obj.numel() * obj.element_size()
+            elif hasattr(obj, "state_dict"):
+                _walk(obj.state_dict())
+            elif isinstance(obj, dict):
+                for _, item in obj.items():
+                    _walk(item)
+
+        _walk(payload)
+        return int(total)
+
     deepspeed.init_distributed(dist_backend='nccl')
     model_engine, optimizer, train_loader, lr_schdlr = deepspeed.initialize(
         args=training_args, model=model,
@@ -675,6 +691,13 @@ def main():
         config=deepspeed_config,
         checkp_type='GPM',
     )
+
+    rank = torch.distributed.get_rank()
+    use_rank_file = bool(getattr(model_args, "gpm_rank_file", True))
+    checkpoint_file = f"checkpoint_gpm_rank{rank}.chk" if use_rank_file else "checkpoint_gpm.chk"
+    default_max_mapped_bytes = int(os.environ.get("PCCHECK_GPM_MAX_MAPPED_BYTES", str(24 * 1024**3)))
+    max_mapped_override = int(getattr(model_args, "gpm_max_mapped_bytes", 0) or 0)
+    max_mapped_bytes = max_mapped_override if max_mapped_override > 0 else default_max_mapped_bytes
 
     steps_since_checkp = 0
     checkpoints = 0
@@ -688,15 +711,34 @@ def main():
             if (cfreq>0):
                 print("save checkpoint!!!")
                 if chk is None:
-                    total_size = get_total_size(model_engine.module, [optimizer])
-                    datasize = total_size*2 if training_args.fp16 is True else total_size*4
+                    tracked_payload = {
+                        "model": model_engine.module,
+                        "optimizer": optimizer,
+                    }
+                    payload_bytes = _estimate_payload_bytes(tracked_payload)
+                    mapped_bytes = payload_bytes * 2
+
+                    if mapped_bytes > max_mapped_bytes:
+                        print(
+                            f"[WARN] GPM payload too large on rank {rank}: "
+                            f"payload={payload_bytes} bytes, mapped={mapped_bytes} bytes, "
+                            f"limit={max_mapped_bytes} bytes. Fallback to model-only payload."
+                        )
+                        tracked_payload = {
+                            "model": model_engine.module,
+                        }
+                        payload_bytes = _estimate_payload_bytes(tracked_payload)
+                        mapped_bytes = payload_bytes * 2
+
                     print(
-                        f"total_size is {total_size}, datasize is {datasize}")
+                        f"[INFO] GPM checkpoint payload on rank {rank}: "
+                        f"payload={payload_bytes} bytes, mapped={mapped_bytes} bytes, file={checkpoint_file}"
+                    )
+
                     chk = GPMCheckpoint(
-                            f"checkpoint_gpm.chk",
-                            model=model_engine.module,
-                            optimizer=optimizer,
-                            datasize=datasize  # use float
+                        checkpoint_file,
+                        datasize=payload_bytes,
+                        **tracked_payload,
                     )
                 chk._checkpoint(iter_chk=step)
                 steps_since_checkp = 0

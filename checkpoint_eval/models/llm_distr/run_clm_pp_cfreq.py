@@ -249,6 +249,11 @@ class ModelArguments:
         metadata = {"help": "if specified, the checkpoint will be written to pmem, at this path"}
     )
 
+    pp_degree: int = field(
+        default = 2,
+        metadata = {"help": "Pipeline parallel degree (number of stages)"}
+    )
+
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -531,7 +536,11 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    model = convert("opt", model, config, 2)
+    if model_args.pp_degree <= 0:
+        raise ValueError(f"Invalid pp_degree={model_args.pp_degree}, expected > 0")
+
+    model_key = (model_args.model_name_or_path or getattr(config, "model_type", "opt")).lower()
+    model = convert(model_key, model, config, model_args.pp_degree)
 
     # # Preprocessing the datasets.
     # # First we tokenize all the texts.

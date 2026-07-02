@@ -152,13 +152,14 @@ class MultiStreamPipelineEngine(PipelineEngine):
                     torch.cuda.current_stream().wait_event(events[0])
         super()._exec_optimizer_step(lr_kwargs)
 
-    def save_multistream_checkpoint(self, step, sync=False):
-        """触发 multistream 异步保存，返回耗时（秒）。"""
+    def save_multistream_checkpoint(self, step, sync=False, return_breakdown=False):
+        """触发 multistream 异步保存，默认返回耗时（秒）。"""
         if not self._ms_initialized:
             self._init_multistream()
 
         import os
         import sys
+        import time
         repo_root = os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))
         if repo_root not in sys.path:
@@ -169,7 +170,7 @@ class MultiStreamPipelineEngine(PipelineEngine):
             save_global_training_state,
         )
 
-        elapsed = save_stage_checkpoint(
+        stage_result = save_stage_checkpoint(
             ms_ckpt=self._ms_ckpt,
             gpu_buffer=self._ms_gpu_buffer,
             param_layout=self._ms_param_layout,
@@ -179,14 +180,45 @@ class MultiStreamPipelineEngine(PipelineEngine):
             rank=self.global_rank,
             step=step,
             sync=sync,
+            return_breakdown=return_breakdown,
         )
 
+        if return_breakdown:
+            breakdown = dict(stage_result)
+            elapsed = float(breakdown.get("elapsed_sec", 0.0))
+        else:
+            elapsed = stage_result
+
+        global_state_ms = 0.0
         if self.global_rank == 0:
+            global_state_t0 = time.perf_counter()
             save_global_training_state(
                 self._ms_checkpoint_dir, step)
+            global_state_ms = (time.perf_counter() - global_state_t0) * 1000.0
 
+        barrier_ms = 0.0
         if torch.distributed.is_initialized():
+            barrier_t0 = time.perf_counter()
             torch.distributed.barrier()
+            barrier_ms = (time.perf_counter() - barrier_t0) * 1000.0
+
+        if return_breakdown:
+            metadata_barrier_ms = (
+                float(breakdown.get("metadata_ms", 0.0))
+                + float(breakdown.get("stage_state_ms", 0.0))
+                + global_state_ms
+                + barrier_ms
+            )
+            total_ms = float(breakdown.get("total_ms", elapsed * 1000.0))
+            total_ms += global_state_ms + barrier_ms
+            breakdown.update({
+                "elapsed_sec": total_ms / 1000.0,
+                "total_ms": total_ms,
+                "global_state_ms": global_state_ms,
+                "barrier_ms": barrier_ms,
+                "metadata_barrier_ms": metadata_barrier_ms,
+            })
+            return breakdown
 
         return elapsed
 
@@ -326,8 +358,13 @@ def initialize(args=None,
         config_class = DeepSpeedConfig(config, mpu)
 
         print(f'-------------------- checkp_type is {checkp_type}')
+        checkp_type_norm = (
+            checkp_type.strip().lower()
+            if isinstance(checkp_type, str)
+            else ""
+        )
 
-        if checkp_type == 'CheckFreq':
+        if checkp_type_norm == 'checkfreq':
             engine = CheckFreqPipelineEngine(
                 checkp_params=checkp_params,
                 args=args,
@@ -341,7 +378,7 @@ def initialize(args=None,
                 collate_fn=collate_fn,
                 config=config,
                 config_class=config_class)
-        elif checkp_type == 'PCCheck':
+        elif checkp_type_norm == 'pccheck':
             engine = PCCheckPipelineEngine(
                 checkp_params=checkp_params,
                 args=args,
@@ -355,7 +392,7 @@ def initialize(args=None,
                 collate_fn=collate_fn,
                 config=config,
                 config_class=config_class)
-        elif checkp_type == 'MultiStream':
+        elif checkp_type_norm == 'multistream':
             engine = MultiStreamPipelineEngine(
                 checkp_params=checkp_params,
                 args=args,
