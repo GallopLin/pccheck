@@ -18,13 +18,103 @@ from itertools import cycle
 import os
 import json
 
+
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_choice(name: str, default: str, choices: set) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}, got {value!r}")
+    return value
+
+
+def _env_int(name: str, default: int, min_value: Optional[int] = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        value = int(default)
+    else:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+class CascadeSaveProfiler:
+    """Low-overhead JSONL interval profiler for group-level CascadeSave overlap."""
+
+    def __init__(self, output_dir: str, rank: int = 0, enabled: bool = False):
+        self.enabled = bool(enabled)
+        self.output_dir = output_dir
+        self.rank = int(rank)
+        self.detailed_chunks = (
+            os.environ.get("PCCHECK_CASCADE_PROFILE_CHUNKS", "0").lower()
+            in TRUE_ENV_VALUES
+        )
+        self._lock = Lock()
+        self._path = os.path.join(output_dir, f"cascade_save_rank{self.rank}.jsonl")
+        if self.enabled:
+            os.makedirs(output_dir, exist_ok=True)
+
+    @classmethod
+    def from_env(cls, rank: int = 0):
+        enabled = os.environ.get("PCCHECK_CASCADE_PROFILE", "0").lower() in TRUE_ENV_VALUES
+        rank_filter = os.environ.get("PCCHECK_CASCADE_PROFILE_RANK", "").strip()
+        if rank_filter:
+            try:
+                enabled = enabled and int(rank_filter) == int(rank)
+            except ValueError:
+                pass
+        output_dir = os.environ.get("PCCHECK_CASCADE_PROFILE_DIR", "./cascade_save_profile")
+        return cls(output_dir=output_dir, rank=rank, enabled=enabled)
+
+    @staticmethod
+    def now_ns() -> int:
+        return time.perf_counter_ns()
+
+    def record(self, event: str, **fields):
+        if not self.enabled:
+            return
+        rec = {
+            "event": event,
+            "rank": self.rank,
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "time_ns": self.now_ns(),
+        }
+        rec.update({k: v for k, v in fields.items() if v is not None})
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+    def interval(self, event: str, start_ns: int, end_ns: int, **fields):
+        if not self.enabled:
+            return
+        if end_ns < start_ns:
+            end_ns = start_ns
+        self.record(
+            event,
+            start_ns=int(start_ns),
+            end_ns=int(end_ns),
+            duration_ms=(end_ns - start_ns) / 1e6,
+            **fields,
+        )
+
+
 class MultiStreamOptimizer:
     def __init__(
         self, 
         optimizer: torch.optim.Optimizer,
         layer_groups: List[List[int]],
         param_list: List[torch.nn.Parameter],
-        callback: Optional[Callable[[List[int]], None]] = None
+        callback: Optional[Callable[[List[int]], None]] = None,
+        profiler: Optional[CascadeSaveProfiler] = None,
+        parall_iter: Optional[int] = None,
+        checkpoint_seq: Optional[int] = None,
+        param_group_mode: str = "legacy",
     ):
         """
         Args:
@@ -33,10 +123,17 @@ class MultiStreamOptimizer:
             param_list: 模型参数列表（与layer_id对应）
             callback: 回调函数，签名为 callback(layer_ids)，在每层组更新后调用
         """
-        self.optimizer = optimizer
+        self.original_optimizer = optimizer
+        self.optimizer = self._unwrap_optimizer(optimizer)
         self.layer_groups = layer_groups
         self.param_list = param_list
         self.callback = callback
+        self.profiler = profiler
+        self.parall_iter = parall_iter
+        self.checkpoint_seq = checkpoint_seq
+        self.param_group_mode = param_group_mode
+        if self.param_group_mode != "legacy":
+            raise ValueError(f"param_group_mode must be 'legacy', got {param_group_mode!r}")
         
         # 构建层组到参数的映射
         self.group_params = []
@@ -48,10 +145,24 @@ class MultiStreamOptimizer:
             self.group_params.append(group_params)
         
         # 检测优化器类型
-        self.optimizer_type = type(optimizer).__name__
+        self.optimizer_type = type(self.optimizer).__name__
+        self._param_group_index_by_id = {}
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            for param in group.get("params", []):
+                self._param_group_index_by_id[id(param)] = group_idx
         
         # ✅ 跨检查点同步：更新前的等待回调
         self.pre_update_callback = None  # 签名: pre_update_callback(group_idx)
+
+    @staticmethod
+    def _unwrap_optimizer(optimizer: torch.optim.Optimizer) -> torch.optim.Optimizer:
+        """Return the real PyTorch optimizer used by Accelerate wrappers."""
+        while type(optimizer).__name__ == "AcceleratedOptimizer":
+            inner = getattr(optimizer, "optimizer", None)
+            if inner is None:
+                raise RuntimeError("AcceleratedOptimizer does not expose the wrapped optimizer")
+            optimizer = inner
+        return optimizer
         
     def step_with_callback(self, closure=None):
         loss = None
@@ -63,14 +174,50 @@ class MultiStreamOptimizer:
         for group_idx, (layer_ids, params) in enumerate(zip(self.layer_groups, self.group_params)):
             # ✅ 更新前回调：等待上一个检查点的该层拷贝完成
             if self.pre_update_callback is not None:
+                wait_start = CascadeSaveProfiler.now_ns()
                 self.pre_update_callback(group_idx)
+                wait_end = CascadeSaveProfiler.now_ns()
+                if self.profiler is not None:
+                    self.profiler.interval(
+                        "optimizer_pre_update_wait",
+                        wait_start,
+                        wait_end,
+                        checkpoint_seq=self.checkpoint_seq,
+                        parall_iter=self.parall_iter,
+                        group_idx=group_idx,
+                    )
             
             # 对这组参数执行真实的优化器更新
+            update_start = CascadeSaveProfiler.now_ns()
             self._step_param_group(params)
+            update_end = CascadeSaveProfiler.now_ns()
+            if self.profiler is not None:
+                self.profiler.interval(
+                    "optimizer_update",
+                    update_start,
+                    update_end,
+                    checkpoint_seq=self.checkpoint_seq,
+                    parall_iter=self.parall_iter,
+                    group_idx=group_idx,
+                    layer_start=int(layer_ids[0]) if layer_ids else None,
+                    layer_end=int(layer_ids[-1]) if layer_ids else None,
+                    num_layers=len(layer_ids),
+                )
             
             # 触发回调（在更新完成后），传递 group_idx
             if self.callback is not None:
+                cb_start = CascadeSaveProfiler.now_ns()
                 self.callback(group_idx, layer_ids)
+                cb_end = CascadeSaveProfiler.now_ns()
+                if self.profiler is not None:
+                    self.profiler.interval(
+                        "save_callback_submit",
+                        cb_start,
+                        cb_end,
+                        checkpoint_seq=self.checkpoint_seq,
+                        parall_iter=self.parall_iter,
+                        group_idx=group_idx,
+                    )
         
         return loss
     
@@ -91,191 +238,152 @@ class MultiStreamOptimizer:
             elif self.optimizer_type == 'SGD':
                 self._step_sgd(params)
             else:
-                # 对于其他优化器，使用通用方法（逐参数调用优化器的内部逻辑）
-                self._step_generic(params)
+                raise RuntimeError(
+                    f"Unsupported optimizer type for CascadeSave grouped step: {self.optimizer_type}. "
+                    "Supported optimizers are Adam, AdamW, and SGD."
+                )
+
+    def _iter_param_group_batches(self, params: List[torch.nn.Parameter]):
+        yield self.optimizer.param_groups[0], params
+
+    def _ensure_adam_state(self, state: Dict, param: torch.nn.Parameter):
+        if len(state) == 0:
+            state['step'] = torch.tensor(0.)
+            state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+        elif not isinstance(state.get('step'), torch.Tensor):
+            state['step'] = torch.tensor(float(state['step']))
     
     def _step_adam(self, params: List[torch.nn.Parameter]):
         """执行Adam更新（使用PyTorch的functional API）"""
         from torch.optim._functional import adam
         
-        # 获取优化器的超参数（从第一个param_group）
-        group = self.optimizer.param_groups[0]
-        
-        # 收集批量参数
-        params_list = []
-        grads_list = []
-        exp_avgs_list = []
-        exp_avg_sqs_list = []
-        max_exp_avg_sqs_list = []
-        state_steps_list = []
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            # 获取或初始化state
-            state = self.optimizer.state[param]
-            
-            # 初始化state（如果需要）
-            if len(state) == 0:
-                state['step'] = torch.tensor(0.)
-                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-            
-            # 增加步数
-            state['step'] += 1
-            
-            params_list.append(param)
-            grads_list.append(param.grad)
-            exp_avgs_list.append(state['exp_avg'])
-            exp_avg_sqs_list.append(state['exp_avg_sq'])
-            state_steps_list.append(state['step'])
-            
-        if not params_list:
-            return
+        for group, group_params in self._iter_param_group_batches(params):
+            params_list = []
+            grads_list = []
+            exp_avgs_list = []
+            exp_avg_sqs_list = []
+            max_exp_avg_sqs_list = []
+            state_steps_list = []
 
-        # 调用PyTorch的functional API进行批量更新 (foreach=True)
-        adam(
-            params_list,
-            grads_list,
-            exp_avgs_list,
-            exp_avg_sqs_list,
-            max_exp_avg_sqs_list,
-            state_steps_list,
-            amsgrad=group.get('amsgrad', False),
-            beta1=group['betas'][0],
-            beta2=group['betas'][1],
-            lr=group['lr'],
-            weight_decay=group.get('weight_decay', 0),
-            eps=group['eps'],
-            maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
-            capturable=False,
-            differentiable=False,
-            fused=False,
-            grad_scale=None,
-            found_inf=None
-        )
+            for param in group_params:
+                if param.grad is None:
+                    continue
+
+                state = self.optimizer.state[param]
+                self._ensure_adam_state(state, param)
+
+                params_list.append(param)
+                grads_list.append(param.grad)
+                exp_avgs_list.append(state['exp_avg'])
+                exp_avg_sqs_list.append(state['exp_avg_sq'])
+                state_steps_list.append(state['step'])
+
+            if not params_list:
+                continue
+
+            adam(
+                params_list,
+                grads_list,
+                exp_avgs_list,
+                exp_avg_sqs_list,
+                max_exp_avg_sqs_list,
+                state_steps_list,
+                amsgrad=group.get('amsgrad', False),
+                beta1=group['betas'][0],
+                beta2=group['betas'][1],
+                lr=group['lr'],
+                weight_decay=group.get('weight_decay', 0),
+                eps=group['eps'],
+                maximize=group.get('maximize', False),
+                foreach=True,
+                capturable=False,
+                differentiable=False,
+                fused=False,
+                grad_scale=None,
+                found_inf=None
+            )
     
     def _step_adamw(self, params: List[torch.nn.Parameter]):
         """执行AdamW更新"""
         from torch.optim._functional import adamw
         
-        group = self.optimizer.param_groups[0]
-        
-        # 收集批量参数
-        params_list = []
-        grads_list = []
-        exp_avgs_list = []
-        exp_avg_sqs_list = []
-        max_exp_avg_sqs_list = []
-        state_steps_list = []
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            state = self.optimizer.state[param]
-            
-            if len(state) == 0:
-                state['step'] = torch.tensor(0.)
-                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-            
-            state['step'] += 1
-            
-            params_list.append(param)
-            grads_list.append(param.grad)
-            exp_avgs_list.append(state['exp_avg'])
-            exp_avg_sqs_list.append(state['exp_avg_sq'])
-            state_steps_list.append(state['step'])
-            
-        if not params_list:
-            return
+        for group, group_params in self._iter_param_group_batches(params):
+            params_list = []
+            grads_list = []
+            exp_avgs_list = []
+            exp_avg_sqs_list = []
+            max_exp_avg_sqs_list = []
+            state_steps_list = []
 
-        adamw(
-            params_list,
-            grads_list,
-            exp_avgs_list,
-            exp_avg_sqs_list,
-            max_exp_avg_sqs_list,
-            state_steps_list,
-            amsgrad=group.get('amsgrad', False),
-            beta1=group['betas'][0],
-            beta2=group['betas'][1],
-            lr=group['lr'],
-            weight_decay=group.get('weight_decay', 0),
-            eps=group['eps'],
-            maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
-            capturable=False,
-            differentiable=False,
-            fused=False,
-            grad_scale=None,
-            found_inf=None
-        )
+            for param in group_params:
+                if param.grad is None:
+                    continue
+
+                state = self.optimizer.state[param]
+                self._ensure_adam_state(state, param)
+
+                params_list.append(param)
+                grads_list.append(param.grad)
+                exp_avgs_list.append(state['exp_avg'])
+                exp_avg_sqs_list.append(state['exp_avg_sq'])
+                state_steps_list.append(state['step'])
+
+            if not params_list:
+                continue
+
+            adamw(
+                params_list,
+                grads_list,
+                exp_avgs_list,
+                exp_avg_sqs_list,
+                max_exp_avg_sqs_list,
+                state_steps_list,
+                amsgrad=group.get('amsgrad', False),
+                beta1=group['betas'][0],
+                beta2=group['betas'][1],
+                lr=group['lr'],
+                weight_decay=group.get('weight_decay', 0),
+                eps=group['eps'],
+                maximize=group.get('maximize', False),
+                foreach=True,
+                capturable=False,
+                differentiable=False,
+                fused=False,
+                grad_scale=None,
+                found_inf=None
+            )
     
     def _step_sgd(self, params: List[torch.nn.Parameter]):
         """执行SGD更新"""
         from torch.optim._functional import sgd
         
-        group = self.optimizer.param_groups[0]
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            state = self.optimizer.state[param]
-            
-            # SGD的momentum buffer
-            momentum_buffer_list = []
-            if 'momentum_buffer' in state:
-                momentum_buffer_list.append(state['momentum_buffer'])
-            else:
-                momentum_buffer_list.append(None)
-            
-            sgd(
-                [param],
-                [param.grad],
-                momentum_buffer_list,
-                weight_decay=group.get('weight_decay', 0),
-                momentum=group.get('momentum', 0),
-                lr=group['lr'],
-                dampening=group.get('dampening', 0),
-                nesterov=group.get('nesterov', False),
-                maximize=group.get('maximize', False),
-                foreach=False,
-                fused=False,
-                grad_scale=None,
-                found_inf=None
-            )
-            
-            # 更新momentum buffer
-            if momentum_buffer_list[0] is not None:
-                state['momentum_buffer'] = momentum_buffer_list[0]
-    
-    def _step_generic(self, params: List[torch.nn.Parameter]):
-        """
-        通用的参数更新方法（用于不支持的优化器类型）
-        通过临时修改param_groups来实现
-        """
-        # 保存原始的param_groups
-        original_param_groups = self.optimizer.param_groups
-        
-        # 创建临时param_group（只包含当前要更新的参数）
-        temp_param_group = {
-            'params': params,
-            **{k: v for k, v in original_param_groups[0].items() if k != 'params'}
-        }
-        
-        # 临时替换param_groups
-        self.optimizer.param_groups = [temp_param_group]
-        
-        # 执行标准的step
-        self.optimizer.step()
-        
-        # 恢复原始的param_groups
-        self.optimizer.param_groups = original_param_groups
+        for group, group_params in self._iter_param_group_batches(params):
+            for param in group_params:
+                if param.grad is None:
+                    continue
+
+                state = self.optimizer.state[param]
+                momentum_buffer_list = [state.get('momentum_buffer')]
+
+                sgd(
+                    [param],
+                    [param.grad],
+                    momentum_buffer_list,
+                    weight_decay=group.get('weight_decay', 0),
+                    momentum=group.get('momentum', 0),
+                    lr=group['lr'],
+                    dampening=group.get('dampening', 0),
+                    nesterov=group.get('nesterov', False),
+                    maximize=group.get('maximize', False),
+                    foreach=False,
+                    fused=False,
+                    grad_scale=None,
+                    found_inf=None
+                )
+
+                if momentum_buffer_list[0] is not None:
+                    state['momentum_buffer'] = momentum_buffer_list[0]
     
     def step(self, closure=None):
         """
@@ -396,11 +504,12 @@ class MultiStreamWriter:
         self.lib.return_cpu_slot.argtypes = [c_void_p, c_int]
         
         # ✅ 注册borrow_chunk和return_chunk
-        if hasattr(self.lib, 'borrow_chunk'):
-            self.lib.borrow_chunk.restype = c_void_p
-            self.lib.borrow_chunk.argtypes = [c_void_p]
-            self.lib.return_chunk.restype = None
-            self.lib.return_chunk.argtypes = [c_void_p, c_void_p]
+        if not hasattr(self.lib, 'borrow_chunk') or not hasattr(self.lib, 'return_chunk'):
+            raise RuntimeError("Multistream shared library must export borrow_chunk and return_chunk")
+        self.lib.borrow_chunk.restype = c_void_p
+        self.lib.borrow_chunk.argtypes = [c_void_p]
+        self.lib.return_chunk.restype = None
+        self.lib.return_chunk.argtypes = [c_void_p, c_void_p]
         
         print(f"✓ MultiStreamWriter initialized with {num_streams} streams")
         print(f"  DRAMAlloc: {num_chunks} chunks of size {chunk_size} floats ({chunk_size*4/1e6:.2f} MB)")
@@ -519,6 +628,31 @@ class MultiStreamCheckpoint:
         self.rank = rank
         self.world_size = world_size
         self.metadata_path = metadata_path
+        self.ab_mode = _env_choice(
+            "PCCHECK_CASCADE_AB_MODE",
+            "legacy",
+            {"legacy"},
+        )
+        self.group_strategy = _env_choice(
+            "PCCHECK_LAYER_GROUP_STRATEGY",
+            "legacy",
+            {"legacy"},
+        )
+        self.d2h_copy_mode = _env_choice(
+            "PCCHECK_D2H_COPY_MODE",
+            "segmented",
+            {"segmented"},
+        )
+        self.param_group_mode = _env_choice(
+            "PCCHECK_OPTIMIZER_PARAM_GROUP_MODE",
+            "legacy",
+            {"legacy"},
+        )
+        self.pinned_chunk_policy = _env_choice(
+            "PCCHECK_PINNED_CHUNK_POLICY",
+            "legacy",
+            {"legacy"},
+        )
         
         # 计算每个流的大小
         self.stream_sizes = self._calculate_stream_sizes()
@@ -530,6 +664,10 @@ class MultiStreamCheckpoint:
         print(f"\nMultiStreamCheckpoint Configuration:")
         print(f"  Total size: {total_size:,} floats ({total_size*4/1e9:.2f} GB)")
         print(f"  Num streams: {num_streams}")
+        print(f"  AB mode: {self.ab_mode}")
+        print(f"  Layer group strategy: {self.group_strategy}")
+        print(f"  D2H copy mode: {self.d2h_copy_mode}")
+        print(f"  Pinned chunk policy: {self.pinned_chunk_policy}")
         print(f"  Stream sizes:")
         for i, size in enumerate(self.stream_sizes):
             param_type = ['param', 'grad', 'exp_avg', 'exp_avg_sq'][i]
@@ -539,18 +677,13 @@ class MultiStreamCheckpoint:
         self.layer_groups = self._create_layer_groups()
         print(f"  Layer groups: {len(self.layer_groups)} groups")
 
-        # self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB
-        
-        # 优化：根据模型大小动态调整 chunk size (问题7)
         model_size_gb = total_size * 4 / 1e9
         if model_size_gb < 0.5:
-            self.chunk_size = 4 * 1024 * 1024   # 4M floats = 16MB
+            self.chunk_size = 4 * 1024 * 1024   # 16 MiB
         elif model_size_gb < 2:
-            self.chunk_size = 8 * 1024 * 1024   # 8M floats = 32MB
-        elif model_size_gb < 5:
-            self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB
+            self.chunk_size = 8 * 1024 * 1024   # 32 MiB
         else:
-            self.chunk_size = 16 * 1024 * 1024  # 32M floats = 128MB
+            self.chunk_size = 16 * 1024 * 1024  # 64 MiB
         
         # 策略2：基于实际并发需求估算
         # 关键洞察：虽然层组是串行的，但SSD写入慢，chunks会在pipeline中堆积
@@ -558,21 +691,13 @@ class MultiStreamCheckpoint:
         max_stream_size = max(self.stream_sizes)
         chunks_per_stream = (max_stream_size + self.chunk_size - 1) // self.chunk_size
         
-        # 并发分析：
-        # - 理论上：每个checkpoint最多num_layer_groups个层组在飞行中
-        # - 实际上：由于SSD写入慢，几乎所有层组的chunks都被占用直到checkpoint完成
-        # - 因此需要：max_async × num_streams × chunks_per_stream
-        # 
-        # 但由于chunks是按需借用的，可以适当减少（假设有50%的复用率）
         estimated_concurrent_chunks = max_async * num_streams * chunks_per_stream
         self.num_chunks = int(estimated_concurrent_chunks * 0.6) + num_streams * 2
-        
-        # 确保不少于一个checkpoint的完整需求
         min_chunks = num_streams * chunks_per_stream + num_streams
         self.num_chunks = max(self.num_chunks, min_chunks)
         
         print(f"  DRAMAlloc chunk size: {self.chunk_size} floats ({self.chunk_size*4/1024/1024:.2f} MB)")
-        print(f"  DRAMAlloc num chunks: {self.num_chunks} (chunks/stream={chunks_per_stream}, estimated_usage=60%, Total: {self.num_chunks*self.chunk_size*4/1024/1024/1024:.2f} GB)")
+        print(f"  DRAMAlloc num chunks: {self.num_chunks} (chunks/stream={chunks_per_stream}, Total: {self.num_chunks*self.chunk_size*4/1024/1024/1024:.2f} GB)")
         
         # 初始化多流writer
         resolved_filename = filename
@@ -611,15 +736,15 @@ class MultiStreamCheckpoint:
         # 创建双线程池架构：
         # 1. copy_thread_pool: 专门处理 GPU→CPU 拷贝（等待 CUDA stream 同步）
         # 2. ssd_thread_pool: 专门处理 SSD 写入（IO 密集型，不阻塞拷贝）
-        import os
         cpu_count = os.cpu_count() or 16
         
-        # GPU→CPU 拷贝线程池：每个流一个线程足够（瓶颈在 PCIe 带宽）
-        copy_pool_workers = num_streams * (max_async + 1)
+        default_copy_workers = num_streams * (max_async + 1) if self.ab_mode == "legacy" else num_streams * max(1, max_async)
+        copy_pool_workers = _env_int("PCCHECK_COPY_WORKERS", default_copy_workers, 1)
         self.copy_thread_pool = ThreadPoolExecutor(max_workers=copy_pool_workers, thread_name_prefix="copy_worker")
         
         # SSD 写入线程池：IO 密集型，可以多一些线程
-        ssd_pool_workers = min(num_streams * max_async * 2, cpu_count)
+        default_ssd_workers = min(num_streams * max_async * 2, cpu_count)
+        ssd_pool_workers = _env_int("PCCHECK_SSD_WORKERS", default_ssd_workers, 1)
         self.ssd_thread_pool = ThreadPoolExecutor(max_workers=ssd_pool_workers, thread_name_prefix="ssd_worker")
         
         # 保留旧名称以兼容性（指向 copy_thread_pool）
@@ -644,6 +769,23 @@ class MultiStreamCheckpoint:
         self._max_async = max_async
         self._slot_available_event = threading.Event()  # 槽位释放通知
         self._slot_available_event.set()  # 初始状态：有可用槽位
+        self.cascade_profiler = CascadeSaveProfiler.from_env(rank=rank)
+        self._profile_checkpoint_counter = 0
+        self._profile_context = {}
+        if self.cascade_profiler.enabled:
+            self.cascade_profiler.record(
+                "profiler_enabled",
+                total_size=int(total_size),
+                num_streams=int(num_streams),
+                num_layer_groups=int(self.num_layer_groups),
+                max_async=int(max_async),
+                filename=str(self.filename),
+                ab_mode=self.ab_mode,
+                group_strategy=self.group_strategy,
+                d2h_copy_mode=self.d2h_copy_mode,
+                chunk_size_floats=int(self.chunk_size),
+                pinned_chunks=int(self.num_chunks),
+            )
         
         # ✅ 跨检查点同步：记录每个层组的拷贝完成事件
         # _layer_copy_events[group_idx] = [event0, event1, event2, event3] (每个流一个事件)
@@ -721,18 +863,47 @@ class MultiStreamCheckpoint:
         return buffers
     
     def _create_layer_groups(self):
-        """将层分成多组"""
+        """将层按 legacy 条目数均分。"""
         total_layers = len(self.param_layout)
+        if total_layers == 0:
+            return []
+
         layers_per_group = max(1, total_layers // self.num_layer_groups)
         
         groups = []
         for i in range(self.num_layer_groups):
             start = i * layers_per_group
-            end = min((i + 1) * layers_per_group, total_layers)
+            end = total_layers if i == self.num_layer_groups - 1 else min((i + 1) * layers_per_group, total_layers)
             if start < total_layers:
                 groups.append(list(range(start, end)))
         
         return groups
+
+    def _get_profile_seq(self, parall_iter):
+        with self._slot_lock:
+            slot_info = self._checkpoint_slots.get(parall_iter, {})
+            return slot_info.get("profile_seq")
+
+    def set_profile_context(self, **fields):
+        """Attach training context to the next checkpoint profiler records."""
+        self._profile_context = {k: v for k, v in fields.items() if v is not None}
+
+    def profile_interval(self, event, start_ns, end_ns, **fields):
+        """Record a profiler interval merged with the current training context.
+
+        Thin wrapper so callers outside this module (e.g. the Trainer's forward/backward
+        timing) can emit events onto the same CascadeSave timeline without reaching into
+        the profiler internals. No-op when profiling is disabled.
+        """
+        if not self.cascade_profiler.enabled:
+            return
+        merged = dict(self._profile_context)
+        merged.update({k: v for k, v in fields.items() if v is not None})
+        self.cascade_profiler.interval(event, start_ns, end_ns, **merged)
+
+    @property
+    def profiler_enabled(self):
+        return self.cascade_profiler.enabled
 
     # ====================== Metadata Export ======================
     def _serialize_optimizer_param_groups(self, optimizer, param_name_to_param):
@@ -889,6 +1060,15 @@ class MultiStreamCheckpoint:
             except Exception:
                 checkpoint_file = None
 
+        existing_latest_parall_iter = None
+        if output_path and os.path.exists(output_path):
+            try:
+                with open(output_path, "r", encoding="utf-8") as f:
+                    existing_metadata = json.load(f)
+                existing_latest_parall_iter = existing_metadata.get("latest_parall_iter")
+            except Exception:
+                existing_latest_parall_iter = None
+
         metadata = {
             "format": "multistream",
             "version": 1,
@@ -902,6 +1082,13 @@ class MultiStreamCheckpoint:
             "checkpoint_padding_bytes": int(checkpoint_padding_bytes),
             "checkpoint_stride_floats": int(checkpoint_stride_floats),
             "num_chunks": len(chunks),
+            "cascade_ab_mode": self.ab_mode,
+            "layer_group_strategy": self.group_strategy,
+            "d2h_copy_mode": self.d2h_copy_mode,
+            "optimizer_param_group_mode": self.param_group_mode,
+            "pinned_chunk_policy": self.pinned_chunk_policy,
+            "d2h_chunk_size_floats": int(self.chunk_size),
+            "pinned_buffer_chunks": int(self.num_chunks),
             "chunks": chunks,
             "param_map": param_map,
         }
@@ -910,6 +1097,8 @@ class MultiStreamCheckpoint:
             metadata["optimizer_param_groups"] = optimizer_param_groups
         if optimizer_steps is not None:
             metadata["optimizer_steps"] = optimizer_steps
+        if existing_latest_parall_iter is not None:
+            metadata["latest_parall_iter"] = int(existing_latest_parall_iter)
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -951,6 +1140,8 @@ class MultiStreamCheckpoint:
         """
         # ✅ 创建 4 个拷贝完成事件，每个流一个
         copy_done_events = [torch.cuda.Event() for _ in range(4)]
+        profile_seq = self._get_profile_seq(parall_iter)
+        submit_start = CascadeSaveProfiler.now_ns()
         
         # 使用线程池提交任务（避免反复创建销毁线程）
         futures = []
@@ -963,6 +1154,19 @@ class MultiStreamCheckpoint:
                 copy_done_events[stream_id], group_idx
             )
             futures.append(future)
+        submit_end = CascadeSaveProfiler.now_ns()
+        self.cascade_profiler.interval(
+            "save_layer_group_submit",
+            submit_start,
+            submit_end,
+            checkpoint_seq=profile_seq,
+            parall_iter=parall_iter,
+            group_idx=group_idx,
+            num_streams=len(futures),
+            layer_start=int(layer_group_ids[0]) if layer_group_ids else None,
+            layer_end=int(layer_group_ids[-1]) if layer_group_ids else None,
+            num_layers=len(layer_group_ids),
+        )
         
         # ✅ 立即更新层组的拷贝完成事件列表（事件会在各自的流中被记录）
         with self._layer_copy_events_lock:
@@ -1003,6 +1207,8 @@ class MultiStreamCheckpoint:
             
             stream_index = parall_iter % (self._max_async + 1)
             current_stream = self.cuda_streams[stream_index][stream_id]
+            profile_seq = self._get_profile_seq(parall_iter)
+            worker_start = CascadeSaveProfiler.now_ns()
 
             with torch.cuda.stream(current_stream):
                 # 等待默认流上的参数更新完成
@@ -1036,21 +1242,171 @@ class MultiStreamCheckpoint:
                     # 即使没有数据，也要记录事件（保持一致性）
                     if copy_done_event is not None:
                         copy_done_event.record(current_stream)
+                    self.cascade_profiler.interval(
+                        "save_stream_worker",
+                        worker_start,
+                        CascadeSaveProfiler.now_ns(),
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        group_idx=group_idx,
+                        stream_id=stream_id,
+                        param_type=param_type,
+                        bytes=0,
+                    )
                     return
+
+                detailed_chunks = self.cascade_profiler.detailed_chunks
+                total_chunks = (total_elements + self.chunk_size - 1) // self.chunk_size
+                profile_agg_lock = Lock()
+                d2h_profile = {"count": 0, "start": None, "end": None, "bytes": 0}
+                ssd_profile = {"count": 0, "start": None, "end": None, "bytes": 0}
+                # Pure GPU->CPU copy-kernel time per stream: sum of CUDA-elapsed copy
+                # durations, anchored to the first chunk's enqueue launch. Unlike d2h_copy
+                # (which folds in the SSD-wait tail) or d2h_enqueue (which inflates under
+                # buffer back-pressure), this is the honest DMA span for the transfer lane.
+                kernel_profile = {"count": 0, "anchor_ns": None, "cuda_ms": 0.0, "bytes": 0}
+
+                def _record_kernel(start_ns, cuda_ms, num_bytes):
+                    with profile_agg_lock:
+                        kernel_profile["count"] += 1
+                        kernel_profile["cuda_ms"] += float(cuda_ms)
+                        kernel_profile["bytes"] += int(num_bytes)
+                        if kernel_profile["anchor_ns"] is None:
+                            kernel_profile["anchor_ns"] = start_ns
+                        else:
+                            kernel_profile["anchor_ns"] = min(kernel_profile["anchor_ns"], start_ns)
+                        if kernel_profile["count"] != total_chunks:
+                            return
+                        anchor = kernel_profile["anchor_ns"]
+                        total_cuda_ms = kernel_profile["cuda_ms"]
+                        agg_bytes = kernel_profile["bytes"]
+                    self.cascade_profiler.interval(
+                        "d2h_copy_kernel",
+                        int(anchor),
+                        int(anchor + total_cuda_ms * 1_000_000.0),
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        group_idx=group_idx,
+                        stream_id=stream_id,
+                        param_type=param_type,
+                        chunks=int(total_chunks),
+                        bytes=int(agg_bytes),
+                        cuda_elapsed_ms=total_cuda_ms,
+                        aggregate=True,
+                    )
+
+                def _record_aggregate(state, event, start_ns, end_ns, num_bytes):
+                    with profile_agg_lock:
+                        state["count"] += 1
+                        state["bytes"] += int(num_bytes)
+                        state["start"] = start_ns if state["start"] is None else min(state["start"], start_ns)
+                        state["end"] = end_ns if state["end"] is None else max(state["end"], end_ns)
+                        if state["count"] != total_chunks:
+                            return
+                        agg_start = state["start"]
+                        agg_end = state["end"]
+                        agg_bytes = state["bytes"]
+
+                    self.cascade_profiler.interval(
+                        event,
+                        agg_start,
+                        agg_end,
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        group_idx=group_idx,
+                        stream_id=stream_id,
+                        param_type=param_type,
+                        chunks=int(total_chunks),
+                        bytes=int(agg_bytes),
+                        aggregate=True,
+                    )
 
                 # ========== 阶段2：异步写入 SSD ==========
                 # ✅ 供“按 chunk 流式提交”使用：避免 pinned chunk 池不足导致 borrow_chunk 阻塞/死锁（H6）
                 def ssd_write_task(chunks, stream_id, offset_in_stream, parall_iter, num_threads, writer):
                     try:
-                        total_chunk_elems = 0
-                        try:
-                            total_chunk_elems = int(sum(c[1] for c in chunks))
-                        except Exception:
-                            total_chunk_elems = 0
-                        for chunk_ptr, chunk_size, offset, ready_event in chunks:
+                        for (
+                            chunk_ptr,
+                            chunk_size,
+                            offset,
+                            ready_event,
+                            copy_start_event,
+                            chunk_id,
+                            d2h_enqueue_start_ns,
+                            d2h_enqueue_end_ns,
+                        ) in chunks:
+                            wait_start = CascadeSaveProfiler.now_ns()
                             if ready_event is not None:
                                 ready_event.synchronize()
+                            wait_end = CascadeSaveProfiler.now_ns()
+                            if detailed_chunks:
+                                self.cascade_profiler.interval(
+                                    "ssd_wait_d2h",
+                                    wait_start,
+                                    wait_end,
+                                    checkpoint_seq=profile_seq,
+                                    parall_iter=parall_iter,
+                                    group_idx=group_idx,
+                                    stream_id=stream_id,
+                                    param_type=param_type,
+                                    chunk_id=chunk_id,
+                                    bytes=int(chunk_size) * 4,
+                                )
+                            if detailed_chunks and copy_start_event is not None and ready_event is not None:
+                                d2h_ms = float(copy_start_event.elapsed_time(ready_event))
+                                d2h_end_ns = wait_end
+                                d2h_start_ns = max(
+                                    int(d2h_enqueue_start_ns),
+                                    int(d2h_end_ns - d2h_ms * 1_000_000.0),
+                                )
+                                self.cascade_profiler.interval(
+                                    "d2h_copy",
+                                    d2h_start_ns,
+                                    d2h_end_ns,
+                                    checkpoint_seq=profile_seq,
+                                    parall_iter=parall_iter,
+                                    group_idx=group_idx,
+                                    stream_id=stream_id,
+                                    param_type=param_type,
+                                    chunk_id=chunk_id,
+                                    bytes=int(chunk_size) * 4,
+                                    cuda_elapsed_ms=d2h_ms,
+                                )
+                            elif not detailed_chunks:
+                                _record_aggregate(
+                                    d2h_profile,
+                                    "d2h_copy",
+                                    int(d2h_enqueue_start_ns),
+                                    int(wait_end),
+                                    int(chunk_size) * 4,
+                                )
+                            # Pure copy-kernel span for the transfer lane (all groups, any mode).
+                            if copy_start_event is not None and ready_event is not None:
+                                kernel_ms = float(copy_start_event.elapsed_time(ready_event))
+                                kernel_end_ns = wait_end
+                                kernel_start_ns = max(
+                                    int(d2h_enqueue_start_ns),
+                                    int(kernel_end_ns - kernel_ms * 1_000_000.0),
+                                )
+                                self.cascade_profiler.interval(
+                                    "d2h_copy_kernel_chunk",
+                                    kernel_start_ns,
+                                    kernel_end_ns,
+                                    checkpoint_seq=profile_seq,
+                                    parall_iter=parall_iter,
+                                    group_idx=group_idx,
+                                    stream_id=stream_id,
+                                    param_type=param_type,
+                                    chunk_id=chunk_id,
+                                    bytes=int(chunk_size) * 4,
+                                    cuda_elapsed_ms=kernel_ms,
+                                    enqueue_start_ns=int(d2h_enqueue_start_ns),
+                                    enqueue_end_ns=int(d2h_enqueue_end_ns),
+                                    observed_ready_ns=int(kernel_end_ns),
+                                )
+                                _record_kernel(int(d2h_enqueue_start_ns), kernel_ms, int(chunk_size) * 4)
                             float_ptr = cast(chunk_ptr, POINTER(c_float))
+                            write_start = CascadeSaveProfiler.now_ns()
                             writer.write_stream_chunk(
                                 stream_id,
                                 float_ptr,
@@ -1059,12 +1415,35 @@ class MultiStreamCheckpoint:
                                 parall_iter,
                                 num_threads,
                             )
+                            write_end = CascadeSaveProfiler.now_ns()
+                            if detailed_chunks:
+                                self.cascade_profiler.interval(
+                                    "ssd_write",
+                                    write_start,
+                                    write_end,
+                                    checkpoint_seq=profile_seq,
+                                    parall_iter=parall_iter,
+                                    group_idx=group_idx,
+                                    stream_id=stream_id,
+                                    param_type=param_type,
+                                    chunk_id=chunk_id,
+                                    bytes=int(chunk_size) * 4,
+                                )
+                            else:
+                                _record_aggregate(
+                                    ssd_profile,
+                                    "ssd_write",
+                                    int(write_start),
+                                    int(write_end),
+                                    int(chunk_size) * 4,
+                                )
                     except Exception as e:
                         print(f"[ERROR] SSD write failed for stream {stream_id}: {e}")
                         import traceback
                         traceback.print_exc()
+                        raise
                     finally:
-                        for chunk_ptr, _, _, _ in chunks:
+                        for chunk_ptr, *_ in chunks:
                             writer.return_chunk(chunk_ptr)
                         with self._inflight_ssd_lock:
                             self._inflight_ssd_tasks -= 1
@@ -1090,11 +1469,29 @@ class MultiStreamCheckpoint:
                 current_offset = 0
                 current_layer_idx = 0
                 offset_in_current_layer = 0
+                d2h_enqueue_first_ns = None
+                d2h_enqueue_last_ns = None
 
                 while current_offset < total_elements:
                     elements_to_process = min(self.chunk_size, total_elements - current_offset)
 
+                    borrow_start = CascadeSaveProfiler.now_ns()
                     chunk_ptr = self.writer.borrow_chunk()
+                    borrow_end = CascadeSaveProfiler.now_ns()
+                    chunk_id = int(current_offset // self.chunk_size)
+                    if detailed_chunks:
+                        self.cascade_profiler.interval(
+                            "borrow_chunk",
+                            borrow_start,
+                            borrow_end,
+                            checkpoint_seq=profile_seq,
+                            parall_iter=parall_iter,
+                            group_idx=group_idx,
+                            stream_id=stream_id,
+                            param_type=param_type,
+                            chunk_id=chunk_id,
+                            bytes=int(elements_to_process) * 4,
+                        )
                     
                     if chunk_ptr is None or chunk_ptr == 0:
                         raise RuntimeError(f"borrow_chunk() returned invalid pointer: {chunk_ptr}")
@@ -1116,6 +1513,15 @@ class MultiStreamCheckpoint:
 
                     # ✅ H5: 禁用 autograd，避免 CopySlices/SliceBackward 在后台线程构建
                     dest_offset = 0
+                    d2h_enqueue_start = CascadeSaveProfiler.now_ns()
+                    copy_start_event = None
+                    # Time the pure GPU->CPU copy kernel for the transfer lane in the
+                    # overlap figure. This is the actual DMA duration, independent of the
+                    # CPU-side enqueue stall that inflates d2h_enqueue once buffers saturate.
+                    kernel_timing = self.cascade_profiler.enabled or detailed_chunks
+                    if kernel_timing:
+                        copy_start_event = torch.cuda.Event(enable_timing=True)
+                        copy_start_event.record(current_stream)
                     with torch.no_grad():
                         while dest_offset < elements_to_process:
                             gpu_offset, size = layers_to_process[current_layer_idx]
@@ -1139,18 +1545,80 @@ class MultiStreamCheckpoint:
                     current_offset += elements_to_process
 
                     # 记录chunk就绪事件；SSD线程在事件完成后再写盘，避免阻塞拷贝线程
-                    chunk_ready_event = torch.cuda.Event()
+                    chunk_ready_event = torch.cuda.Event(enable_timing=(detailed_chunks or kernel_timing))
                     chunk_ready_event.record(current_stream)
-                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset, chunk_ready_event)])
+                    d2h_enqueue_end = CascadeSaveProfiler.now_ns()
+                    d2h_enqueue_first_ns = (
+                        d2h_enqueue_start
+                        if d2h_enqueue_first_ns is None
+                        else min(d2h_enqueue_first_ns, d2h_enqueue_start)
+                    )
+                    d2h_enqueue_last_ns = (
+                        d2h_enqueue_end
+                        if d2h_enqueue_last_ns is None
+                        else max(d2h_enqueue_last_ns, d2h_enqueue_end)
+                    )
+                    if detailed_chunks:
+                        self.cascade_profiler.interval(
+                            "d2h_enqueue",
+                            d2h_enqueue_start,
+                            d2h_enqueue_end,
+                            checkpoint_seq=profile_seq,
+                            parall_iter=parall_iter,
+                            group_idx=group_idx,
+                            stream_id=stream_id,
+                            param_type=param_type,
+                            chunk_id=chunk_id,
+                            bytes=int(elements_to_process) * 4,
+                        )
+                    _submit_ssd([
+                        (
+                            chunk_ptr,
+                            elements_to_process,
+                            chunk_offset,
+                            chunk_ready_event,
+                            copy_start_event,
+                            chunk_id,
+                            d2h_enqueue_start,
+                            d2h_enqueue_end,
+                        )
+                    ])
+
+                if not detailed_chunks and d2h_enqueue_first_ns is not None:
+                    self.cascade_profiler.interval(
+                        "d2h_enqueue",
+                        d2h_enqueue_first_ns,
+                        d2h_enqueue_last_ns,
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        group_idx=group_idx,
+                        stream_id=stream_id,
+                        param_type=param_type,
+                        chunks=int(total_chunks),
+                        bytes=int(total_elements) * 4,
+                        aggregate=True,
+                    )
 
                 # ✅ 所有 GPU→CPU 拷贝命令已完成/已提交，记录跨检查点同步事件
                 if copy_done_event is not None:
                     copy_done_event.record(current_stream)
+                self.cascade_profiler.interval(
+                    "save_stream_worker",
+                    worker_start,
+                    CascadeSaveProfiler.now_ns(),
+                    checkpoint_seq=profile_seq,
+                    parall_iter=parall_iter,
+                    group_idx=group_idx,
+                    stream_id=stream_id,
+                    param_type=param_type,
+                    bytes=int(total_elements) * 4,
+                )
                 
         except Exception as e:
             print(f"[ERROR] Stream {stream_id} ({param_type}) failed: {e}")
             import traceback
             traceback.print_exc()
+            raise
     
     def set_io_callback(self, callback):
         """
@@ -1280,6 +1748,7 @@ class MultiStreamCheckpoint:
 
                 # 创建回调函数，捕获parall_iter
                 def save_callback(group_idx, layer_ids):
+                    profile_seq = self._checkpoint._get_profile_seq(parall_iter)
                     if is_zero_copy_enabled:
                         # 🔥 零拷贝优化：参数已经在 gpu_ar 上，无需拷贝
                         # 直接在默认流上记录事件，标记参数更新已完成
@@ -1287,6 +1756,7 @@ class MultiStreamCheckpoint:
                         sync_event.record(torch.cuda.current_stream())
                     else:
                         # 常规模式：在拷贝流上执行 D2D 拷贝
+                        d2d_enqueue_start = CascadeSaveProfiler.now_ns()
                         with torch.cuda.stream(copy_stream):
                             # 等待默认流上的参数更新完成
                             copy_stream.wait_stream(torch.cuda.current_stream())
@@ -1339,6 +1809,18 @@ class MultiStreamCheckpoint:
                             # ✅ 在拷贝流上记录事件，标记该层组的参数拷贝已完成
                             sync_event = torch.cuda.Event()
                             sync_event.record(copy_stream)
+                        d2d_enqueue_end = CascadeSaveProfiler.now_ns()
+                        self._checkpoint.cascade_profiler.interval(
+                            "d2d_enqueue",
+                            d2d_enqueue_start,
+                            d2d_enqueue_end,
+                            checkpoint_seq=profile_seq,
+                            parall_iter=parall_iter,
+                            group_idx=group_idx,
+                            layer_start=int(layer_ids[0]) if layer_ids else None,
+                            layer_end=int(layer_ids[-1]) if layer_ids else None,
+                            num_layers=len(layer_ids),
+                        )
                         
                     # 提交异步保存任务，传递同步事件和group_idx
                     futures = self._checkpoint.save_layer_group(layer_ids, parall_iter, group_idx, sync_event)
@@ -1351,7 +1833,11 @@ class MultiStreamCheckpoint:
                     optimizer=self._real_optimizer,
                     layer_groups=self._checkpoint.layer_groups,
                     param_list=self._checkpoint._pending_param_list,
-                    callback=save_callback
+                    callback=save_callback,
+                    profiler=self._checkpoint.cascade_profiler,
+                    parall_iter=parall_iter,
+                    checkpoint_seq=self._checkpoint._get_profile_seq(parall_iter),
+                    param_group_mode=self._checkpoint.param_group_mode,
                 )
                 # ✅ 设置更新前回调
                 self._ms_optimizer.pre_update_callback = pre_update_callback
@@ -1439,12 +1925,15 @@ class MultiStreamCheckpoint:
             parall_iter: 检查点槽位ID，用于后续操作
         """
         # ✅ 修复：使用 Event 等待可用槽位，避免 time.sleep 轮询
+        begin_wait_start = CascadeSaveProfiler.now_ns()
         while True:
             self._slot_available_event.wait()  # 阻塞直到收到槽位释放通知
             with self._slot_lock:
                 if len(self._checkpoint_slots) < self._max_async:
                     # 有可用槽位，注册获取
+                    register_start = CascadeSaveProfiler.now_ns()
                     parall_iter = self.writer.register()
+                    register_end = CascadeSaveProfiler.now_ns()
                     # 如果槽位已满，清除事件，让下次 begin_checkpoint 等待
                     if len(self._checkpoint_slots) + 1 >= self._max_async:
                         self._slot_available_event.clear()
@@ -1455,11 +1944,39 @@ class MultiStreamCheckpoint:
         
         # ✅ 修复：为每个检查点创建独立的记录
         with self._slot_lock:
+            profile_seq = self._profile_checkpoint_counter
+            self._profile_checkpoint_counter += 1
+            profile_context = dict(self._profile_context)
             self._checkpoint_slots[parall_iter] = {
                 'futures': [],
                 'start_time': time.time(),
+                'start_ns': CascadeSaveProfiler.now_ns(),
+                'profile_seq': profile_seq,
+                'profile_context': profile_context,
                 # 'cpu_buffer': None  # 不再需要全局buffer
             }
+        self.cascade_profiler.interval(
+            "checkpoint_begin_wait",
+            begin_wait_start,
+            register_start,
+            checkpoint_seq=profile_seq,
+            parall_iter=parall_iter,
+        )
+        self.cascade_profiler.interval(
+            "checkpoint_register",
+            register_start,
+            register_end,
+            checkpoint_seq=profile_seq,
+            parall_iter=parall_iter,
+        )
+        self.cascade_profiler.record(
+            "checkpoint_begin",
+            checkpoint_seq=profile_seq,
+            parall_iter=parall_iter,
+            active_slots=len(self._checkpoint_slots),
+            max_async=int(self._max_async),
+            **profile_context,
+        )
         
         print(f"\n{'='*60}")
         print(f"Begin checkpoint (parall_iter: {parall_iter}, active: {len(self._checkpoint_slots)}/{self._max_async})")
@@ -1486,22 +2003,47 @@ class MultiStreamCheckpoint:
             slot_info = self._checkpoint_slots[parall_iter]
             futures = slot_info['futures']
             start_time = slot_info['start_time']
+            start_ns = slot_info.get('start_ns')
+            profile_seq = slot_info.get('profile_seq')
 
         with self._inflight_ssd_lock:
             inflight_ssd = int(self._inflight_ssd_tasks)
             
         if wait:
+            finalize_start_ns = CascadeSaveProfiler.now_ns()
             # 同步模式：等待所有保存完成
             # 等待所有异步保存任务完成
             print(f"\n  Waiting for all layer groups to complete (parall_iter: {parall_iter})...")
+            wait_start_ns = CascadeSaveProfiler.now_ns()
             for future in futures:
                 future.result()
+            wait_end_ns = CascadeSaveProfiler.now_ns()
+            self.cascade_profiler.interval(
+                "checkpoint_wait_futures",
+                wait_start_ns,
+                wait_end_ns,
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="sync",
+                num_futures=len(futures),
+                inflight_ssd_at_finalize=inflight_ssd,
+            )
             
             # 同步所有流到磁盘
             print(f"\n  Syncing all streams to disk (parall_iter: {parall_iter})...")
             sync_start = time.time()
+            sync_start_ns = CascadeSaveProfiler.now_ns()
             self.writer.sync_all_streams(parall_iter)
+            sync_end_ns = CascadeSaveProfiler.now_ns()
             sync_time = time.time() - sync_start
+            self.cascade_profiler.interval(
+                "storage_sync",
+                sync_start_ns,
+                sync_end_ns,
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="sync",
+            )
             
             total_time = time.time() - start_time
             throughput = (self.total_size * 4 / 1e9) / total_time
@@ -1517,13 +2059,41 @@ class MultiStreamCheckpoint:
             print(f"{'='*60}\n")
             
             # ✅ 更新 metadata 中的 latest_parall_iter
+            metadata_start_ns = CascadeSaveProfiler.now_ns()
             self._update_latest_parall_iter(parall_iter)
+            metadata_end_ns = CascadeSaveProfiler.now_ns()
+            self.cascade_profiler.interval(
+                "metadata_publish",
+                metadata_start_ns,
+                metadata_end_ns,
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="sync",
+            )
             
             # ✅ 修复：释放槽位
             with self._slot_lock:
                 # 可能在 drain() 与后台 async finalize 并发时被其他线程抢先删除
                 self._checkpoint_slots.pop(parall_iter, None)
             self._slot_available_event.set()  # 通知等待的 begin_checkpoint
+            finalize_end_ns = CascadeSaveProfiler.now_ns()
+            self.cascade_profiler.interval(
+                "checkpoint_finalize",
+                finalize_start_ns,
+                finalize_end_ns,
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="sync",
+                total_checkpoint_ms=((finalize_end_ns - start_ns) / 1e6) if start_ns else None,
+            )
+            self.cascade_profiler.record(
+                "checkpoint_complete",
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="sync",
+                total_checkpoint_ms=total_time * 1000.0,
+                throughput_gbps=throughput,
+            )
             
             return total_time
         else:
@@ -1531,14 +2101,36 @@ class MultiStreamCheckpoint:
             def async_finalize():
                 try:  
                     # 等待所有异步保存任务完成（GPU→CPU拷贝）
+                    wait_start_ns = CascadeSaveProfiler.now_ns()
                     for future in futures:
                         future.result()
+                    wait_end_ns = CascadeSaveProfiler.now_ns()
+                    self.cascade_profiler.interval(
+                        "checkpoint_wait_futures",
+                        wait_start_ns,
+                        wait_end_ns,
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        wait_mode="async",
+                        num_futures=len(futures),
+                        inflight_ssd_at_finalize=inflight_ssd,
+                    )
                     
                     # 同步所有流到磁盘
                     sync_streams_start = time.time()
+                    sync_streams_start_ns = CascadeSaveProfiler.now_ns()
                     self.writer.sync_all_streams(parall_iter)
+                    sync_streams_end_ns = CascadeSaveProfiler.now_ns()
                     
                     sync_streams_time = time.time() - sync_streams_start
+                    self.cascade_profiler.interval(
+                        "storage_sync",
+                        sync_streams_start_ns,
+                        sync_streams_end_ns,
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        wait_mode="async",
+                    )
                     
                     total_time = time.time() - start_time
                     throughput = (self.total_size * 4 / 1e9) / total_time
@@ -1548,7 +2140,17 @@ class MultiStreamCheckpoint:
                     print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
                     
                     # ✅ 更新 metadata 中的 latest_parall_iter
+                    metadata_start_ns = CascadeSaveProfiler.now_ns()
                     self._update_latest_parall_iter(parall_iter)
+                    metadata_end_ns = CascadeSaveProfiler.now_ns()
+                    self.cascade_profiler.interval(
+                        "metadata_publish",
+                        metadata_start_ns,
+                        metadata_end_ns,
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        wait_mode="async",
+                    )
                     
                     # 调用IO统计回调
                     if self.io_callback is not None:
@@ -1559,8 +2161,26 @@ class MultiStreamCheckpoint:
                         if parall_iter in self._checkpoint_slots:
                             del self._checkpoint_slots[parall_iter]
                     self._slot_available_event.set()  # 通知等待的 begin_checkpoint
+                    complete_ns = CascadeSaveProfiler.now_ns()
+                    self.cascade_profiler.record(
+                        "checkpoint_complete",
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        wait_mode="async",
+                        total_checkpoint_ms=total_time * 1000.0,
+                        throughput_gbps=throughput,
+                        storage_sync_ms=sync_streams_time * 1000.0,
+                        wall_from_begin_ms=((complete_ns - start_ns) / 1e6) if start_ns else None,
+                    )
                 except Exception as e:
                     print(f"✗ Background checkpoint {parall_iter} failed: {e}")
+                    self.cascade_profiler.record(
+                        "checkpoint_error",
+                        checkpoint_seq=profile_seq,
+                        parall_iter=parall_iter,
+                        wait_mode="async",
+                        error=str(e),
+                    )
                     import traceback
                     traceback.print_exc()
                     # ✅ 修复：即使失败也要确保槽位被释放
@@ -1569,7 +2189,19 @@ class MultiStreamCheckpoint:
                     self._slot_available_event.set()  # 通知等待的 begin_checkpoint
             
             # 提交到线程池
+            submit_start_ns = CascadeSaveProfiler.now_ns()
             self.thread_pool.submit(async_finalize)
+            submit_end_ns = CascadeSaveProfiler.now_ns()
+            self.cascade_profiler.interval(
+                "checkpoint_finalize_submit",
+                submit_start_ns,
+                submit_end_ns,
+                checkpoint_seq=profile_seq,
+                parall_iter=parall_iter,
+                wait_mode="async",
+                num_futures=len(futures),
+                inflight_ssd_at_finalize=inflight_ssd,
+            )
             
             # 立即返回（不阻塞）
             submit_time = time.time() - start_time

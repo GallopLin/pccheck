@@ -234,7 +234,8 @@ def save_stage_checkpoint(
     rank: int,
     step: int,
     sync: bool = False,
-) -> float:
+    return_breakdown: bool = False,
+):
     """
     执行一次完整的 multistream 保存。
 
@@ -242,19 +243,40 @@ def save_stage_checkpoint(
     因此无需 pack_stage_states 拷贝，直接调用 save_full_checkpoint 即可。
 
     Returns:
-        保存耗时（秒）
+        return_breakdown=False: 保存耗时（秒）
+        return_breakdown=True: 高层前台耗时分解（毫秒）
     """
-    t0 = time.time()
+    t0 = time.perf_counter()
 
     # 零拷贝：gpu_ar 就是模型的存储，无需 pack_stage_states
+    submit_t0 = time.perf_counter()
     parall_iter, metric = ms_ckpt.save_full_checkpoint(sync=sync)
+    checkpoint_submit_ms = (time.perf_counter() - submit_t0) * 1000.0
 
+    # export_metadata needs the model to serialize optimizer param groups/steps by name.
+    metadata_t0 = time.perf_counter()
+    ms_ckpt._pending_model = model
     ms_ckpt.export_metadata(optimizer=optimizer)
 
     _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
-    _write_stage_training_state(checkpoint_dir, rank, step, optimizer)
+    metadata_ms = (time.perf_counter() - metadata_t0) * 1000.0
 
-    elapsed = time.time() - t0
+    state_t0 = time.perf_counter()
+    _write_stage_training_state(checkpoint_dir, rank, step, optimizer, slot=parall_iter)
+    stage_state_ms = (time.perf_counter() - state_t0) * 1000.0
+
+    elapsed = time.perf_counter() - t0
+    if return_breakdown:
+        return {
+            "elapsed_sec": elapsed,
+            "total_ms": elapsed * 1000.0,
+            "checkpoint_submit_ms": checkpoint_submit_ms,
+            "metadata_ms": metadata_ms,
+            "stage_state_ms": stage_state_ms,
+            "parall_iter": int(parall_iter),
+            "sync": bool(sync),
+            "save_full_return_sec": float(metric) if isinstance(metric, (int, float)) else None,
+        }
     return elapsed
 
 
@@ -276,6 +298,7 @@ def _write_stage_training_state(
     rank: int,
     step: int,
     optimizer: torch.optim.Optimizer,
+    slot: Optional[int] = None,
 ):
     """写入每个阶段的训练状态"""
     stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
@@ -284,6 +307,8 @@ def _write_stage_training_state(
         "rank": rank,
         "lr": optimizer.param_groups[0].get("lr", 0),
     }
+    if slot is not None:
+        state["slot"] = int(slot)
     path = os.path.join(stage_dir, "training_state.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
@@ -324,6 +349,8 @@ def resume_stage_with_pipelayer(
     rank: int,
     lib_path: str,
     device: str = "cuda",
+    forward_prefetch_window: int = 2,
+    restore_schedule_policy: str = "window_interleave",
 ):
     """
     使用 pipelayer 的 MultiStreamStateLoader 恢复当前 PP 阶段。
@@ -331,36 +358,58 @@ def resume_stage_with_pipelayer(
     Returns:
         training_state dict（包含 completed_steps 等信息）
     """
-    from pipelayer.checkpointing import MultiStreamStateLoader
-
-    stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
-    info_path = os.path.join(stage_dir, "multistream_info.json")
-
-    with open(info_path, "r", encoding="utf-8") as f:
-        info = json.load(f)
-
-    metadata_file = info["metadata_file"]
-    checkpoint_file = info["checkpoint_file"]
-    loader_lib_path = info.get("lib_path", lib_path)
-
-    loader = MultiStreamStateLoader(
+    handle = resume_stage_with_pipelayer_async(
         model=model,
         optimizer=optimizer,
-        chkpt_dir=stage_dir,
-        lib_path=loader_lib_path,
-        metadata_file=metadata_file,
-        checkpoint_file=checkpoint_file,
+        checkpoint_dir=checkpoint_dir,
+        rank=rank,
+        lib_path=lib_path,
         device=device,
+        forward_prefetch_window=forward_prefetch_window,
+        restore_schedule_policy=restore_schedule_policy,
     )
-
-    for i in range(loader.num_chunks):
-        loader.wait_for_chunk(i)
-    loader.stop()
-
-    state_path = os.path.join(stage_dir, "training_state.json")
-    training_state = {}
-    if os.path.exists(state_path):
-        with open(state_path, "r", encoding="utf-8") as f:
-            training_state = json.load(f)
-
+    handle.wait_all()
+    training_state = dict(handle.training_state)
+    handle.cleanup()
     return training_state
+
+
+def resume_stage_with_pipelayer_async(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+    rank: int,
+    lib_path: str,
+    device: str = "cuda",
+    engine=None,
+    iteration: Optional[int] = None,
+    load_grad: bool = False,
+    num_copy_workers: Optional[int] = None,
+    forward_prefetch_window: int = 2,
+    restore_schedule_policy: str = "window_interleave",
+):
+    """
+    异步恢复当前 PP 阶段。
+
+    返回 PipelayerAsyncLoadHandle。调用方可以立即进入 train_batch；
+    forward hook 会按模块等待必要 chunk，第一次 optimizer step 前会等待
+    全部 optimizer state 恢复完成。
+    """
+    from pipelayer.distributed import start_distributed_multistream_resume
+
+    return start_distributed_multistream_resume(
+        model=model,
+        optimizer=optimizer,
+        checkpoint_dir=checkpoint_dir,
+        lib_path=lib_path,
+        rank=rank,
+        iteration=iteration,
+        device=device,
+        engine=engine,
+        install_forward_hooks=True,
+        guard_optimizer_step=True,
+        load_grad=load_grad,
+        num_copy_workers=num_copy_workers,
+        forward_prefetch_window=forward_prefetch_window,
+        restore_schedule_policy=restore_schedule_policy,
+    )

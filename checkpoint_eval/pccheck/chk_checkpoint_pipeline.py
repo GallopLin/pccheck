@@ -188,9 +188,9 @@ class Checkpoint:
         cpu_copy_end = time.time()
         # print(f"CPU copy took {(cpu_copy_end-cpu_copy_start)*1000} ms")  # 减少输出
 
-    def write_pipelined(self, cpu_ar, num_threads, sz, bsize, lock, cp_in_progress):
+    def write_pipelined(self, cpu_ar, num_threads, sz, bsize, lock, cp_in_progress, active_async):
 
-        num_batches = int(sz / bsize)
+        num_batches = max(1, ceil(sz / bsize))
         chk_ret = self.writer.register()
         # print(f"************** New checkpoint at position {chk_ret}")  # 减少输出
         start = time.time()
@@ -212,6 +212,7 @@ class Checkpoint:
 
             start_idx = int(i * bsize)
             end_idx = min(sz, int((i + 1) * bsize))
+            curr_batch_size = end_idx - start_idx
 
             threads.append(
                 Thread(
@@ -225,7 +226,7 @@ class Checkpoint:
                         num_threads,
                         sz,
                         i + 1,
-                        bsize,
+                        curr_batch_size,
                         i == num_batches - 1,
                         chk_ret,
                         lock,
@@ -237,8 +238,12 @@ class Checkpoint:
         for i in range(num_batches):
             threads[i].start()
 
-        for i in range(num_batches):
-            threads[i].join()
+        try:
+            for i in range(num_batches):
+                threads[i].join()
+        finally:
+            with lock:
+                active_async.value -= 1
 
         total_time = time.time() - start
         self.chk_times.append(total_time)
@@ -266,17 +271,21 @@ class Checkpoint:
         lock,
         checkpoint_dict,
         cp_in_progress,
+        active_async,
         start1,
         stop,
         gpu_copy=True,
         is_sync=False,
     ):
 
-        os.sched_setaffinity(0, {1})
+        try:
+            os.sched_setaffinity(0, {1})
+        except Exception:
+            pass
 
         # GOAL: same mem footprint as GPM/CheckFreq
         print(f"total_size: {self.total_size}, bsize: {self.bsize}, ratio: {self.ratio}")
-        total_mem_batches = int(self.ratio * self.total_size / self.bsize)
+        total_mem_batches = max(1, ceil(self.ratio * self.total_size / self.bsize))
         self.writer = Writer(
             self.filename.encode(),
             self.lib_path,
@@ -322,6 +331,7 @@ class Checkpoint:
 
             with lock:
                 if start1.value == 0:
+                    time.sleep(0.001)
                     continue
 
             # snapshot here
@@ -334,6 +344,8 @@ class Checkpoint:
                 assert flattened_size == self.total_size
 
             if is_sync:
+                with lock:
+                    active_async.value += 1
                 self.write_pipelined(
                     self.cpu_ar_list[i] if not self.memory_saving else None,
                     self.num_threads,
@@ -341,14 +353,21 @@ class Checkpoint:
                     self.bsize,
                     lock,
                     cp_in_progress,
+                    active_async,
                 )
             else:
+                # Release the training loop immediately so save() returns
+                # without waiting for a free async slot.
+                with lock:
+                    start1.value = 0
                 while True:
                     tid = -1
                     for i in range(self.max_async):
                         if (self.threads[i] is None) or (
                             not self.threads[i].is_alive()
                         ):
+                            with lock:
+                                active_async.value += 1
                             p = Thread(
                                 target=self.write_pipelined,
                                 args=(
@@ -362,6 +381,7 @@ class Checkpoint:
                                     self.bsize,
                                     lock,
                                     cp_in_progress,
+                                    active_async,
                                 ),
                             )
                             p.start()
@@ -371,9 +391,12 @@ class Checkpoint:
                             break
                     if tid >= 0:
                         break
+                    time.sleep(0.001)
 
-            with lock:
-                start1.value = 0
+            # start1 already cleared above in the async branch
+            if is_sync:
+                with lock:
+                    start1.value = 0
 
         for x in self.threads:
             # if x.is_alive():

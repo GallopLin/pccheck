@@ -1,6 +1,7 @@
+import json
+import os
 import torch
 import time
-import os
 from checkpoint_eval.pccheck.chk_checkpoint_pipeline import Checkpoint
 from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock, Barrier
 
@@ -11,6 +12,38 @@ try:
 except RuntimeError:
     # 如果已经设置过，忽略错误
     pass
+
+
+def _write_recovery_metadata(
+    metadata_file,
+    *,
+    completed_steps=None,
+    checkpoint_file=None,
+    max_async=None,
+    extra_metadata=None,
+):
+    payload = {}
+    if metadata_file and os.path.exists(metadata_file):
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            try:
+                payload = json.load(f)
+            except Exception:
+                payload = {}
+
+    payload["format"] = "pccheck-linear-v1"
+    if completed_steps is not None:
+        payload["completed_steps"] = int(completed_steps)
+    if checkpoint_file is not None:
+        payload["checkpoint_file"] = checkpoint_file
+    if max_async is not None:
+        payload["max_async"] = int(max_async)
+    if extra_metadata:
+        payload.update(extra_metadata)
+
+    if metadata_file:
+        os.makedirs(os.path.dirname(os.path.abspath(metadata_file)), exist_ok=True)
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 class Chk_monitor:
@@ -30,13 +63,21 @@ class Chk_monitor:
         is_distributed=False,
         rank=0,
         world_size=1,
+        checkpoint_file=None,
+        recovery_metadata_file=None,
+        recovery_checkpoint_file=None,
         **kwargs,
     ):
 
         # only 1 background process
-        basic_path = "pccheck_checkpoint.chk"
+        basic_path = checkpoint_file or f"pccheck_checkpoint_rank{rank}.chk"
+        self.checkpoint_file = basic_path
+        self.max_async = max_async
+        self.recovery_metadata_file = recovery_metadata_file
+        self.recovery_checkpoint_file = recovery_checkpoint_file or basic_path
         self.lock = Lock()
         self.cp_in_progress = Value("i", 0)
+        self.active_async = Value("i", 0)
         self.start = Value("i", 0)
         self.stop = Value("i", 0)
         self.barrier = Barrier(2)
@@ -70,6 +111,7 @@ class Chk_monitor:
                 self.lock,
                 self.checkpoint_dict,
                 self.cp_in_progress,
+                self.active_async,
                 self.start,
                 self.stop,
                 gpu_copy,
@@ -96,8 +138,30 @@ class Chk_monitor:
 
         return False
 
-    def save(self):
+    def async_checkpoint_count(self):
+        with self.lock:
+            return self.active_async.value
+
+    def try_save(self):
+        with self.lock:
+            if self.start.value != 0:
+                return False
+            if self.active_async.value >= 1:
+                return False
+            self.cp_in_progress.value = 1
+            self.start.value = 1
+            return True
+
+    def save(self, completed_steps=None, extra_metadata=None):
         # print(f"******************** CALL SAVE ********************")  # 减少输出
+
+        _write_recovery_metadata(
+            self.recovery_metadata_file,
+            completed_steps=completed_steps,
+            checkpoint_file=self.recovery_checkpoint_file,
+            max_async=self.max_async,
+            extra_metadata=extra_metadata,
+        )
 
         while True:
             with self.lock:
@@ -108,9 +172,25 @@ class Chk_monitor:
             self.cp_in_progress.value = 1
             self.start.value = 1
 
-    def kill_checkpoint(self):
+    def kill_checkpoint(self, timeout=30):
 
         with self.lock:
             self.stop.value = 1
+            # 避免 save()/后台循环卡在旧状态
+            self.start.value = 0
+            self.cp_in_progress.value = 0
 
-        self.chk_process.join()
+        self.chk_process.join(timeout=timeout)
+        if self.chk_process.is_alive():
+            try:
+                self.chk_process.terminate()
+            except Exception:
+                pass
+            self.chk_process.join(timeout=5)
+
+        if self.chk_process.is_alive():
+            try:
+                self.chk_process.kill()
+            except Exception:
+                pass
+            self.chk_process.join(timeout=5)
