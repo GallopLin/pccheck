@@ -73,13 +73,9 @@ static int *PEER_CHECK_ADDR;
 static int PADDING[64];
 static int *PR_ADDR_DATA;
 static uint64_t MAPPED_SIZE = 0;
-static int DATA_SLOT_COUNT = 1;
-static uint64_t DATA_REGION_OFFSET_BYTES = 0;
-static std::string MAPPED_FILENAME;
 
 static uint8_t Cores[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-static const int NUM_CORES = sizeof(Cores) / sizeof(Cores[0]);
 
 struct thread_data
 {
@@ -113,52 +109,6 @@ static FAAArrayQueue<int> free_space;
 int fd;
 DRAMAlloc dram;
 
-static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
-{
-    if (alignment == 0)
-        return value;
-    uint64_t remainder = value % alignment;
-    return remainder == 0 ? value : value + (alignment - remainder);
-}
-
-static void refresh_region_pointers()
-{
-    PEER_CHECK_ADDR = PR_ADDR + OFFSET_SIZE;
-    PR_ADDR_DATA = PR_ADDR + (DATA_SLOT_COUNT + 3) * OFFSET_SIZE;
-    DATA_REGION_OFFSET_BYTES = (uint64_t)(DATA_SLOT_COUNT + 3) * OFFSET_SIZE * sizeof(int);
-}
-
-static void reset_initial_checkpoint_metadata()
-{
-    void *next_addr = PR_ADDR + 2 * OFFSET_SIZE;
-    struct checkpoint check = {0, 0};
-
-    memcpy(next_addr, &check, sizeof(struct checkpoint));
-    uint64_t init_checkpoint_end = (uint64_t)2 * OFFSET_SIZE * sizeof(int) + sizeof(struct checkpoint);
-    int res = msync((void *)PR_ADDR, init_checkpoint_end, MS_SYNC);
-    if (res == -1)
-    {
-        perror("msync - init, next_addr ");
-        exit(1);
-    }
-
-    memcpy(PR_ADDR, &next_addr, sizeof(struct checkpoint *));
-    res = msync((void *)PR_ADDR, sizeof(struct checkpoint *), MS_SYNC);
-    if (res == -1)
-    {
-        perror("msync - init, PR_ADDR");
-        exit(1);
-    }
-
-    memcpy(PEER_CHECK_ADDR, &next_addr, sizeof(struct checkpoint *));
-    res = msync((void *)PEER_CHECK_ADDR, sizeof(struct checkpoint *), MS_SYNC);
-    if (res == -1)
-    {
-        perror("msync - init, PEER_CHECK_ADDR");
-        exit(1);
-    }
-}
-
 // for distributed
 bool is_distributed;
 int my_rank;
@@ -176,8 +126,7 @@ static inline void set_cpu(int cpu)
 {
     assert(cpu > -1);
     int n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    int cores_len = (int)(sizeof(Cores) / sizeof(Cores[0]));
-    if (cpu < n_cpus && cpu < cores_len)
+    if (cpu < n_cpus)
     {
         int cpu_use = Cores[cpu];
         cpu_set_t mask;
@@ -312,13 +261,6 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
 
     struct stat buffer;
     bool newfile = (stat(filename, &buffer) == -1);
-    (void)newfile;
-
-    // Need one extra data slot beyond the maximum number of in-flight
-    // checkpoints so the latest published checkpoint is not overwritten while
-    // new checkpoints are being written.
-    DATA_SLOT_COUNT = max_async >= 0 ? max_async + 1 : 1;
-    MAPPED_FILENAME = filename ? filename : "";
 
     fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, (mode_t)0666);
     if (ftruncate(fd, REGION_SIZE) != 0) {
@@ -331,22 +273,51 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     //mapPersistentRegion(filename, PR_ADDR_DATA, REGION_SIZE, true, fd);
     // 现在和filename无关（与fd有关），PR_ADDR PR_ADDR_DATA都是mmap出来的，与第二个参数无关（有关逻辑被注释了）
     mapPersistentRegion(filename, PR_ADDR, REGION_SIZE, false, fd);
-    refresh_region_pointers();
+    PEER_CHECK_ADDR = PR_ADDR + OFFSET_SIZE;
+    // 头部占用：checkpoint* | PEER | init | metadata[parall_iter 0..max_async]
+    // = (max_async+4) 个 OFFSET_SIZE。旧值 (max_async+3) 使 parall_iter==max_async
+    // 的 metadata 槽（位于 OFFSET_SIZE*(max_async+3)）与 slot0 数据区前 64 字节
+    // 重叠——每次发布最后一个槽位都会覆写 slot0 param 流开头（byte-diff 实锤）。
+    PR_ADDR_DATA = PR_ADDR + (max_async+4)*OFFSET_SIZE;
 
-    printf("PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p, data_slots=%d\n",
-           PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR, DATA_SLOT_COUNT);
+    printf("PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR);
 
     curr_parall_iter.store(0);
     counter.store(1);
     counter.store(1);
 
-    // write init checkpoint on NVMM - located right next to the checkpoint *
-    reset_initial_checkpoint_metadata();
+    // write init checkpoint on NVMM - locted right next to the checkpoint *
+    void *next_addr = PR_ADDR + 2*OFFSET_SIZE; // sizeof(checkpoint*) == CACHELINE_SIZE
+    struct checkpoint check = {0, 0};
+    // pmem_memcpy_persist(next_addr, &check, sizeof(struct checkpoint));
+    // pmem_memcpy_persist(PR_ADDR, &next_addr, sizeof(struct checkpoint*));
 
-    // insert the current free data slots in the file. Slot count is
-    // max_async + 1: max_async in-flight checkpoints plus the last published
-    // checkpoint slot.
-    for (int i = 0; i < DATA_SLOT_COUNT; i++)
+    memcpy(next_addr, &check, sizeof(struct checkpoint));
+    int res = msync((void *)PR_ADDR, 2*OFFSET_SIZE + sizeof(struct checkpoint), MS_SYNC);
+    if (res == -1)
+    {
+        perror("msync - init, next_addr ");
+        exit(1);
+    }
+
+    memcpy(PR_ADDR, &next_addr, sizeof(struct checkpoint *));
+    res = msync((void *)PR_ADDR, sizeof(struct checkpoint *), MS_SYNC);
+    if (res == -1)
+    {
+        perror("msync - init, PR_ADDR");
+        exit(1);
+    }
+
+    memcpy(PEER_CHECK_ADDR, &next_addr, sizeof(struct checkpoint *));
+    res = msync((void *)PEER_CHECK_ADDR, sizeof(struct checkpoint *), MS_SYNC);
+    if (res == -1)
+    {
+        perror("msync - init, PEER_CHECK_ADDR");
+        exit(1);
+    }
+
+    // insert the current free data slots in the file
+    for (int i = 0; i <= max_async; i++)
     {
         printf("--------------- init enqueue: %d\n", i);
         free_space.enqueue(i, 0);
@@ -364,16 +335,7 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     if (is_distributed) {
 
         char const* tmp = getenv("PCCHECK_COORDINATOR");
-        std::string server_ip;
-        if (tmp != nullptr && tmp[0] != '\0') {
-            server_ip = tmp;
-        } else {
-            // 单机多卡默认走本机回环地址，避免 std::string(nullptr) 崩溃
-            server_ip = "127.0.0.1";
-            fprintf(stderr,
-                    "[WARN] PCCHECK_COORDINATOR is not set, fallback to %s\n",
-                    server_ip.c_str());
-        }
+        std::string server_ip(tmp);
 
         printf("My rank is %d\n", my_rank);
         if (my_rank==0) {
@@ -391,8 +353,6 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
 
 static void initialize_for_read(const char *filename, int max_async)
 {
-    DATA_SLOT_COUNT = max_async >= 0 ? max_async + 1 : 1;
-
     fd = open(filename, O_RDWR, (mode_t)0666);
     if (fd < 0)
     {
@@ -404,10 +364,10 @@ static void initialize_for_read(const char *filename, int max_async)
     MAPPED_SIZE = region_size;
     mapPersistentRegion(filename, PR_ADDR, region_size, false, fd);
 
-    refresh_region_pointers();
+    PEER_CHECK_ADDR = PR_ADDR + OFFSET_SIZE;
+    PR_ADDR_DATA = PR_ADDR + (max_async + 4) * OFFSET_SIZE;  // 与 initialize() 保持一致
 
-    printf("[Reader] PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p, data_slots=%d\n",
-           PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR, DATA_SLOT_COUNT);
+    printf("[Reader] PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR);
 
     is_distributed = false;
     my_rank = 0;
@@ -523,96 +483,11 @@ private:
     // - pool_num_threads: 线程池大小
     std::unordered_map<int, float*> slot_buffers;  // 槽位→pinned buffer映射（用于DRAM复用）
     std::mutex slot_mutex;             // 保护slot_buffers的互斥锁
-
-    void ensure_region_capacity(uint64_t required_bytes) {
-        uint64_t page_size = 4096;
-        uint64_t new_size = align_up_u64(required_bytes, page_size);
-        if (new_size == 0) {
-            fprintf(stderr, "[ERROR] Invalid mmap size request: 0 bytes\n");
-            exit(1);
-        }
-        if (new_size == MAPPED_SIZE) {
-            return;
-        }
-
-        printf("[mmap] resizing checkpoint file: mapped=%lu bytes, required=%lu bytes, aligned=%lu bytes, slots=%d\n",
-               (unsigned long)MAPPED_SIZE,
-               (unsigned long)required_bytes,
-               (unsigned long)new_size,
-               DATA_SLOT_COUNT);
-
-        if (PR_ADDR != nullptr && MAPPED_SIZE > 0) {
-            uint64_t sync_bytes = DATA_REGION_OFFSET_BYTES < MAPPED_SIZE ? DATA_REGION_OFFSET_BYTES : MAPPED_SIZE;
-            if (sync_bytes > 0) {
-                msync((void *)PR_ADDR, sync_bytes, MS_SYNC);
-            }
-            if (munmap((void *)PR_ADDR, MAPPED_SIZE) != 0) {
-                perror("munmap");
-                exit(1);
-            }
-            PR_ADDR = nullptr;
-            PR_ADDR_DATA = nullptr;
-            PEER_CHECK_ADDR = nullptr;
-        }
-
-        if (ftruncate(fd, new_size) != 0) {
-            perror("ftruncate");
-            exit(1);
-        }
-
-        MAPPED_SIZE = new_size;
-        mapPersistentRegion(MAPPED_FILENAME.c_str(), PR_ADDR, MAPPED_SIZE, false, fd);
-        refresh_region_pointers();
-        reset_initial_checkpoint_metadata();
-    }
-
-    uint64_t mapped_offset_bytes(void *addr) {
-        return (uint64_t)((uintptr_t)addr - (uintptr_t)PR_ADDR);
-    }
-
-    void check_data_bounds(const char *op, int parall_iter, int stream_id,
-                           size_t offset_in_stream, uint64_t byte_count,
-                           void *target_addr) {
-        if (parall_iter < 0 || parall_iter >= DATA_SLOT_COUNT) {
-            fprintf(stderr,
-                    "[ERROR] %s invalid parall_iter=%d, data_slots=%d\n",
-                    op, parall_iter, DATA_SLOT_COUNT);
-            exit(1);
-        }
-
-        uint64_t start = mapped_offset_bytes(target_addr);
-        if (start > MAPPED_SIZE || byte_count > MAPPED_SIZE - start) {
-            fprintf(stderr,
-                    "[ERROR] %s out of mmap bounds: parall_iter=%d stream_id=%d offset_in_stream=%lu "
-                    "start=%lu bytes=%lu mapped=%lu stride_floats=%lu total_checkpoint_floats=%lu "
-                    "data_offset=%lu slots=%d\n",
-                    op,
-                    parall_iter,
-                    stream_id,
-                    (unsigned long)offset_in_stream,
-                    (unsigned long)start,
-                    (unsigned long)byte_count,
-                    (unsigned long)MAPPED_SIZE,
-                    (unsigned long)checkpoint_stride_floats,
-                    (unsigned long)total_checkpoint_size,
-                    (unsigned long)DATA_REGION_OFFSET_BYTES,
-                    DATA_SLOT_COUNT);
-            exit(1);
-        }
-    }
     
     // ✅ 复用checkpoint基地址计算，避免每次重复计算offset
     float* checkpoint_base_ptr(int parall_iter) {
         if (checkpoint_stride_floats == 0) {
             fprintf(stderr, "[ERROR] checkpoint_stride_floats not initialized! Call init_streams first.\n");
-            exit(1);
-        }
-        if (parall_iter < 0 || parall_iter >= DATA_SLOT_COUNT) {
-            fprintf(stderr,
-                    "[ERROR] invalid parall_iter=%d, data_slots=%d, checkpoint_stride_floats=%lu\n",
-                    parall_iter,
-                    DATA_SLOT_COUNT,
-                    (unsigned long)checkpoint_stride_floats);
             exit(1);
         }
         return (float *)PR_ADDR_DATA + (parall_iter * checkpoint_stride_floats);
@@ -670,22 +545,6 @@ public:
                total_checkpoint_size, checkpoint_bytes / 1e9);
         printf("Checkpoint padding: %lu bytes (%.2f KB), stride: %lu floats\n",
                checkpoint_padding_bytes, checkpoint_padding_bytes / 1024.0, checkpoint_stride_floats);
-
-        if (checkpoint_stride_floats > UINT64_MAX / sizeof(float) / (uint64_t)DATA_SLOT_COUNT) {
-            fprintf(stderr,
-                    "[ERROR] checkpoint mmap size overflows uint64_t: stride=%lu slots=%d\n",
-                    (unsigned long)checkpoint_stride_floats,
-                    DATA_SLOT_COUNT);
-            exit(1);
-        }
-        uint64_t data_bytes = (uint64_t)checkpoint_stride_floats * sizeof(float) * (uint64_t)DATA_SLOT_COUNT;
-        uint64_t required_bytes = DATA_REGION_OFFSET_BYTES + data_bytes;
-        ensure_region_capacity(required_bytes);
-        printf("Checkpoint mmap capacity: metadata=%lu bytes, data=%lu bytes, total_mapped=%lu bytes, slots=%d\n",
-               (unsigned long)DATA_REGION_OFFSET_BYTES,
-               (unsigned long)data_bytes,
-               (unsigned long)MAPPED_SIZE,
-               DATA_SLOT_COUNT);
         
         return 0;
     }
@@ -714,15 +573,39 @@ public:
         float* target_addr = checkpoint_base + stream->stream_offset + offset_in_stream;
         
         size_t chunk_bytes = chunk_size * sizeof(float);
-        check_data_bounds("write_stream_chunk", parall_iter, stream_id, offset_in_stream,
-                          (uint64_t)chunk_bytes, target_addr);
-        
+
         // ✅ 简化：直接使用单线程 memcpy
         // 原因：
         // - mmap 写入是内存映射，实际写入由内核 page cache 管理
         // - 多线程 memcpy 不会加快磁盘写入，只会增加 CPU 竞争
         // - Python 端的 ssd_thread_pool 已经实现了 4 路并行（4个stream）
         memcpy(target_addr, data, chunk_bytes);
+
+        // ✅ 逐组增量刷盘（group-granular durability 第一阶段）：
+        // 旧行为把全部落盘推迟到 finalize 的一次性 msync（实测占 checkpoint
+        // 时长 ~70%）。这里在每个 chunk memcpy 后立即用
+        // sync_file_range(SYNC_FILE_RANGE_WRITE) 异步启动该区间的内核回写，
+        // 让设备写入与后续组的更新/拷贝重叠；finalize 的 msync(MS_SYNC)
+        // 仍是唯一耐久点与发布屏障（一致性语义不变），但届时大部分脏页
+        // 已回写完成。开关：PCCHECK_GROUP_FLUSH=0 关闭（默认开启）。
+        static const bool group_flush = [] {
+            const char *e = getenv("PCCHECK_GROUP_FLUSH");
+            return e == nullptr || strcmp(e, "0") != 0;
+        }();
+        if (group_flush) {
+            const size_t fpage = 4096;
+            size_t file_off = (size_t)((char *)target_addr - (char *)PR_ADDR);
+            size_t fstart = (file_off / fpage) * fpage;
+            size_t fend = ((file_off + chunk_bytes + fpage - 1) / fpage) * fpage;
+            if (sync_file_range(fd, (off64_t)fstart, (off64_t)(fend - fstart),
+                                SYNC_FILE_RANGE_WRITE) == -1) {
+                // 回写失败不致命（最终 msync 仍保证耐久），仅告警一次
+                static std::atomic<bool> sfr_warned{false};
+                if (!sfr_warned.exchange(true)) {
+                    perror("[WARN] sync_file_range");
+                }
+            }
+        }
     }
 
     // 读取单个流的数据块到用户缓冲区
@@ -743,8 +626,6 @@ public:
         float* source_addr = checkpoint_base + stream->stream_offset + offset_in_stream;
 
         size_t chunk_bytes = chunk_size * sizeof(float);
-        check_data_bounds("read_stream_chunk", parall_iter, stream_id, offset_in_stream,
-                          (uint64_t)chunk_bytes, source_addr);
         memcpy(out, source_addr, chunk_bytes);
     }
     
@@ -767,8 +648,6 @@ public:
         float* checkpoint_base = checkpoint_base_ptr(parall_iter);
         float* target_addr = checkpoint_base + stream->stream_offset;
         size_t sync_bytes = stream->stream_size * sizeof(float);
-        check_data_bounds("sync_stream", parall_iter, stream_id, 0,
-                          (uint64_t)sync_bytes, target_addr);
         
         // msync 需要页对齐的地址和大小
         size_t page_size = 4096;
@@ -812,8 +691,6 @@ public:
         
         // 计算整个检查点区域的大小（所有stream的总和，不包含padding）
         size_t total_sync_bytes = total_checkpoint_size * sizeof(float);
-        check_data_bounds("sync_all_streams", parall_iter, -1, 0,
-                          (uint64_t)total_sync_bytes, checkpoint_base);
         
         // ✅ 优化：单次msync整个检查点区域，而不是4次分别msync
         // 这样可以：
@@ -1033,14 +910,6 @@ public:
             parall_iter = free_space.dequeue(parall_iter);
             if (parall_iter == INT_MIN)
                 continue;
-            if (parall_iter < 0 || parall_iter >= DATA_SLOT_COUNT)
-            {
-                fprintf(stderr,
-                        "[ERROR] free_space returned invalid parall_iter=%d, data_slots=%d\n",
-                        parall_iter,
-                        DATA_SLOT_COUNT);
-                exit(1);
-            }
             else
                 break;
         }
@@ -1276,6 +1145,10 @@ extern "C" // 生成的.so文件暴露出来的接口
     
     // 初始化多个数据流
     int init_streams(NVM_write *t, int num_streams, size_t *stream_sizes) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] init_streams called with null handle\n");
+            return -1;
+        }
         return t->init_streams(num_streams, stream_sizes);
     }
     
@@ -1283,6 +1156,10 @@ extern "C" // 生成的.so文件暴露出来的接口
     void write_stream_chunk(NVM_write *t, int stream_id, float *data, 
                            size_t offset_in_stream, size_t chunk_size, 
                            int parall_iter, int num_threads) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] write_stream_chunk called with null handle\n");
+            return;
+        }
         t->write_stream_chunk(stream_id, data, offset_in_stream, chunk_size, 
                              parall_iter, num_threads);
     }
@@ -1291,40 +1168,72 @@ extern "C" // 生成的.so文件暴露出来的接口
     void read_stream_chunk(NVM_write *t, int stream_id, float *out,
                            size_t offset_in_stream, size_t chunk_size,
                            int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] read_stream_chunk called with null handle\n");
+            return;
+        }
         t->read_stream_chunk(stream_id, out, offset_in_stream, chunk_size, parall_iter);
     }
     
     // 同步单个流到磁盘
     void sync_stream(NVM_write *t, int stream_id, int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] sync_stream called with null handle\n");
+            return;
+        }
         t->sync_stream(stream_id, parall_iter);
     }
     
     // 同步所有流到磁盘（沿用原pccheck的槽位管理和元数据更新）
     void sync_all_streams(NVM_write *t, int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] sync_all_streams called with null handle\n");
+            return;
+        }
         t->sync_all_streams(parall_iter);
     }
     
     // ✅ DRAM槽位管理接口（用于多流pccheck内存复用）
     // 借用一块pinned buffer
     float* borrow_chunk(NVM_write *t) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] borrow_chunk called with null handle\n");
+            return nullptr;
+        }
         return t->borrow_chunk();
     }
     
     // 归还pinned buffer
     void return_chunk(NVM_write *t, float* buffer) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] return_chunk called with null handle\n");
+            return;
+        }
         t->return_chunk(buffer);
     }
 
     // 兼容旧接口
     float* borrow_cpu_slot(NVM_write *t, int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] borrow_cpu_slot called with null handle\n");
+            return nullptr;
+        }
         return t->borrow_cpu_slot(parall_iter);
     }
     
     void return_cpu_slot(NVM_write *t, int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] return_cpu_slot called with null handle\n");
+            return;
+        }
         t->return_cpu_slot(parall_iter);
     }
 
     int get_latest_parall_iter(NVM_write *t) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] get_latest_parall_iter called with null handle\n");
+            return -1;
+        }
         return t->get_latest_parall_iter();
     }
 

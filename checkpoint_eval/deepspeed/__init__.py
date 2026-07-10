@@ -147,9 +147,18 @@ class MultiStreamPipelineEngine(PipelineEngine):
 
     def _exec_optimizer_step(self, lr_kwargs=None):
         if self._ms_ckpt is not None:
-            for events in self._ms_ckpt._layer_copy_events.values():
-                if events and events[0] is not None:
-                    torch.cuda.current_stream().wait_event(events[0])
+            # 写后读保护：更新前必须等该组 *全部* 流（param/master/exp_avg/exp_avg_sq）
+            # 的 D2D 拷贝事件。旧代码只等 events[0]（param 流），moment 流可能仍在
+            # 拷贝中就被本次 update 覆写 → 动量流撕裂（单卡逐位校验抓过同款 bug）。
+            with self._ms_ckpt._layer_copy_events_lock:
+                pending_events = [
+                    ev
+                    for events in self._ms_ckpt._layer_copy_events.values()
+                    for ev in (events or [])
+                    if ev is not None
+                ]
+            for ev in pending_events:
+                torch.cuda.current_stream().wait_event(ev)
         super()._exec_optimizer_step(lr_kwargs)
 
     def save_multistream_checkpoint(self, step, sync=False, return_breakdown=False):
