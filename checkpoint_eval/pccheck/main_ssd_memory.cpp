@@ -334,6 +334,13 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     printf("------------------------- is_distributed is %d, rank is %d\n", is_distributed, my_rank);
     if (is_distributed) {
 
+        // 并行多作业隔离：coordinator 端口可由环境变量覆盖（默认 1235）
+        char const* port_env = getenv("PCCHECK_COORD_PORT");
+        if (port_env != nullptr && port_env[0] != '\0') {
+            int p = atoi(port_env);
+            if (p > 0 && p < 65536) port = p;
+        }
+
         char const* tmp = getenv("PCCHECK_COORDINATOR");
         std::string server_ip;
         if (tmp != nullptr && tmp[0] != '\0') {
