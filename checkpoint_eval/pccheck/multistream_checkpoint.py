@@ -812,6 +812,9 @@ class MultiStreamCheckpoint:
         # 新检查点更新该层组之前，需要等待所有 4 个事件
         self._layer_copy_events = {}  # {group_idx: [events]}
         self._layer_copy_events_lock = Lock()
+        # metadata JSON 的读-改-写串行化（export_metadata / _update_latest_parall_iter
+        # 分别在主线程与后台 finalize 线程并发访问同一文件）
+        self._metadata_io_lock = Lock()
         self._profile_checkpoint_seq = 0
         self._profile_parall_to_checkpoint_id = {}
         print(f"  ✓ Cross-checkpoint layer synchronization enabled")
@@ -1125,8 +1128,14 @@ class MultiStreamCheckpoint:
             metadata["optimizer_steps"] = optimizer_steps
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        # 原子写（tmp + os.replace）+ 进程内锁：export（主线程逐 checkpoint 调用）与
+        # _update_latest_parall_iter（后台 finalize 线程）并发读写同一 JSON，
+        # 直接覆写会让并发读者（含跨进程的 pipelayer 恢复端）读到半截文件。
+        with self._metadata_io_lock:
+            tmp_path = output_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, output_path)
 
         print(f"✓ Multistream metadata exported to {output_path}")
         return output_path
@@ -1141,20 +1150,24 @@ class MultiStreamCheckpoint:
         if not self.metadata_path or not os.path.exists(self.metadata_path):
             return
         try:
-            with open(self.metadata_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            metadata["latest_parall_iter"] = int(parall_iter)
-            # 兼容旧 metadata：optimizer_steps 可能在初始化导出后一直为 0，
-            # 这会在恢复时导致 AdamW bias_correction 分母为 0。
-            steps = metadata.get("optimizer_steps")
-            if isinstance(steps, dict) and steps:
-                try:
-                    if all(int(v) <= 0 for v in steps.values()):
-                        metadata["optimizer_steps"] = {k: int(parall_iter) for k in steps.keys()}
-                except Exception:
-                    pass
-            with open(self.metadata_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            # 与 export_metadata 共享同一把锁做读-改-写串行化；原子替换防半截读。
+            with self._metadata_io_lock:
+                with open(self.metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                metadata["latest_parall_iter"] = int(parall_iter)
+                # 兼容旧 metadata：optimizer_steps 可能在初始化导出后一直为 0，
+                # 这会在恢复时导致 AdamW bias_correction 分母为 0。
+                steps = metadata.get("optimizer_steps")
+                if isinstance(steps, dict) and steps:
+                    try:
+                        if all(int(v) <= 0 for v in steps.values()):
+                            metadata["optimizer_steps"] = {k: int(parall_iter) for k in steps.keys()}
+                    except Exception:
+                        pass
+                tmp_path = self.metadata_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, self.metadata_path)
         except Exception as e:
             print(f"[WARN] Failed to update latest_parall_iter in metadata: {e}")
 
