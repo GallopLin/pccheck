@@ -608,17 +608,44 @@ public:
             const char *e = getenv("PCCHECK_GROUP_FLUSH");
             return e == nullptr || strcmp(e, "0") != 0;
         }();
+        // ✅ 逐组页回收（group-granular reclaim 第二阶段，PCCHECK_GROUP_RECLAIM=1 开启）：
+        // mmap 写入的脏页计入 cgroup memory。慢盘上多 rank 并发大 checkpoint
+        // （如 BLOOM-7B PP4 每次 ~84GB 突发）会让脏页顶爆容器 memory.max →
+        // cgroup OOM 直接 SIGKILL 训练 rank（实测 oom_kill=4 对应 4 个失败档）。
+        // 开启后每 chunk 同步等待该区间回写完成（WAIT_BEFORE|WRITE|WAIT_AFTER，
+        // 在 SSD 后台线程阻塞，天然形成写入回压），再 posix_fadvise(DONTNEED)
+        // 回收已干净的页缓存——checkpoint 的内存足迹从 O(payload) 降为 O(chunk)。
+        // 代价：SSD 线程逐 chunk 等待设备（本就是持久化线程，非关键路径）；
+        // 下一 slot 复用该区间时按页缺页重读（顺序覆盖写，读放大可忽略）。
+        static const bool group_reclaim = [] {
+            const char *e = getenv("PCCHECK_GROUP_RECLAIM");
+            return e != nullptr && strcmp(e, "1") == 0;
+        }();
         if (group_flush) {
             const size_t fpage = 4096;
             size_t file_off = (size_t)((char *)target_addr - (char *)PR_ADDR);
             size_t fstart = (file_off / fpage) * fpage;
             size_t fend = ((file_off + chunk_bytes + fpage - 1) / fpage) * fpage;
+            unsigned int sfr_flags = group_reclaim
+                ? (SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                   SYNC_FILE_RANGE_WAIT_AFTER)
+                : SYNC_FILE_RANGE_WRITE;
             if (sync_file_range(fd, (off64_t)fstart, (off64_t)(fend - fstart),
-                                SYNC_FILE_RANGE_WRITE) == -1) {
+                                sfr_flags) == -1) {
                 // 回写失败不致命（最终 msync 仍保证耐久），仅告警一次
                 static std::atomic<bool> sfr_warned{false};
                 if (!sfr_warned.exchange(true)) {
                     perror("[WARN] sync_file_range");
+                }
+            } else if (group_reclaim) {
+                // 该区间已回写完成（干净页），可安全从页缓存回收；
+                // 失败（如 tmpfs 不支持）不致命，告警一次后继续。
+                if (posix_fadvise(fd, (off64_t)fstart, (off64_t)(fend - fstart),
+                                  POSIX_FADV_DONTNEED) != 0) {
+                    static std::atomic<bool> fadv_warned{false};
+                    if (!fadv_warned.exchange(true)) {
+                        perror("[WARN] posix_fadvise(DONTNEED)");
+                    }
                 }
             }
         }
