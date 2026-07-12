@@ -197,7 +197,17 @@ def create_stage_checkpoint(
     torch.cuda.empty_cache()
 
     # 3. 构建 param_layout（MultiStreamCheckpoint 需要的元数据）
-    param_layout = build_param_layout(model, optimizer)
+    # PCCHECK_MS_QUANT=1: moments 流 int8 量化融进拷贝（payload 3N→~1.5N，
+    # 慢盘环境直接砍近半写盘时间；单卡 resume-loss 1e-5 近无损已验证）。
+    # 量化/分组交互（split 刀口 snap 到 block 边界、交错布局）由 v3 模块内部处理。
+    quant_moments = os.environ.get("PCCHECK_MS_QUANT", "0") == "1"
+    quant_kwargs = {}
+    if quant_moments:
+        quant_block = int(os.environ.get("PCCHECK_MS_QUANT_BLOCK", "2048"))
+        quant_kwargs = {"quant_moments": True, "quant_block": quant_block}
+        print(f"[multistream] PCCHECK_MS_QUANT=1: int8 moment quantization "
+              f"enabled (block={quant_block})")
+    param_layout = build_param_layout(model, optimizer, **quant_kwargs)
     stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
     os.makedirs(stage_dir, exist_ok=True)
     chk_file = os.path.join(stage_dir, f"stage_{rank}.chk")
@@ -219,6 +229,7 @@ def create_stage_checkpoint(
         distributed=True,
         rank=rank,
         world_size=world_size,
+        **quant_kwargs,
     )
 
     return ms_ckpt, gpu_buffers, param_layout
