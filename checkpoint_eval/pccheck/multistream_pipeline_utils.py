@@ -10,10 +10,12 @@ DeepSpeed Pipeline Parallelism + MultiStream Checkpoint 工具
     3. MultiStreamCheckpoint 直接从映射后的存储读取，无需额外拷贝
 """
 
+import atexit
 import json
 import os
 import time
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -21,6 +23,60 @@ import torch.distributed as dist
 
 from .multistream_checkpoint import MultiStreamCheckpoint, build_param_layout
 from ..pccheck_utils import initialize, set_storage
+
+# P1.2：metadata/training_state 写盘下沉后台单线程（保序），主线程只做
+# 廉价快照 + submit。tmpfs 对照显示每步 checkpoint 前台开销 p50 +26%，
+# 主要来自 export_metadata（per-param step .item() 逐个 CUDA sync + 大 JSON
+# 序列化 + 原子写盘）。PCCHECK_MS_ASYNC_META=0 回退旧同步行为。
+_ASYNC_META_ENABLED = os.environ.get("PCCHECK_MS_ASYNC_META", "1") == "1"
+_meta_executor: Optional[ThreadPoolExecutor] = None
+_meta_last_future = None
+
+
+def _get_meta_executor() -> ThreadPoolExecutor:
+    global _meta_executor
+    if _meta_executor is None:
+        _meta_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ms-meta")
+        atexit.register(drain_metadata_writes)
+    return _meta_executor
+
+
+def drain_metadata_writes(timeout: float = 60.0) -> None:
+    """等待最后一个后台 metadata 写完成（进程退出/同步模式屏障）。"""
+    f = _meta_last_future
+    if f is not None:
+        try:
+            f.result(timeout=timeout)
+        except Exception as e:  # 不吞真实错误信号，仅避免退出路径抛出
+            print(f"[WARN] async metadata write failed: {e}")
+
+
+@torch.no_grad()
+def _snapshot_optimizer_steps(model: torch.nn.Module,
+                              optimizer: torch.optim.Optimizer) -> Dict[str, int]:
+    """主线程 step 快照：GPU 标量批量 cat 后单次 D2H，替代 per-param .item()
+    的逐个同步；同时保证后台写出的 steps 属于本 checkpoint（非下一迭代）。"""
+    pmap = {p: n for n, p in model.named_parameters()}
+    names, tensors, vals = [], [], {}
+    for group in optimizer.param_groups:
+        for p in group.get("params", []):
+            st = optimizer.state.get(p)
+            if not st or "step" not in st or p not in pmap:
+                continue
+            s = st["step"]
+            if isinstance(s, torch.Tensor):
+                if s.is_cuda:
+                    names.append(pmap[p])
+                    tensors.append(s.detach().reshape(1).float())
+                else:
+                    vals[pmap[p]] = int(s.item())
+            else:
+                vals[pmap[p]] = int(s)
+    if tensors:
+        flat = torch.cat(tensors).cpu()  # 单次同步
+        for n, v in zip(names, flat.tolist()):
+            vals[n] = int(v)
+    return vals
 
 
 @torch.no_grad()
@@ -267,14 +323,38 @@ def save_stage_checkpoint(
     # export_metadata needs the model to serialize optimizer param groups/steps by name.
     metadata_t0 = time.perf_counter()
     ms_ckpt._pending_model = model
-    ms_ckpt.export_metadata(optimizer=optimizer)
+    if _ASYNC_META_ENABLED and not sync:
+        # 主线程只做快照（steps 批量单 sync + param_groups 纯 CPU 结构），
+        # 序列化与写盘下沉后台单线程；async 模式下 metadata_ms ≈ 快照+submit。
+        name_map = {n: p for n, p in model.named_parameters()}
+        steps_snap = _snapshot_optimizer_steps(model, optimizer)
+        pg_snap = ms_ckpt._serialize_optimizer_param_groups(optimizer, name_map)
+        lr_snap = optimizer.param_groups[0].get("lr", 0)
 
-    _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
-    metadata_ms = (time.perf_counter() - metadata_t0) * 1000.0
+        def _meta_task():
+            ms_ckpt.export_metadata(optimizer=None,
+                                    optimizer_steps_override=steps_snap,
+                                    param_groups_override=pg_snap)
+            _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
+            _write_stage_training_state(checkpoint_dir, rank, step,
+                                        optimizer=None, slot=parall_iter,
+                                        lr=lr_snap)
 
-    state_t0 = time.perf_counter()
-    _write_stage_training_state(checkpoint_dir, rank, step, optimizer, slot=parall_iter)
-    stage_state_ms = (time.perf_counter() - state_t0) * 1000.0
+        global _meta_last_future
+        _meta_last_future = _get_meta_executor().submit(_meta_task)
+        metadata_ms = (time.perf_counter() - metadata_t0) * 1000.0
+        stage_state_ms = 0.0
+    else:
+        ms_ckpt.export_metadata(optimizer=optimizer)
+        _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
+        metadata_ms = (time.perf_counter() - metadata_t0) * 1000.0
+
+        state_t0 = time.perf_counter()
+        _write_stage_training_state(checkpoint_dir, rank, step, optimizer,
+                                    slot=parall_iter)
+        stage_state_ms = (time.perf_counter() - state_t0) * 1000.0
+    if sync:
+        drain_metadata_writes()
 
     elapsed = time.perf_counter() - t0
     if return_breakdown:
@@ -292,7 +372,11 @@ def save_stage_checkpoint(
 
 
 def _write_multistream_info(ms_ckpt: MultiStreamCheckpoint, checkpoint_dir: str, rank: int):
-    """写入 multistream_info.json，供 pipelayer MultiStreamStateLoader 发现"""
+    """写入 multistream_info.json，供 pipelayer MultiStreamStateLoader 发现。
+    内容对一次训练静态，只写一次。"""
+    if getattr(ms_ckpt, "_ms_info_written", None) == checkpoint_dir:
+        return
+    ms_ckpt._ms_info_written = checkpoint_dir
     stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
     info = {
         "lib_path": ms_ckpt.lib_path,
@@ -308,15 +392,18 @@ def _write_stage_training_state(
     checkpoint_dir: str,
     rank: int,
     step: int,
-    optimizer: torch.optim.Optimizer,
+    optimizer: Optional[torch.optim.Optimizer],
     slot: Optional[int] = None,
+    lr: Optional[float] = None,
 ):
-    """写入每个阶段的训练状态"""
+    """写入每个阶段的训练状态。异步路径下 optimizer=None、lr 用主线程快照值。"""
     stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
+    if lr is None:
+        lr = optimizer.param_groups[0].get("lr", 0) if optimizer is not None else 0
     state = {
         "completed_steps": step,
         "rank": rank,
-        "lr": optimizer.param_groups[0].get("lr", 0),
+        "lr": lr,
     }
     if slot is not None:
         state["slot"] = int(slot)

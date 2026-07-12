@@ -953,7 +953,9 @@ class MultiStreamCheckpoint:
         return steps
 
     def export_metadata(self, output_path: Optional[str] = None, optimizer: Optional[torch.optim.Optimizer] = None,
-                        chunk_groups: Optional[List[List[int]]] = None) -> str:
+                        chunk_groups: Optional[List[List[int]]] = None,
+                        optimizer_steps_override: Optional[Dict[str, int]] = None,
+                        param_groups_override: Optional[List[Dict]] = None) -> str:
         """
         导出 multistream 检查点元数据，供流水加载使用。
 
@@ -961,6 +963,10 @@ class MultiStreamCheckpoint:
             output_path: 元数据文件路径；默认使用 self.metadata_path。
             optimizer: 可选，用于导出 optimizer param_groups 与 step。
             chunk_groups: 可选自定义 layer group 划分；默认使用 self.layer_groups。
+            optimizer_steps_override / param_groups_override: 可选，主线程在
+                checkpoint 提交点取好的快照。提供后本函数不再读 optimizer 活状态，
+                可安全下沉到后台线程执行（否则并发的下一迭代 update 会污染
+                steps/lr，导致 metadata 与该 checkpoint 语义错位一步）。
         """
         if output_path is None:
             output_path = self.metadata_path
@@ -1073,12 +1079,18 @@ class MultiStreamCheckpoint:
                 "stream_slices": stream_slices,
             }
 
-        # optimizer metadata
+        # optimizer metadata（override 命中则不读 optimizer 活状态，见 docstring）
         param_name_to_param = {}
         if hasattr(self, "_pending_model") and self._pending_model is not None:
             param_name_to_param = {name: p for name, p in self._pending_model.named_parameters()}
-        optimizer_param_groups = self._serialize_optimizer_param_groups(optimizer, param_name_to_param) if optimizer else None
-        optimizer_steps = self._serialize_optimizer_steps(optimizer, param_name_to_param) if optimizer else None
+        if param_groups_override is not None:
+            optimizer_param_groups = param_groups_override
+        else:
+            optimizer_param_groups = self._serialize_optimizer_param_groups(optimizer, param_name_to_param) if optimizer else None
+        if optimizer_steps_override is not None:
+            optimizer_steps = optimizer_steps_override
+        else:
+            optimizer_steps = self._serialize_optimizer_steps(optimizer, param_name_to_param) if optimizer else None
 
         checkpoint_file = self.filename
         if isinstance(checkpoint_file, (bytes, bytearray)):
