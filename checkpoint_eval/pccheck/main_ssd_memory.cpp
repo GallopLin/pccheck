@@ -608,45 +608,79 @@ public:
             const char *e = getenv("PCCHECK_GROUP_FLUSH");
             return e == nullptr || strcmp(e, "0") != 0;
         }();
-        // ✅ 逐组页回收（group-granular reclaim 第二阶段，PCCHECK_GROUP_RECLAIM=1 开启）：
-        // mmap 写入的脏页计入 cgroup memory。慢盘上多 rank 并发大 checkpoint
-        // （如 BLOOM-7B PP4 每次 ~84GB 突发）会让脏页顶爆容器 memory.max →
-        // cgroup OOM 直接 SIGKILL 训练 rank（实测 oom_kill=4 对应 4 个失败档）。
-        // 开启后每 chunk 同步等待该区间回写完成（WAIT_BEFORE|WRITE|WAIT_AFTER，
-        // 在 SSD 后台线程阻塞，天然形成写入回压），再 posix_fadvise(DONTNEED)
-        // 回收已干净的页缓存——checkpoint 的内存足迹从 O(payload) 降为 O(chunk)。
-        // 代价：SSD 线程逐 chunk 等待设备（本就是持久化线程，非关键路径）；
-        // 下一 slot 复用该区间时按页缺页重读（顺序覆盖写，读放大可忽略）。
+        // ✅ 逐组页回收（第二阶段，PCCHECK_GROUP_RECLAIM=1 开启）——窗口化回写：
+        // 背景：mmap 脏页计入 cgroup memory，慢盘上多 rank 并发大 checkpoint
+        // （BLOOM PP4 每次 ~84GB）会顶爆容器 memory.max → cgroup OOM 杀 rank。
+        // 第一版实现逐 chunk 同步 WAIT_AFTER，实测把盘打成队列深度=1 的单请求
+        // 模式（内核失去合并/重排/深队列），checkpoint span 301→446s 反而劣化。
+        // 现改窗口化：每 chunk 只发异步 SYNC_FILE_RANGE_WRITE（内核保持批量
+        // 回写），线程本地窗口累计超过 PCCHECK_RECLAIM_WINDOW_MB（默认 512）
+        // 才对最老段做 WAIT_AFTER + fadvise(DONTNEED) 回收——脏页足迹硬限在
+        // O(窗口×线程数)，回写吞吐保持批量模式。finalize 的 msync 仍兜底全量。
         static const bool group_reclaim = [] {
             const char *e = getenv("PCCHECK_GROUP_RECLAIM");
             return e != nullptr && strcmp(e, "1") == 0;
+        }();
+        static const size_t reclaim_window_bytes = [] {
+            const char *e = getenv("PCCHECK_RECLAIM_WINDOW_MB");
+            long mb = (e != nullptr && e[0] != '\0') ? atol(e) : 512;
+            if (mb < 64) mb = 64;
+            return (size_t)mb * 1024 * 1024;
         }();
         if (group_flush) {
             const size_t fpage = 4096;
             size_t file_off = (size_t)((char *)target_addr - (char *)PR_ADDR);
             size_t fstart = (file_off / fpage) * fpage;
             size_t fend = ((file_off + chunk_bytes + fpage - 1) / fpage) * fpage;
-            unsigned int sfr_flags = group_reclaim
-                ? (SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
-                   SYNC_FILE_RANGE_WAIT_AFTER)
-                : SYNC_FILE_RANGE_WRITE;
             if (sync_file_range(fd, (off64_t)fstart, (off64_t)(fend - fstart),
-                                sfr_flags) == -1) {
+                                SYNC_FILE_RANGE_WRITE) == -1) {
                 // 回写失败不致命（最终 msync 仍保证耐久），仅告警一次
                 static std::atomic<bool> sfr_warned{false};
                 if (!sfr_warned.exchange(true)) {
                     perror("[WARN] sync_file_range");
                 }
             } else if (group_reclaim) {
-                // 该区间已回写完成（干净页），可安全从页缓存回收；
-                // 失败（如 tmpfs 不支持）不致命，告警一次后继续。
-                if (posix_fadvise(fd, (off64_t)fstart, (off64_t)(fend - fstart),
-                                  POSIX_FADV_DONTNEED) != 0) {
-                    static std::atomic<bool> fadv_warned{false};
-                    if (!fadv_warned.exchange(true)) {
-                        perror("[WARN] posix_fadvise(DONTNEED)");
+                // 线程本地待回收段环形缓冲（SSD 线程各自独立，无锁）
+                struct PendingSeg { off64_t start; off64_t len; };
+                constexpr int RING_CAP = 128;
+                static thread_local PendingSeg ring[RING_CAP];
+                static thread_local int rhead = 0, rcount = 0;
+                static thread_local size_t rbytes = 0;
+
+                auto drain_oldest = [&]() {
+                    PendingSeg &seg = ring[rhead];
+                    // 等该段回写完成后回收其页缓存；失败均不致命（告警一次）
+                    if (sync_file_range(fd, seg.start, seg.len,
+                                        SYNC_FILE_RANGE_WAIT_BEFORE |
+                                        SYNC_FILE_RANGE_WRITE |
+                                        SYNC_FILE_RANGE_WAIT_AFTER) == 0) {
+                        if (posix_fadvise(fd, seg.start, seg.len,
+                                          POSIX_FADV_DONTNEED) != 0) {
+                            static std::atomic<bool> fadv_warned{false};
+                            if (!fadv_warned.exchange(true)) {
+                                perror("[WARN] posix_fadvise(DONTNEED)");
+                            }
+                        }
+                    } else {
+                        static std::atomic<bool> wait_warned{false};
+                        if (!wait_warned.exchange(true)) {
+                            perror("[WARN] sync_file_range(WAIT_AFTER)");
+                        }
                     }
+                    rbytes -= (size_t)seg.len;
+                    rhead = (rhead + 1) % RING_CAP;
+                    rcount--;
+                };
+
+                // 窗口满（按字节或环容量）先排空最老段，再入队本段
+                while (rcount > 0 && (rbytes >= reclaim_window_bytes ||
+                                      rcount >= RING_CAP)) {
+                    drain_oldest();
                 }
+                int rtail = (rhead + rcount) % RING_CAP;
+                ring[rtail] = {(off64_t)fstart, (off64_t)(fend - fstart)};
+                rcount++;
+                rbytes += fend - fstart;
             }
         }
     }
