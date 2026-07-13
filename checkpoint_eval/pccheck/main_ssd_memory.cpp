@@ -590,12 +590,43 @@ public:
         
         size_t chunk_bytes = chunk_size * sizeof(float);
 
-        // ✅ 简化：直接使用单线程 memcpy
-        // 原因：
-        // - mmap 写入是内存映射，实际写入由内核 page cache 管理
-        // - 多线程 memcpy 不会加快磁盘写入，只会增加 CPU 竞争
-        // - Python 端的 ssd_thread_pool 已经实现了 4 路并行（4个stream）
-        memcpy(target_addr, data, chunk_bytes);
+        // ✅ 数据区写入路径（PCCHECK_DATA_PWRITE=1 默认，=0 回退 mmap memcpy）：
+        // mmap memcpy 写出的脏页 mapcount>0，posix_fadvise(DONTNEED) 无法回收
+        // ——page cache 以内存带宽膨胀顶满 cgroup，触发全局 direct reclaim
+        // 把训练主线程一并拖慢（BLOOM 实测 p50 步时 1.26s→10.5s）。改用
+        // pwrite：同一 inode 的统一 page cache（mmap 读端一致性不变、msync
+        // 兜底语义不变），但页无 mmap 引用，窗口化 fadvise 能真正回收——
+        // 脏页与干净页总量都被窗口硬限。
+        static const bool data_pwrite = [] {
+            const char *e = getenv("PCCHECK_DATA_PWRITE");
+            return e == nullptr || strcmp(e, "0") != 0;
+        }();
+        bool wrote_via_fd = false;
+        if (data_pwrite) {
+            size_t woff = (size_t)((char *)target_addr - (char *)PR_ADDR);
+            ssize_t done = 0;
+            while (done < (ssize_t)chunk_bytes) {
+                ssize_t w = pwrite(fd, (const char *)data + done,
+                                   chunk_bytes - done, (off64_t)(woff + done));
+                if (w <= 0) {
+                    if (w < 0 && errno == EINTR) continue;
+                    static std::atomic<bool> pw_warned{false};
+                    if (!pw_warned.exchange(true)) {
+                        perror("[WARN] pwrite data region, fallback to mmap memcpy");
+                    }
+                    break;
+                }
+                done += w;
+            }
+            if (done == (ssize_t)chunk_bytes) {
+                wrote_via_fd = true;
+            } else if (done > 0) {
+                // 部分写入后失败：整段用 memcpy 重写保证完整性
+            }
+        }
+        if (!wrote_via_fd) {
+            memcpy(target_addr, data, chunk_bytes);
+        }
 
         // ✅ 逐组增量刷盘（group-granular durability 第一阶段）：
         // 旧行为把全部落盘推迟到 finalize 的一次性 msync（实测占 checkpoint
