@@ -1323,6 +1323,67 @@ class MultiStreamCheckpoint:
         print(f"✓ Multistream metadata exported to {output_path}")
         return output_path
 
+    def verify_published(self, snapshots):
+        """把文件中最新已发布版本与内存真值逐张量比对。
+
+        snapshots: {checkpoint_id: {layer_id: (param, exp_avg, exp_avg_sq)}}（CPU fp32），
+        由调用方在各 checkpoint 时刻捕获。按 extra blob 的 checkpoint_id 找到对应真值；
+        参数要求逐位一致，moment 在无损模式下逐位一致、量化模式下等于真值的 QDQ。
+        返回 {"ok", "slot", "checkpoint_id", "mismatches", "checked"}。"""
+        rec = read_published_checkpoint(self.filename, self._max_async)
+        if rec["status"] != "published":
+            return {"ok": False, "reason": f"published record status={rec['status']}"}
+        slot = rec["slot"]
+        with open(self.metadata_path) as f:
+            meta = json.load(f)
+        stride = int(meta["checkpoint_stride_floats"])
+        sizes = [int(x) for x in self.stream_sizes]
+        base = (self._max_async + 4) * 4096 + slot * stride
+        offs = [0, sizes[0], sizes[0] + sizes[1], sizes[0] + sizes[1] + sizes[2]]
+        mm = np.memmap(self.filename, dtype=np.float32, mode="r")
+        blob = None
+        if self.extra_stream_floats > 0:
+            raw = np.array(mm[base + sum(sizes): base + sum(sizes) + self.extra_stream_floats]).tobytes()
+            blob, _ = self.parse_extra_state_blob(raw)
+        cid = int(blob.get("checkpoint_id", -1)) if blob else -1
+        truth = snapshots.get(cid)
+        if truth is None:
+            return {"ok": False, "slot": slot, "checkpoint_id": cid,
+                    "reason": f"no snapshot for checkpoint_id {cid} (have {sorted(snapshots)})"}
+        bad, checked = [], 0
+        q = bool(self.quant_moments)
+        blk = int(self.quant_block)
+        for lid, (p_t, ea_t, eas_t) in truth.items():
+            li = self.param_layout[lid]
+            n = int(li["param_size"])
+            o = base + offs[0] + int(li["param_offset"])
+            if not np.array_equal(np.asarray(mm[o:o + n]), p_t.reshape(-1).numpy()):
+                bad.append(f"param:{li['name']}")
+            for key, t, sid, sq in (("exp_avg", ea_t, 2, False), ("exp_avg_sq", eas_t, 3, True)):
+                if t is None:
+                    continue
+                if q:
+                    # 期望值必须在 GPU 上量化：CPU 与 GPU 的 amax/127 与舍入并非逐位一致
+                    # （实测约 1e-7 比例的码字差 1），生产路径在 GPU 上量化
+                    dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    qq, sc = quantize_int8_blocks(t.reshape(-1).to(dev), blk, sqrt_domain=sq)
+                    nb, U = int(li["q_nblocks"]), _quant_unit_floats(blk)
+                    oo = base + offs[sid] + int(li[f"{key}_offset"])
+                    region = np.array(mm[oo:oo + nb * U]).reshape(nb, U)
+                    i8 = torch.from_numpy(region[:, :U - 1].copy()).view(torch.int8).reshape(-1)[:n]
+                    scl = torch.from_numpy(region[:, U - 1].copy())
+                    if not (torch.equal(qq.cpu(), i8) and torch.equal(sc.cpu(), scl)):
+                        bad.append(f"{key}:{li['name']}")
+                else:
+                    oo = base + offs[sid] + int(li[f"{key}_offset"])
+                    if not np.array_equal(np.asarray(mm[oo:oo + n]), t.reshape(-1).numpy()):
+                        bad.append(f"{key}:{li['name']}")
+            checked += 1
+        res = {"ok": not bad, "slot": slot, "checkpoint_id": cid, "checked": checked,
+               "mismatches": bad[:20], "n_mismatch": len(bad)}
+        _ms_profile_event("verify", **{k: v for k, v in res.items() if k != "mismatches"})
+        return res
+
     def add_publish_callback(self, cb):
         """注册发布回调 cb(parall_iter, payload)：仅在该 slot 已持久化并发布后调用。"""
         self._publish_callbacks.append(cb)
@@ -2551,31 +2612,28 @@ class MultiStreamCheckpoint:
 
         return submit_time
 
-    def drain(self):
-        """等待所有尚未完成的异步 checkpoint 完成并落盘。
+    def drain(self, timeout=None):
+        """等待所有在途 checkpoint 持久化并发布（或被错误闩中止）。
 
-        目的：
-        - 让 benchmark 的时间统计包含尾部异步写入/flush，避免吞吐被高估或出现非单调异常。
-        - 避免后台线程池继续占用 CPU/SSD 带宽，干扰后续 step 或后续实验。
-        """
-        print("Draining multistream checkpoint: waiting for all background tasks...")
-        
-        # 等待所有SSD写入任务完成
-        max_wait_time = 60
-        wait_start = time.time()
-        
+        计时口径：基准的 EXECUTION TIME 必须包含尾部 checkpoint 的完整持久化
+        （D2H、写盘、fdatasync、CAS 发布），与基线 drain 到写完为止的口径一致。
+        旧实现只等 SSD 写任务数归零、且最多 60 s，会漏掉最后的 durability barrier。"""
+        timeout = float(os.environ.get("PCCHECK_DRAIN_TIMEOUT", "3600")) if timeout is None else timeout
+        print("Draining multistream checkpoint: waiting for all in-flight checkpoints to publish...")
+        t0 = time.time()
         while True:
+            with self._slot_lock:
+                active = len(self._checkpoint_slots)
             with self._inflight_ssd_lock:
                 inflight = self._inflight_ssd_tasks
-            
-            if inflight == 0:
-                print(f"✓ All background tasks completed")
-                break
-            
-            if time.time() - wait_start > max_wait_time:
-                print(f"⚠ Warning: drain timeout after {max_wait_time}s, {inflight} tasks still running")
-                break
-    
+            if active == 0 and inflight == 0:
+                print(f"✓ All checkpoints published ({time.time() - t0:.2f}s tail)")
+                return time.time() - t0
+            if time.time() - t0 > timeout:
+                print(f"⚠ Warning: drain timeout after {timeout}s, active={active} inflight={inflight}")
+                return time.time() - t0
+            time.sleep(0.01)
+
     def shutdown(self):
         """关闭线程池，释放资源"""
         # 在关闭线程池之前，先确保没有未完成的异步 checkpoint。

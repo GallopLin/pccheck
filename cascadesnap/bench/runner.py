@@ -183,6 +183,32 @@ def file_sha(path):
         return None
 
 
+def freeze_code(result_root):
+    """整批实验使用冻结的代码快照：git archive HEAD + 已编译的 .so。
+    运行期间修改源码不会混入本批；provenance 记录的就是实际运行的代码。"""
+    global PCCHECK_ROOT, TRANSFORMERS_ROOT, EXAMPLES, CASCADE_LIB, PCCHECK_LIB
+    dst = os.path.join(result_root, "code")
+    for root, name in ((PCCHECK_ROOT, "pccheck"), (TRANSFORMERS_ROOT, "transformers")):
+        if sh(f"git -C {root} status --porcelain --untracked-files=no"):
+            raise SystemExit(f"--freeze needs a clean tree: {root}")
+        out = os.path.join(dst, name)
+        if not os.path.isdir(out):
+            os.makedirs(out)
+            subprocess.run(f"git -C {root} archive HEAD | tar -x -C {out}", shell=True, check=True)
+            with open(os.path.join(out, "COMMIT"), "w") as f:
+                f.write(sh(f"git -C {root} rev-parse HEAD") + "\n")
+    lib_dst = os.path.join(dst, "pccheck", "checkpoint_eval", "pccheck", "libtest_ssd.so")
+    if not os.path.exists(lib_dst):
+        shutil.copy(CASCADE_LIB, lib_dst)
+    same_lib = PCCHECK_LIB == CASCADE_LIB
+    PCCHECK_ROOT = os.path.join(dst, "pccheck")
+    TRANSFORMERS_ROOT = os.path.join(dst, "transformers")
+    EXAMPLES = f"{TRANSFORMERS_ROOT}/examples/pytorch/language-modeling"
+    CASCADE_LIB = lib_dst
+    if same_lib:
+        PCCHECK_LIB = lib_dst
+
+
 def _sigterm(*_):
     raise KeyboardInterrupt("SIGTERM")
 
@@ -195,9 +221,13 @@ def main():
     ap.add_argument("--reps", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--timeout", type=int, default=7200)
+    ap.add_argument("--freeze", action="store_true",
+                    help="把两个仓库的 HEAD 导出到 RESULT_ROOT/code 并整批使用（要求工作区干净）")
     a = ap.parse_args()
 
     a.result_root = os.path.abspath(a.result_root)  # 子进程在工作目录里运行
+    if a.freeze:
+        freeze_code(a.result_root)
     spec = json.load(open(a.matrix))
     defaults = spec.get("defaults", {})
     runs = [dict(defaults, **r) for r in spec["runs"]]
@@ -219,10 +249,16 @@ def main():
         with open(progress, "a") as f:
             f.write(line + "\n")
 
+    def _commit(root):
+        c = os.path.join(root, "COMMIT")
+        return open(c).read().strip() if os.path.exists(c) else sh(f"git -C {root} rev-parse HEAD")
+
     provenance = {
-        "pccheck_commit": sh(f"git -C {PCCHECK_ROOT} rev-parse HEAD"),
+        "frozen": bool(a.freeze),
+        "pccheck_root": PCCHECK_ROOT,
+        "pccheck_commit": _commit(PCCHECK_ROOT),
         "pccheck_dirty": bool(sh(f"git -C {PCCHECK_ROOT} status --porcelain --untracked-files=no")),
-        "transformers_commit": sh(f"git -C {TRANSFORMERS_ROOT} rev-parse HEAD"),
+        "transformers_commit": _commit(TRANSFORMERS_ROOT),
         "transformers_dirty": bool(sh(f"git -C {TRANSFORMERS_ROOT} status --porcelain --untracked-files=no")),
         "cascade_lib_sha256": file_sha(CASCADE_LIB),
         "pccheck_lib_sha256": file_sha(PCCHECK_LIB),

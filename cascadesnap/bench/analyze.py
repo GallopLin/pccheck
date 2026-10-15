@@ -95,6 +95,12 @@ def per_run(root, row):
     out["timed_ckpts"] = sum(1 for _, c, _ in timed if c)
     out["step_gpu_ms"] = [g for _, _, g in timed]
     out["throughput"] = (len(timed) / row["execution_s"]) if row.get("execution_s") and timed else None
+    # 训练窗口 = 计时区内各步耗时之和；尾部 = 最后一步之后等在途 checkpoint 持久化的时间。
+    # 短跑里尾部可能主导 execution_s，两者分开报告。
+    win = sum(g for _, _, g in timed) / 1000.0 if timed else None
+    out["train_window_s"] = win
+    out["tail_s"] = (row["execution_s"] - win) if (win is not None and row.get("execution_s")) else None
+    out["throughput_window"] = (len(timed) / win) if win else None
     fin = [e for e in prof if e.get("event") == "checkpoint_finalize"]
     out["L_ms"] = median([e.get("durability_latency_ms", e.get("total_ms")) for e in fin])
     out["published"] = len(fin)
@@ -142,7 +148,7 @@ def main():
         tags.setdefault(r["tag"], []).append(r)
     summary = {"base": base, "failed": [{k: f[k] for k in ("tag", "rep", "rc")} for f in failed],
                "tags": {}}
-    metrics = ["execution_s", "throughput", "overhead_per_ckpt_s", "stall_per_ckpt_ms", "L_ms",
+    metrics = ["execution_s", "throughput", "train_window_s", "tail_s", "throughput_window", "overhead_per_ckpt_s", "stall_per_ckpt_ms", "L_ms",
                "peak_gpu_mib", "peak_dirty_kb", "peak_mem_avail_min_kb", "guard_wait_ms_sum",
                "pre_wait_ms_sum", "stage_ms_median"]
     for tag, rs in sorted(tags.items()):

@@ -119,8 +119,26 @@ class Chk_monitor:
             ],
         )
         self.chk_process.start()
+        if os.environ.get("PCCHECK_DIAG") == "1":
+            self._start_diag()
         self.barrier.wait()
         # print("Chk process started! PID is: ", self.chk_process.pid)
+
+    def _start_diag(self):
+        """诊断：每 10 s 不加锁地读取共享标志，并每 60 s 打印本进程线程栈。"""
+        import faulthandler
+        import sys as _sys
+        import threading
+        faulthandler.dump_traceback_later(60, repeat=True, file=_sys.stderr)
+
+        def loop():
+            while True:
+                time.sleep(10)
+                vals = {k: getattr(self, k).get_obj().value
+                        for k in ("cp_in_progress", "start", "active_async", "stop")}
+                print(f"[pccheck-diag] {time.strftime('%H:%M:%S')} {vals} "
+                      f"child_alive={self.chk_process.is_alive()}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def gpu_copy_in_progress(self):
 

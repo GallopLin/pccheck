@@ -282,6 +282,11 @@ class Checkpoint:
             os.sched_setaffinity(0, {1})
         except Exception:
             pass
+        if os.environ.get("PCCHECK_DIAG") == "1":
+            # 诊断：周期性打印本进程全部线程的 Python 栈（不终止进程）
+            import faulthandler
+            import sys as _sys
+            faulthandler.dump_traceback_later(60, repeat=True, file=_sys.stderr)
 
         # GOAL: same mem footprint as GPM/CheckFreq
         print(f"total_size: {self.total_size}, bsize: {self.bsize}, ratio: {self.ratio}")
