@@ -27,9 +27,10 @@ p = argparse.ArgumentParser()
 p.add_argument("--repo", required=True)
 p.add_argument("--ckdir", required=True)
 p.add_argument("--only", default="")
+p.add_argument("--pipelayer", default="/home/linzhicheng/download/pipelayer/src")
 args = p.parse_args()
 
-ALL_TESTS = ["T1", "T2", "T3", "T4", "T5", "T6"]
+ALL_TESTS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
 if not args.only:
     # C++ 库的 PR_ADDR / free_space 是进程级 static：同一进程里创建多个 writer 会
     # 让空闲 slot 队列出现重复编号。生产中每进程一个 writer，因此每个测试单独起进程。
@@ -37,7 +38,8 @@ if not args.only:
     rcs = {}
     for name in ALL_TESTS:
         r = subprocess.run([sys.executable, "-W", "ignore", os.path.abspath(__file__),
-                            "--repo", args.repo, "--ckdir", args.ckdir, "--only", name],
+                            "--repo", args.repo, "--ckdir", args.ckdir, "--only", name,
+                            "--pipelayer", args.pipelayer],
                            capture_output=True, text=True)
         line = next((l for l in r.stdout.splitlines() if l.startswith(f"{name}:")),
                     f"{name}: ERROR — no summary (rc={r.returncode})\n{r.stderr[-2000:]}")
@@ -474,6 +476,100 @@ def t6():
         return f"fused AdamW 2 groups bit-exact vs optimizer.step(); slot{slot} content OK"
     finally:
         ck.shutdown()
+
+
+# --------------------------------------------------------------------------- T7
+def _t7_child():
+    """子进程：发布 step 100 → 在途提交 step 101（拷贝被拖慢）→ 未发布时硬退出。"""
+    model, opt, ck = make_pp_stage("t7", quant=os.environ.get("T7_QUANT") == "1",
+                                   max_async=2, groups=4)
+    cdir = os.path.join(args.ckdir, "t7")
+    fwd_bwd(model, opt, 70)
+    opt.step()
+    torch.cuda.synchronize()
+    ppu.save_stage_checkpoint(ck, None, ck.param_layout, model, opt, cdir, rank=0,
+                              step=100, sync=True)
+    torch.save(snapshot_state(model, opt), os.path.join(cdir, "truth_step100.pt"))
+    fwd_bwd(model, opt, 71)
+    opt.step()
+    torch.cuda.synchronize()
+    real_borrow = ck.writer.borrow_chunk
+
+    def stalled_borrow():
+        time.sleep(60)  # 慢盘背压：拷贝线程拿不到 pinned chunk，step 101 停在途中
+        return real_borrow()
+    ck.writer.borrow_chunk = stalled_borrow
+    ppu.save_stage_checkpoint(ck, None, ck.param_layout, model, opt, cdir, rank=0,
+                              step=101, sync=False)
+    time.sleep(1.0)  # 让异步 meta 任务跑完、step 101 仍在途
+    with open(os.path.join(cdir, "child_state.json"), "w") as f:
+        json.dump({"slots_in_flight": sorted(ck._checkpoint_slots)}, f)
+    os._exit(0)      # 模拟进程崩溃：不 drain、不发布
+
+
+@run("T7")
+def t7():
+    import subprocess
+    sys.path.insert(0, args.pipelayer)
+    from pipelayer.distributed import start_distributed_multistream_resume
+    out = []
+    for quant in ("0", "1"):
+        cdir = os.path.join(args.ckdir, "t7")
+        if os.path.isdir(cdir):
+            import shutil
+            shutil.rmtree(cdir)
+        env = dict(os.environ, T7_QUANT=quant)
+        r = subprocess.run([sys.executable, "-W", "ignore", os.path.abspath(__file__),
+                            "--repo", args.repo, "--ckdir", args.ckdir, "--only", "T7child",
+                            "--pipelayer", args.pipelayer], env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"child failed rc={r.returncode}: {r.stderr[-1500:]}"
+        child = json.load(open(os.path.join(cdir, "child_state.json")))
+        assert child["slots_in_flight"], "step 101 was not in flight at exit (test did not hit the window)"
+        sdir = os.path.join(cdir, "stage_0")
+        ts = json.load(open(os.path.join(sdir, "training_state.json")))
+        assert ts.get("completed_steps") == 100, f"training_state.json claims {ts} (written before publish)"
+        chk = os.path.join(sdir, "stage_0.chk")
+        rec = msc.read_published_checkpoint(chk, 2)
+        assert rec["status"] == "published" and rec["slot"] == ts["slot"], f"record {rec} vs {ts}"
+        assert rec["slot"] not in child["slots_in_flight"]
+
+        os.environ["PCCHECK_MS_QUANT"] = quant
+        torch.manual_seed(123)
+        model = TinyGPT().to(DEV)
+        with torch.no_grad():
+            for prm in model.parameters():
+                prm.zero_()
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        handle = start_distributed_multistream_resume(
+            model=model, optimizer=opt, checkpoint_dir=cdir, rank=0, device=DEV,
+            engine=None, install_forward_hooks=False, guard_optimizer_step=False,
+            lib_path=LIB)
+        handle.wait_all()
+        tstate = dict(handle.training_state)
+        truth = torch.load(os.path.join(cdir, "truth_step100.pt"))
+        bad = []
+        blk = msc.QUANT_BLOCK_DEFAULT
+        for name, prm in model.named_parameters():
+            p_t, ea_t, eas_t = truth[name]
+            if not torch.equal(prm.detach().float().cpu(), p_t):
+                bad.append(f"param:{name}")
+            st = opt.state[prm]
+            for key, t, sq in (("exp_avg", ea_t, False), ("exp_avg_sq", eas_t, True)):
+                exp = expected_moment(t.to(DEV), quant == "1", blk, sq)
+                if not torch.equal(st[key].detach().float().cpu().view(-1), exp.view(-1)):
+                    bad.append(f"{key}:{name}")
+        handle.cleanup()
+        assert tstate.get("completed_steps") == 100, f"resumed training_state {tstate}"
+        assert tstate.get("slot_source") == "published", tstate
+        assert not bad, f"quant={quant}: recovered state != published step 100: {bad[:6]}"
+        out.append(f"{'int8' if quant == '1' else 'fp32'}: in-flight slot{child['slots_in_flight']} "
+                   f"ignored, recovered published slot{rec['slot']} step100 exact")
+    return "; ".join(out)
+
+
+if "T7child" in ONLY:
+    _t7_child()
 
 
 print("\n==== SUMMARY ====")

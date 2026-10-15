@@ -1623,6 +1623,14 @@ public:
         if (record.magic == PUBLISHED_RECORD_MAGIC &&
             record.checksum == published_record_checksum(record.area,
                                                           record.counter) &&
+            record.area < 0) {
+            // New-format file that never published: registered slots may hold
+            // partial data, so there is no recoverable checkpoint.
+            return -1;
+        }
+        if (record.magic == PUBLISHED_RECORD_MAGIC &&
+            record.checksum == published_record_checksum(record.area,
+                                                          record.counter) &&
             record.area >= 0 && record.area <= metadata_max_async) {
             struct checkpoint *slot = (struct checkpoint *)(
                 PR_ADDR + OFFSET_SIZE * (record.area + 3));

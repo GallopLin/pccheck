@@ -292,6 +292,17 @@ def create_stage_checkpoint(
     if ms_ckpt.quant_moments:
         ms_ckpt.attach_moment_sources(model, optimizer)
 
+    # 阶段训练状态（completed_steps 等）：save_stage_checkpoint 在提交前设置，finalize
+    # 时捕获进 extra blob，并且只在该 slot 发布之后才写 training_state.json。
+    # 旧实现在提交时就写入新 slot/step，而恢复端按它选版本 → 发布前崩溃会加载
+    # 在途 slot（撕裂状态 + 步数虚报）。
+    ms_ckpt._pending_optimizer = optimizer
+    ms_ckpt._pp_stage_state = {}
+    ms_ckpt.set_publish_payload_provider(lambda: dict(ms_ckpt._pp_stage_state))
+    ms_ckpt.add_publish_callback(
+        lambda slot, payload: _write_stage_training_state_published(
+            checkpoint_dir, rank, slot, payload))
+
     return ms_ckpt, gpu_buffers, param_layout
 
 
@@ -352,6 +363,9 @@ def save_stage_checkpoint(
     t0 = time.perf_counter()
 
     # 零拷贝：gpu_ar 就是模型的存储，无需 pack_stage_states
+    lr_now = optimizer.param_groups[0].get("lr", 0) if optimizer is not None else 0
+    ms_ckpt._pp_stage_state = {"completed_steps": int(step), "rank": int(rank),
+                               "lr": float(lr_now)}
     submit_t0 = time.perf_counter()
     parall_iter, metric = ms_ckpt.save_full_checkpoint(sync=sync)
     checkpoint_submit_ms = (time.perf_counter() - submit_t0) * 1000.0
@@ -365,16 +379,13 @@ def save_stage_checkpoint(
         name_map = {n: p for n, p in model.named_parameters()}
         steps_snap = _snapshot_optimizer_steps(model, optimizer)
         pg_snap = ms_ckpt._serialize_optimizer_param_groups(optimizer, name_map)
-        lr_snap = optimizer.param_groups[0].get("lr", 0)
 
         def _meta_task():
             ms_ckpt.export_metadata(optimizer=None,
                                     optimizer_steps_override=steps_snap,
                                     param_groups_override=pg_snap)
             _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
-            _write_stage_training_state(checkpoint_dir, rank, step,
-                                        optimizer=None, slot=parall_iter,
-                                        lr=lr_snap)
+            # training_state.json 由发布回调写（仅在 slot 发布之后）
 
         global _meta_last_future
         _meta_last_future = _get_meta_executor().submit(_meta_task)
@@ -385,10 +396,8 @@ def save_stage_checkpoint(
         _write_multistream_info(ms_ckpt, checkpoint_dir, rank)
         metadata_ms = (time.perf_counter() - metadata_t0) * 1000.0
 
-        state_t0 = time.perf_counter()
-        _write_stage_training_state(checkpoint_dir, rank, step, optimizer,
-                                    slot=parall_iter)
-        stage_state_ms = (time.perf_counter() - state_t0) * 1000.0
+        # training_state.json 由发布回调写（仅在 slot 发布之后）
+        stage_state_ms = 0.0
     if sync:
         drain_metadata_writes()
 
@@ -443,9 +452,41 @@ def _write_stage_training_state(
     }
     if slot is not None:
         state["slot"] = int(slot)
-    path = os.path.join(stage_dir, "training_state.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(os.path.join(stage_dir, "training_state.json"), state)
+
+
+def _atomic_write_json(path, obj):
+    """tmp + fsync + rename：崩溃后只会看到旧文件或完整新文件。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _write_stage_training_state_published(checkpoint_dir, rank, slot, payload):
+    """发布回调：slot 已持久化并发布后，写出与之对应的阶段训练状态（提示用途；
+    恢复端以文件头已发布记录 + extra blob 为准）。"""
+    payload = dict(payload or {})
+    state = {
+        "completed_steps": payload.get("completed_steps"),
+        "rank": payload.get("rank", rank),
+        "lr": payload.get("lr"),
+        "slot": int(slot),
+        "published": True,
+    }
+    stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
+    os.makedirs(stage_dir, exist_ok=True)
+    _atomic_write_json(os.path.join(stage_dir, "training_state.json"), state)
 
 
 def save_global_training_state(
@@ -462,9 +503,10 @@ def save_global_training_state(
     }
     if extra:
         state.update(extra)
-    path = os.path.join(checkpoint_dir, "global_state.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    # 注意：在提交时写入，只是"最近一次提交"的提示，不代表各阶段都已发布；
+    # 全局可恢复的步数必须取各阶段已发布版本的步数并核对一致（见 pipelayer）。
+    state["semantics"] = "submitted-hint"
+    _atomic_write_json(os.path.join(checkpoint_dir, "global_state.json"), state)
 
 
 def load_global_training_state(checkpoint_dir: str) -> Dict:

@@ -895,6 +895,11 @@ class MultiStreamCheckpoint:
         # 错误闩统计：失败（未发布）的 checkpoint 数与最近一次错误
         self.failed_checkpoints = 0
         self.last_checkpoint_error = None
+        # 发布回调：cb(parall_iter, payload)，在该 slot 持久化并 CAS 发布之后调用；
+        # payload 来自 set_publish_payload_provider，在 finalize 时（主线程）捕获，
+        # 同时写进 extra blob，因此"blob 里的状态"与"发布后写出的状态"一致。
+        self._publish_callbacks = []
+        self._publish_payload_fn = None
         
         # IO统计回调
         self.io_callback = None
@@ -1270,6 +1275,15 @@ class MultiStreamCheckpoint:
         print(f"✓ Multistream metadata exported to {output_path}")
         return output_path
 
+    def add_publish_callback(self, cb):
+        """注册发布回调 cb(parall_iter, payload)：仅在该 slot 已持久化并发布后调用。"""
+        self._publish_callbacks.append(cb)
+
+    def set_publish_payload_provider(self, fn):
+        """fn() -> dict：每次 finalize 时在主线程捕获，写入 extra blob 的
+        "publish_payload" 字段，并在发布后传给发布回调。"""
+        self._publish_payload_fn = fn
+
     def _update_latest_parall_iter(self, parall_iter: int) -> None:
         """
         更新 metadata 文件中的 latest_parall_iter 字段。
@@ -1326,7 +1340,7 @@ class MultiStreamCheckpoint:
         if provider is not None:
             self._extra_state_providers["provider"] = provider
 
-    def _capture_extra_state(self, parall_iter):
+    def _capture_extra_state(self, parall_iter, payload=None):
         """在主训练线程捕获非分层状态并序列化为 blob 字节；失败/超容量返回 None。
 
         必须在 step_with_callback 返回后、训练线程继续前进前调用——异步 finalize
@@ -1338,6 +1352,7 @@ class MultiStreamCheckpoint:
             state = {
                 "parall_iter": int(parall_iter),
                 "seq": int(self._profile_checkpoint_seq),
+                "checkpoint_id": int(self._profile_parall_to_checkpoint_id.get(parall_iter, -1)),
                 "wall_time": time.time(),
                 "rng": {
                     "torch_cpu": torch.get_rng_state(),
@@ -1356,6 +1371,8 @@ class MultiStreamCheckpoint:
             fn = self._extra_state_providers.get("provider")
             if fn is not None:
                 state["user"] = fn()
+            if payload is not None:
+                state["publish_payload"] = payload
             # 真实 optimizer step（metadata 的 optimizer_steps 存在"用槽号回填"的
             # 历史 kludge，不可靠；恢复端优先使用 blob 中的该值）
             opt = getattr(self, "_pending_optimizer", None)
@@ -2285,7 +2302,8 @@ class MultiStreamCheckpoint:
               f"(failed so far: {self.failed_checkpoints}): {exc!r}")
         self._release_slot(parall_iter)
 
-    def _complete_slot(self, parall_iter, futures, extra_blob, start_time, checkpoint_id, wait):
+    def _complete_slot(self, parall_iter, futures, extra_blob, start_time, checkpoint_id, wait,
+                       payload=None):
         """等待 → 写 extra → durability barrier + CAS 发布 → 释放 slot。
         失败时走 _abort_slot 并返回 (False, exc)。"""
         exc = self._wait_slot_futures(futures)
@@ -2334,8 +2352,13 @@ class MultiStreamCheckpoint:
             else:
                 print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
 
-            # ✅ 更新 metadata 中的 latest_parall_iter
+            # ✅ 更新 metadata 中的 latest_parall_iter（仅提示；权威是文件头已发布记录）
             self._update_latest_parall_iter(parall_iter)
+            for cb in list(self._publish_callbacks):
+                try:
+                    cb(parall_iter, payload)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[WARN] publish callback failed for slot {parall_iter}: {e!r}")
             if not wait and self.io_callback is not None:
                 self.io_callback(total_time, throughput)
         except Exception as e:  # noqa: BLE001
@@ -2358,7 +2381,13 @@ class MultiStreamCheckpoint:
         """
         # P1：非分层状态必须在此刻（主训练线程、优化器更新刚完成）捕获；
         # 序列化后的字节交给后台在 sync_all_streams 之前写入 extra 流。
-        extra_blob = self._capture_extra_state(parall_iter)
+        payload = None
+        if self._publish_payload_fn is not None:
+            try:
+                payload = self._publish_payload_fn()
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] publish payload provider failed: {e!r}")
+        extra_blob = self._capture_extra_state(parall_iter, payload)
 
         # ✅ 修复：使用传入的parall_iter，从槽位记录中获取信息
         with self._slot_lock:
@@ -2373,7 +2402,8 @@ class MultiStreamCheckpoint:
         if wait:
             print(f"\n  Waiting for all layer groups to complete (parall_iter: {parall_iter})...")
             ok, result = self._complete_slot(parall_iter, futures, extra_blob,
-                                             start_time, checkpoint_id, wait=True)
+                                             start_time, checkpoint_id, wait=True,
+                                             payload=payload)
             if not ok:
                 raise RuntimeError(
                     f"checkpoint slot {parall_iter} failed and was not published") from result
@@ -2383,7 +2413,8 @@ class MultiStreamCheckpoint:
         def async_finalize():
             try:
                 self._complete_slot(parall_iter, futures, extra_blob,
-                                    start_time, checkpoint_id, wait=False)
+                                    start_time, checkpoint_id, wait=False,
+                                    payload=payload)
             except Exception as e:  # noqa: BLE001 — 后台线程不能静默丢 slot
                 print(f"✗ Background checkpoint {parall_iter} failed: {e}")
                 import traceback
@@ -2445,6 +2476,54 @@ class MultiStreamCheckpoint:
     def __del__(self):
         """析构时自动关闭线程池"""
         self.shutdown()
+
+
+# ================== 已发布版本记录（恢复端选版本的唯一权威） ==================
+# C++ 在 CAS 发布时于文件头偏移 64 字节处持久化 {magic, area, counter, checksum}
+# （persist_published_record，msync 后才把旧 slot 还给空闲队列），slot 的注册记录
+# {area, counter} 位于 (slot+3)*OFFSET_SIZE。metadata JSON / training_state.json
+# 里的槽号只是提示：它们在发布之外的时刻写入，崩溃时可能指向在途或已被复用的 slot。
+_PUBLISHED_RECORD_MAGIC = 0x43534E4150534C54
+_PUBLISHED_RECORD_OFFSET = 64
+_HEADER_OFFSET_BYTES = 4096 * 4   # OFFSET_SIZE 个 int
+
+
+def _published_record_checksum(area, counter):
+    m = (1 << 64) - 1
+    return (_PUBLISHED_RECORD_MAGIC ^ (area & m) ^ ((counter * 0x9E3779B185EBCA87) & m)) & m
+
+
+def read_published_checkpoint(filename, max_async):
+    """读文件头的已发布记录。
+
+    Returns:
+        {"status": "published", "slot": s, "counter": c}  有已发布版本
+        {"status": "none"}                                 新格式文件但从未发布过
+        {"status": "legacy"}                               旧格式文件（无该记录）
+    Raises:
+        ValueError: 记录校验和不符或与 slot 注册记录不一致（文件头损坏）。
+    """
+    import struct
+    need = (int(max_async) + 4) * _HEADER_OFFSET_BYTES
+    with open(filename, "rb") as f:
+        hdr = f.read(need)
+    if len(hdr) < need:
+        raise ValueError(f"{filename}: header truncated ({len(hdr)} < {need} bytes)")
+    magic, area, counter, cs = struct.unpack_from("<QqqQ", hdr, _PUBLISHED_RECORD_OFFSET)
+    if magic != _PUBLISHED_RECORD_MAGIC:
+        return {"status": "legacy"}
+    if cs != _published_record_checksum(area, counter):
+        raise ValueError(f"{filename}: published record checksum mismatch")
+    if area < 0:
+        return {"status": "none"}
+    if area > int(max_async):
+        raise ValueError(f"{filename}: published slot {area} out of range (max_async={max_async})")
+    s_area, s_counter = struct.unpack_from("<qq", hdr, (area + 3) * _HEADER_OFFSET_BYTES)
+    if s_area != area or s_counter != counter:
+        raise ValueError(
+            f"{filename}: published record (slot {area}, counter {counter}) does not match "
+            f"slot registration ({s_area}, {s_counter})")
+    return {"status": "published", "slot": int(area), "counter": int(counter)}
 
 
 def _resolve_master_weight(param, optimizer, master_accessor=None):
