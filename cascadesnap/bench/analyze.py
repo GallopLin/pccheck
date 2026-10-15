@@ -125,17 +125,21 @@ def main():
     runs = [per_run(a.root, r) for r in rows if r.get("rc") == 0]
     failed = [r for r in rows if r.get("rc") != 0]
 
-    # cf=0 reference per model: median execution time and median step time
+    # cf=0 参照：按（模型, trainer）分别取。CascadeSnap 与 DCP 共用 trainer_multistream；
+    # PCcheck/CheckFreq/GPM 各自的 trainer 初始化与存储布局不同，开销要减去各自的 cf=0。
+    def trainer_of(method):
+        return "multistream" if method in ("cascade", "dcp") else method
+
     base = {}
     for r in runs:
         if r["cf"] == 0:
-            b = base.setdefault(r["model"], {"exec": [], "step": []})
+            b = base.setdefault(f"{r['model']}|{trainer_of(r['method'])}", {"exec": [], "step": []})
             b["exec"].append(r["execution_s"])
             b["step"].extend(r["step_gpu_ms"])
     base = {m: {"exec": median(v["exec"]), "step_ms": median(v["step"])} for m, v in base.items()}
 
     for r in runs:
-        b = base.get(r["model"])
+        b = base.get(f"{r['model']}|{trainer_of(r['method'])}")
         if b and r["cf"] > 0 and r["timed_ckpts"]:
             r["overhead_s"] = r["execution_s"] - b["exec"]
             r["overhead_per_ckpt_s"] = r["overhead_s"] / r["timed_ckpts"]
