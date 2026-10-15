@@ -1,0 +1,148 @@
+From 7d16b7005bf6b224fe9cfe85cb1cc85765ab6f11 Mon Sep 17 00:00:00 2001
+From: GallopLin <1317864235@qq.com>
+Date: Thu, 15 Oct 2026 00:15:51 -0700
+Subject: [PATCH 3/3] fix(P0): GradScaler semantics on checkpoint steps;
+ race-free WAR guard in PP runners
+
+- trainer_multistream: the grouped update bypasses GradScaler.step, so the
+  checkpoint branch now reproduces it (Trainer scaler or the one inside the
+  Accelerate wrapper): unscale_ only if not yet unscaled, skip the update and
+  the checkpoint on inf/nan (retry next step), always update().  Previously
+  fp16 overflow wrote inf/nan into params/moments.
+- run_clm_pp_multistream{,_bloom}: the optimizer.step guard calls
+  MultiStreamCheckpoint.wait_copies_before_update (wait copy futures, then
+  wait_event); falls back to the old loop for older pccheck builds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../run_clm_pp_multistream.py                 | 25 ++++++++-----
+ .../run_clm_pp_multistream_bloom.py           | 25 ++++++++-----
+ src/transformers/trainer_multistream.py       | 37 ++++++++++++++-----
+ 3 files changed, 58 insertions(+), 29 deletions(-)
+
+diff --git a/examples/pytorch/language-modeling/run_clm_pp_multistream.py b/examples/pytorch/language-modeling/run_clm_pp_multistream.py
+index df4bcf792e..3124b0e511 100644
+--- a/examples/pytorch/language-modeling/run_clm_pp_multistream.py
++++ b/examples/pytorch/language-modeling/run_clm_pp_multistream.py
+@@ -823,16 +823,21 @@ def main():
+ 
+         def _copy_guarded_optimizer_step(*step_args, **step_kwargs):
+             ck = ms_fallback["ckpt"]
+-            with ck._layer_copy_events_lock:
+-                pending = [
+-                    ev
+-                    for events in ck._layer_copy_events.values()
+-                    for ev in (events or [])
+-                    if ev is not None
+-                ]
+-            cur = torch.cuda.current_stream()
+-            for ev in pending:
+-                cur.wait_event(ev)
++            if hasattr(ck, "wait_copies_before_update"):
++                # 先 CPU 等拷贝任务结束（保证完成事件已 record），再 GPU 侧 wait_event；
++                # 只做 wait_event 时，背压下尚未 record 的事件等待是空操作。
++                ck.wait_copies_before_update(stream=torch.cuda.current_stream())
++            else:
++                with ck._layer_copy_events_lock:
++                    pending = [
++                        ev
++                        for events in ck._layer_copy_events.values()
++                        for ev in (events or [])
++                        if ev is not None
++                    ]
++                cur = torch.cuda.current_stream()
++                for ev in pending:
++                    cur.wait_event(ev)
+             return _orig_optimizer_step(*step_args, **step_kwargs)
+ 
+         model_engine.optimizer.step = _copy_guarded_optimizer_step
+diff --git a/examples/pytorch/language-modeling/run_clm_pp_multistream_bloom.py b/examples/pytorch/language-modeling/run_clm_pp_multistream_bloom.py
+index 467ecbd6c7..d5fa29cab6 100644
+--- a/examples/pytorch/language-modeling/run_clm_pp_multistream_bloom.py
++++ b/examples/pytorch/language-modeling/run_clm_pp_multistream_bloom.py
+@@ -463,16 +463,21 @@ def main():
+ 
+         def _copy_guarded_optimizer_step(*step_args, **step_kwargs):
+             ck = ms_fallback["ckpt"]
+-            with ck._layer_copy_events_lock:
+-                pending = [
+-                    ev
+-                    for events in ck._layer_copy_events.values()
+-                    for ev in (events or [])
+-                    if ev is not None
+-                ]
+-            cur = torch.cuda.current_stream()
+-            for ev in pending:
+-                cur.wait_event(ev)
++            if hasattr(ck, "wait_copies_before_update"):
++                # 先 CPU 等拷贝任务结束（保证完成事件已 record），再 GPU 侧 wait_event；
++                # 只做 wait_event 时，背压下尚未 record 的事件等待是空操作。
++                ck.wait_copies_before_update(stream=torch.cuda.current_stream())
++            else:
++                with ck._layer_copy_events_lock:
++                    pending = [
++                        ev
++                        for events in ck._layer_copy_events.values()
++                        for ev in (events or [])
++                        if ev is not None
++                    ]
++                cur = torch.cuda.current_stream()
++                for ev in pending:
++                    cur.wait_event(ev)
+             return _orig_optimizer_step(*step_args, **step_kwargs)
+ 
+         model_engine.optimizer.step = _copy_guarded_optimizer_step
+diff --git a/src/transformers/trainer_multistream.py b/src/transformers/trainer_multistream.py
+index 5251e3bdb8..ef7826c38e 100644
+--- a/src/transformers/trainer_multistream.py
++++ b/src/transformers/trainer_multistream.py
+@@ -2414,18 +2414,37 @@ class MultistreamTrainer:
+                                 )
+                             
+                             # 使用 step_with_callback 替代 optimizer.step()
++                            # 分批更新直接调底层优化器，绕过了 GradScaler.step（Trainer 自己的
++                            # scaler，或 fp16 下 Accelerate 包装层里的 scaler），所以要在这里
++                            # 复刻它的语义：梯度裁剪可能已 unscale_（重复调用会抛错）；出现
++                            # inf/nan 时跳过本次更新，本步也不做 checkpoint（steps_since_checkp
++                            # 不清零，下一步重试）；最后必须 update()，否则下一步再 unscale_ 报错。
++                            optimizer_was_run = True
+                             if self.do_grad_scaling:
+-                                ms_optimizer.begin_checkpoint()
+-                                # 对于混合精度训练
+-                                self.scaler.unscale_(self.optimizer)
+-                                ms_optimizer.step_with_callback()
+-                                self.scaler.update()
+-                                ms_optimizer.finalize_checkpoint(wait=False)
++                                scaler, scaled_opt = self.scaler, self.optimizer
++                            else:
++                                scaler = getattr(self.accelerator, "scaler", None)
++                                scaled_opt = getattr(self.optimizer, "optimizer", self.optimizer)
++                            if scaler is not None and scaler.is_enabled():
++                                opt_state = scaler._per_optimizer_states[id(scaled_opt)]
++                                if opt_state["stage"].name != "UNSCALED":
++                                    scaler.unscale_(scaled_opt)
++                                found_inf = sum(
++                                    v.item() for v in opt_state["found_inf_per_device"].values()
++                                )
++                                if found_inf:
++                                    optimizer_was_run = False
++                                else:
++                                    ms_optimizer.begin_checkpoint()
++                                    ms_optimizer.step_with_callback()
++                                    ms_optimizer.finalize_checkpoint(wait=False)
++                                scaler.update()
+                             else:
+                                 ms_optimizer.step_with_checkpoint(wait=False)
+-                            
+-                            steps_since_checkp = 0
+-                            checkpoints += 1
++
++                            if optimizer_was_run:
++                                steps_since_checkp = 0
++                                checkpoints += 1
+                         else:
+                             # cfreq == 0: 不做 checkpoint，执行普通 step
+                             optimizer_was_run = True
+-- 
+2.34.1
+
