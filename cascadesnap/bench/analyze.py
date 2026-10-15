@@ -134,25 +134,30 @@ def main():
     for r in runs:
         if r["cf"] == 0:
             b = base.setdefault(f"{r['model']}|{trainer_of(r['method'])}", {"exec": [], "step": []})
-            b["exec"].append(r["execution_s"])
+            b["exec"].append(r["execution_s"] / max(1, r["timed_steps"]))  # 每步秒数
             b["step"].extend(r["step_gpu_ms"])
-    base = {m: {"exec": median(v["exec"]), "step_ms": median(v["step"])} for m, v in base.items()}
+    base = {m: {"exec_per_step_s": median(v["exec"]), "step_ms": median(v["step"])}
+            for m, v in base.items()}
 
     for r in runs:
         b = base.get(f"{r['model']}|{trainer_of(r['method'])}")
         if b and r["cf"] > 0 and r["timed_ckpts"]:
-            r["overhead_s"] = r["execution_s"] - b["exec"]
+            # 不同 cf 用不同步数：基准 = cf=0 的每步耗时 × 本次计时步数
+            r["overhead_s"] = r["execution_s"] - b["exec_per_step_s"] * r["timed_steps"]
+            r["slowdown_vs_cf0"] = r["execution_s"] / (b["exec_per_step_s"] * r["timed_steps"])
             r["overhead_per_ckpt_s"] = r["overhead_s"] / r["timed_ckpts"]
             r["stall_per_ckpt_ms"] = sum(g - b["step_ms"] for g in r["step_gpu_ms"]) / r["timed_ckpts"]
         else:
             r["overhead_s"] = r["overhead_per_ckpt_s"] = r["stall_per_ckpt_ms"] = None
+            r["slowdown_vs_cf0"] = None
 
     tags = {}
     for r in runs:
         tags.setdefault(r["tag"], []).append(r)
     summary = {"base": base, "failed": [{k: f[k] for k in ("tag", "rep", "rc")} for f in failed],
                "tags": {}}
-    metrics = ["execution_s", "throughput", "train_window_s", "tail_s", "throughput_window", "overhead_per_ckpt_s", "stall_per_ckpt_ms", "L_ms",
+    metrics = ["execution_s", "throughput", "train_window_s", "tail_s", "throughput_window",
+               "slowdown_vs_cf0", "overhead_per_ckpt_s", "stall_per_ckpt_ms", "L_ms",
                "peak_gpu_mib", "peak_dirty_kb", "peak_mem_avail_min_kb", "guard_wait_ms_sum",
                "pre_wait_ms_sum", "stage_ms_median"]
     for tag, rs in sorted(tags.items()):
