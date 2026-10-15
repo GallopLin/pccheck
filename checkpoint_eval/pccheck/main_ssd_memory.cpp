@@ -1575,6 +1575,20 @@ public:
         }
     }
     
+    // Error latch: give up an unpublished slot.  Outstanding native AIO for
+    // this slot must finish first (it still owns pinned chunks and targets the
+    // slot's file range); then the slot goes back to free_space without the
+    // durability barrier or the CAS publish, so the previously published
+    // checkpoint stays the recovery target.
+    void abort_checkpoint(int parall_iter) {
+        wait_async_direct(parall_iter);
+        retire_reclaim_segments(parall_iter);
+        BARRIER(PR_ADDR);
+        free_space.enqueue(parall_iter, parall_iter);
+        fprintf(stderr, "[WARN] Aborted slot %d: not published, returned to free_space\n",
+                parall_iter);
+    }
+
     // ✅ DRAM槽位管理：借用和归还pinned内存（用于多流pccheck内存复用）
     // 从DRAMAlloc借用一块pinned buffer
     float* borrow_chunk() {
@@ -2065,6 +2079,14 @@ extern "C" // 生成的.so文件暴露出来的接口
             return;
         }
         t->sync_all_streams(parall_iter);
+    }
+
+    void abort_checkpoint(NVM_write *t, int parall_iter) {
+        if (t == nullptr) {
+            fprintf(stderr, "[ERROR] abort_checkpoint called with null handle\n");
+            return;
+        }
+        t->abort_checkpoint(parall_iter);
     }
     
     // ✅ DRAM槽位管理接口（用于多流pccheck内存复用）

@@ -357,6 +357,45 @@ def _set_storage_streams(model, optimizer_list, gpu_buffers):
     return model_size
 
 
+def _materialize_optimizer_state(optimizer):
+    """用零梯度执行一次 step 以创建优化器状态张量，且不改变参数与 moments。
+
+    - 直接调底层 torch 优化器（剥掉 Accelerate 包装）：包装层的 step 会走
+      GradScaler.step，而此时还没有 scaler.scale(loss)，fp16 下直接断言失败；
+    - 临时把 lr / weight_decay 置 0：零梯度并不能保证参数不变（AdamW 的解耦
+      weight decay 会把参数乘以 1-lr*wd；Adam 的耦合 weight decay 会把 wd*p
+      写进 moments）；
+    - 结束后把 step 计数清零。"""
+    base = optimizer
+    while hasattr(base, "optimizer") and hasattr(base.optimizer, "param_groups") and base.optimizer is not base:
+        base = base.optimizer
+    for group in base.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+    saved = []
+    for group in base.param_groups:
+        saved.append({k: group[k] for k in ("lr", "weight_decay") if k in group})
+        for k in ("lr", "weight_decay"):
+            if k not in group:
+                continue
+            if isinstance(group[k], torch.Tensor):
+                group[k] = torch.zeros_like(group[k])
+            else:
+                group[k] = 0.0
+    try:
+        base.step()
+    finally:
+        for group, vals in zip(base.param_groups, saved):
+            group.update(vals)
+    for state in base.state.values():
+        if 'step' in state:
+            if isinstance(state['step'], torch.Tensor):
+                state['step'].zero_()
+            else:
+                state['step'] = 0
+
+
 def initialize(model, optimizer_list, do_opt_step=True, separate_streams=False):
     if isinstance(model, dict):
         model_state = model
@@ -372,14 +411,7 @@ def initialize(model, optimizer_list, do_opt_step=True, separate_streams=False):
                     if p.grad is None:
                         p.grad = torch.zeros_like(p)
         if do_opt_step:
-            optimizer.step()
-            # 重置 step 计数器，避免影响后续训练的学习率调度
-            for state in optimizer.state.values():
-                if 'step' in state:
-                    if isinstance(state['step'], torch.Tensor):
-                        state['step'].zero_()
-                    else:
-                        state['step'] = 0
+            _materialize_optimizer_state(optimizer)
 
     param_size = _model_param_numel(model)
     actual_grad_size = _grad_numel(optimizer_list)
@@ -399,20 +431,7 @@ def initialize(model, optimizer_list, do_opt_step=True, separate_streams=False):
         already_initialized = any(len(opt.state) > 0 for opt in optimizer_list)
         if not already_initialized:
             for optimizer in optimizer_list:
-                for group in optimizer.param_groups:
-                    for p in group['params']:
-                        if p.grad is None:
-                            p.grad = torch.zeros_like(p)
-            for optimizer in optimizer_list:
-                optimizer.step()
-            # 重置 step 计数器，避免影响后续训练
-            for optimizer in optimizer_list:
-                for state in optimizer.state.values():
-                    if 'step' in state:
-                        if isinstance(state['step'], torch.Tensor):
-                            state['step'].zero_()
-                        else:
-                            state['step'] = 0
+                _materialize_optimizer_state(optimizer)
 
         actual_grad_size = _grad_numel(optimizer_list)
         reserved_grad_size = _reserved_grad_numel(model, optimizer_list)

@@ -264,6 +264,7 @@ def create_stage_checkpoint(
         print(f"[multistream] PCCHECK_MS_QUANT=1: int8 moment quantization "
               f"enabled (block={quant_block})")
     param_layout = build_param_layout(model, optimizer, **quant_kwargs)
+    _verify_zero_copy_layout(model, optimizer, gpu_buffers, param_layout, quant_moments)
     stage_dir = os.path.join(checkpoint_dir, f"stage_{rank}")
     os.makedirs(stage_dir, exist_ok=True)
     chk_file = os.path.join(stage_dir, f"stage_{rank}.chk")
@@ -288,7 +289,42 @@ def create_stage_checkpoint(
         **quant_kwargs,
     )
 
+    if ms_ckpt.quant_moments:
+        ms_ckpt.attach_moment_sources(model, optimizer)
+
     return ms_ckpt, gpu_buffers, param_layout
+
+
+def _verify_zero_copy_layout(model, optimizer, gpu_buffers, param_layout, quant_moments):
+    """零拷贝前提校验：param_layout 的偏移必须正是 set_storage 放置张量的位置。
+
+    build_param_layout 按 named_parameters()（仅 requires_grad）编号；set_storage
+    的 param 区按全部 named_parameters()、moment 区按 optimizer.param_groups 顺序
+    放置。存在冻结参数或 param_groups 顺序与模型不一致时两者错位，零拷贝 D2H
+    会静默保存错误字节，所以这里直接报错。"""
+    base_opt = getattr(optimizer, "optimizer", None)
+    if base_opt is None or not hasattr(base_opt, "state"):
+        base_opt = optimizer
+    params = [p for _, p in model.named_parameters() if p.requires_grad]
+    if len(params) != len(param_layout):
+        raise RuntimeError(f"zero-copy layout: {len(params)} params vs {len(param_layout)} layout entries")
+    checks = [("param", "param_offset", lambda p: p)]
+    if not quant_moments:
+        checks += [("exp_avg", "exp_avg_offset", lambda p: base_opt.state.get(p, {}).get("exp_avg")),
+                   ("exp_avg_sq", "exp_avg_sq_offset", lambda p: base_opt.state.get(p, {}).get("exp_avg_sq"))]
+    for key, off_key, get in checks:
+        buf = gpu_buffers.get(key)
+        if buf is None:
+            continue
+        base = buf.data_ptr()
+        for p, li in zip(params, param_layout):
+            t = get(p)
+            expect = base + int(li[off_key]) * buf.element_size()
+            if t is None or t.data_ptr() != expect:
+                raise RuntimeError(
+                    f"zero-copy layout mismatch for {key} of '{li.get('name')}': tensor is not at "
+                    f"buffer offset {li[off_key]} (frozen params or optimizer param order differing "
+                    f"from model.named_parameters() are not supported by the zero-copy PP path)")
 
 
 def save_stage_checkpoint(

@@ -101,6 +101,19 @@ def _memory_pressure_snapshot() -> Dict[str, int]:
         pass
     return snapshot
 
+def _unwrap_optimizer(optimizer):
+    """剥掉 Accelerate/HF 等包装层，返回真正持有 param_groups/state 的 torch 优化器。"""
+    seen = set()
+    opt = optimizer
+    while id(opt) not in seen:
+        seen.add(id(opt))
+        inner = getattr(opt, 'optimizer', None)
+        if inner is None or inner is opt or not hasattr(inner, 'param_groups'):
+            break
+        opt = inner
+    return opt
+
+
 class MultiStreamOptimizer:
     def __init__(
         self,
@@ -160,6 +173,17 @@ class MultiStreamOptimizer:
         # 检测优化器类型
         self.optimizer_type = type(optimizer).__name__
 
+        # 真正持有 param_groups/state 的底层优化器（剥掉 Accelerate 等包装层），
+        # 以及 param → 所属 group 下标（每批更新按各自 group 的超参执行）。
+        self._base_optimizer = _unwrap_optimizer(optimizer)
+        self._param_group_idx = {}
+        for gi, g in enumerate(self._base_optimizer.param_groups):
+            for p in g['params']:
+                self._param_group_idx[p] = gi
+        self._group_snapshot = None
+        self._group_updates = {}
+        self._group_tail_steps = None
+
         # ✅ 跨检查点同步：更新前的等待回调
         # 签名: pre_update_callback(group_idx_list) —— 上一检查点中覆盖本批
         # tensor 的组集合（张量内切分后一个 tensor 可能横跨多个组）。
@@ -171,239 +195,137 @@ class MultiStreamOptimizer:
             with torch.enable_grad():
                 loss = closure()
 
-        # 按更新批次遍历：批 = (上一尾 tensor, 本尾 tensor]，批完成 → 触发以尾为界的组
-        for batch_idx, ((lids, gidxs), params) in enumerate(zip(self.batches, self.batch_params)):
-            t_pre = time.perf_counter()
-            # ✅ 更新前回调：等待上一检查点所有覆盖本批 tensor 的组的拷贝完成
-            if self.pre_update_callback is not None:
-                wait_groups = sorted({g for lid in lids for g in self.cover.get(lid, ())})
-                self.pre_update_callback(wait_groups)
-            t_update = time.perf_counter()
+        # 本次 step 的 group 级快照：所有批次的临时 group 都从同一份快照构造，
+        # 结束后统一回写 step() 改动过的 group 级标量（见 _step_param_group）。
+        base = self._base_optimizer
+        self._group_snapshot = [dict(g) for g in base.param_groups]
+        self._group_updates = {}
+        self._group_tail_steps = self._capture_tail_steps()
+        try:
+            # 按更新批次遍历：批 = (上一尾 tensor, 本尾 tensor]，批完成 → 触发以尾为界的组
+            for batch_idx, ((lids, gidxs), params) in enumerate(zip(self.batches, self.batch_params)):
+                t_pre = time.perf_counter()
+                # ✅ 更新前回调：等待上一检查点所有覆盖本批 tensor 的组的拷贝完成
+                if self.pre_update_callback is not None:
+                    wait_groups = sorted({g for lid in lids for g in self.cover.get(lid, ())})
+                    self.pre_update_callback(wait_groups)
+                t_update = time.perf_counter()
 
-            # 对这批参数执行真实的优化器更新（tensor 原子）
-            self._step_param_group(params)
-            t_cb = time.perf_counter()
+                # 对这批参数执行真实的优化器更新（tensor 原子）
+                self._step_param_group(params)
+                t_cb = time.perf_counter()
 
-            # 批内尾 tensor 更新完成 → 其字节全部稳定的组触发保存
-            if self.callback is not None:
-                for g in gidxs:
-                    self.callback(g, self.pieces[g])
-            if _ms_profile_enabled():
-                _ms_profile_event(
-                    "group_update",
-                    group_idx=int(gidxs[0]) if gidxs else -1,
-                    num_groups_triggered=int(len(gidxs)),
-                    num_layers=int(len(lids)),
-                    pre_wait_ms=(t_update - t_pre) * 1000.0,
-                    update_enqueue_ms=(t_cb - t_update) * 1000.0,
-                    save_trigger_ms=(time.perf_counter() - t_cb) * 1000.0,
-                )
+                # 批内尾 tensor 更新完成 → 其字节全部稳定的组触发保存
+                if self.callback is not None:
+                    for g in gidxs:
+                        self.callback(g, self.pieces[g])
+                if _ms_profile_enabled():
+                    _ms_profile_event(
+                        "group_update",
+                        group_idx=int(gidxs[0]) if gidxs else -1,
+                        num_groups_triggered=int(len(gidxs)),
+                        num_layers=int(len(lids)),
+                        pre_wait_ms=(t_update - t_pre) * 1000.0,
+                        update_enqueue_ms=(t_cb - t_update) * 1000.0,
+                        save_trigger_ms=(time.perf_counter() - t_cb) * 1000.0,
+                    )
+        finally:
+            for gi, updates in self._group_updates.items():
+                base.param_groups[gi].update(updates)
+            self._group_snapshot = None
+            self._group_updates = {}
+            self._group_tail_steps = None
 
         return loss
-    
+
+    def _uses_group_tail_step(self):
+        base = self._base_optimizer
+        return (type(base).__name__ == 'FusedAdam'
+                and type(base).__module__.startswith('deepspeed'))
+
+    @staticmethod
+    def _tail_param(params):
+        tail = None
+        for p in params:
+            if p.grad is not None:
+                tail = p
+        return tail
+
+    def _capture_tail_steps(self):
+        """DeepSpeed FusedAdam：{group 下标: 整组当前步数（取自组内尾参数）}；其余优化器 None。"""
+        if not self._uses_group_tail_step():
+            return None
+        base = self._base_optimizer
+        steps = {}
+        for gi, g in enumerate(base.param_groups):
+            tail = self._tail_param(g['params'])
+            if tail is not None and 'step' in base.state.get(tail, {}):
+                steps[gi] = base.state[tail]['step']
+        return steps
+
     def _step_param_group(self, params: List[torch.nn.Parameter]):
-        """
-        对指定的参数组执行优化器更新（使用真实的优化器逻辑）
-        
-        Args:
-            params: 要更新的参数列表
-        """
-        # 在no_grad上下文中执行更新（避免就地操作错误）
-        with torch.no_grad():
-            # 根据优化器类型调用对应的更新逻辑
-            if self.optimizer_type == 'Adam':
-                self._step_adam(params)
-            elif self.optimizer_type == 'AdamW':
-                self._step_adamw(params)
-            elif self.optimizer_type == 'SGD':
-                self._step_sgd(params)
-            else:
-                # 对于其他优化器，使用通用方法（逐参数调用优化器的内部逻辑）
-                self._step_generic(params)
-    
-    def _step_adam(self, params: List[torch.nn.Parameter]):
-        """执行Adam更新（使用PyTorch的functional API）"""
-        from torch.optim._functional import adam
-        
-        # 获取优化器的超参数（从第一个param_group）
-        group = self.optimizer.param_groups[0]
-        
-        # 收集批量参数
-        params_list = []
-        grads_list = []
-        exp_avgs_list = []
-        exp_avg_sqs_list = []
-        max_exp_avg_sqs_list = []
-        state_steps_list = []
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            # 获取或初始化state
-            state = self.optimizer.state[param]
-            
-            # 初始化state（如果需要）
-            if len(state) == 0:
-                state['step'] = torch.tensor(0.)
-                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+        """对一批参数执行真实优化器的 step()（只更新这批参数）。
 
-            # 注意：不要在此手动递增 step——torch 的 functional adam 内部会对
-            # state_steps 自增一次（_foreach_add_(state_steps, 1)），此前的手动
-            # +1 导致 checkpoint 迭代 step 双计、bias-correction 跑偏
-            # （roundtrip 测试对账 step 时发现）。
-            params_list.append(param)
-            grads_list.append(param.grad)
-            exp_avgs_list.append(state['exp_avg'])
-            exp_avg_sqs_list.append(state['exp_avg_sq'])
-            state_steps_list.append(state['step'])
-
-        if not params_list:
+        做法：临时把底层优化器的 param_groups 换成"每个原 group 只保留本批
+        参数"的子 group，调用其原生 step()，再换回。因此：
+          - 每个参数使用它所属 group 的超参（lr/weight_decay/betas/...），
+            不再只读 param_groups[0]（旧实现会给 no-decay 组错误地加 weight decay）；
+          - 用户选择的 fused/foreach/amsgrad/capturable 等实现原样生效，
+            fused AdamW 在这里就是"按组分段调用同一个 fused kernel"；
+          - 逐元素优化器（Adam/AdamW/SGD 等）的结果与整体 step() 逐位一致；
+          - 适用于任何按 self.param_groups 遍历的优化器（含 DeepSpeed FusedAdam）。
+        step() 对 group 级标量的修改（如 DeepSpeed FusedAdam 的 group['step']）
+        记入 _group_updates，在整个 step_with_callback 结束后一次性回写，
+        避免同一 group 被拆成多批时重复自增。
+        不支持按 param 交叉耦合的优化器（如需要全局范数的 LAMB/LARS 变体）。
+        """
+        base = self._base_optimizer
+        by_group = {}
+        for p in params:
+            gi = self._param_group_idx.get(p)
+            if gi is None:
+                continue  # 不受优化器管理（冻结参数）
+            by_group.setdefault(gi, []).append(p)
+        if not by_group:
             return
 
-        # 调用PyTorch的functional API进行批量更新 (foreach=True)
-        adam(
-            params_list,
-            grads_list,
-            exp_avgs_list,
-            exp_avg_sqs_list,
-            max_exp_avg_sqs_list,
-            state_steps_list,
-            amsgrad=group.get('amsgrad', False),
-            beta1=group['betas'][0],
-            beta2=group['betas'][1],
-            lr=group['lr'],
-            weight_decay=group.get('weight_decay', 0),
-            eps=group['eps'],
-            maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
-            capturable=False,
-            differentiable=False,
-            fused=False,
-            grad_scale=None,
-            found_inf=None
-        )
-    
-    def _step_adamw(self, params: List[torch.nn.Parameter]):
-        """执行AdamW更新"""
-        from torch.optim._functional import adamw
-        
-        group = self.optimizer.param_groups[0]
-        
-        # 收集批量参数
-        params_list = []
-        grads_list = []
-        exp_avgs_list = []
-        exp_avg_sqs_list = []
-        max_exp_avg_sqs_list = []
-        state_steps_list = []
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            state = self.optimizer.state[param]
-            
-            if len(state) == 0:
-                state['step'] = torch.tensor(0.)
-                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+        snapshot = self._group_snapshot
+        if snapshot is None:
+            snapshot = [dict(g) for g in base.param_groups]
+        order = sorted(by_group)
+        temp_groups = [{**snapshot[gi], 'params': by_group[gi]} for gi in order]
 
-            # 同 _step_adam：functional adamw 内部自增 state_steps，勿手动 +1
-            params_list.append(param)
-            grads_list.append(param.grad)
-            exp_avgs_list.append(state['exp_avg'])
-            exp_avg_sqs_list.append(state['exp_avg_sq'])
-            state_steps_list.append(state['step'])
+        tail_steps = self._group_tail_steps
+        if tail_steps is None:
+            tail_steps = self._capture_tail_steps()
+        if tail_steps:
+            # DeepSpeed FusedAdam 只用组内最后一个（有 grad 的）参数的 state['step']
+            # 作为整组步数并只给它自增：子组的尾参数不同，先把它对齐到本次 step
+            # 开始时整组的步数，否则分批更新的 bias-correction 会用错步数。
+            for gi, tg in zip(order, temp_groups):
+                if gi in tail_steps:
+                    tail = self._tail_param(tg['params'])
+                    if tail is not None:
+                        base.state[tail]['step'] = tail_steps[gi]
 
-        if not params_list:
-            return
+        original_param_groups = base.param_groups
+        base.param_groups = temp_groups
+        try:
+            with torch.no_grad():
+                base.step()
+        finally:
+            base.param_groups = original_param_groups
 
-        adamw(
-            params_list,
-            grads_list,
-            exp_avgs_list,
-            exp_avg_sqs_list,
-            max_exp_avg_sqs_list,
-            state_steps_list,
-            amsgrad=group.get('amsgrad', False),
-            beta1=group['betas'][0],
-            beta2=group['betas'][1],
-            lr=group['lr'],
-            weight_decay=group.get('weight_decay', 0),
-            eps=group['eps'],
-            maximize=group.get('maximize', False),
-            foreach=True,  # 启用foreach优化
-            capturable=False,
-            differentiable=False,
-            fused=False,
-            grad_scale=None,
-            found_inf=None
-        )
-    
-    def _step_sgd(self, params: List[torch.nn.Parameter]):
-        """执行SGD更新"""
-        from torch.optim._functional import sgd
-        
-        group = self.optimizer.param_groups[0]
-        
-        for param in params:
-            if param.grad is None:
-                continue
-            
-            state = self.optimizer.state[param]
-            
-            # SGD的momentum buffer
-            momentum_buffer_list = []
-            if 'momentum_buffer' in state:
-                momentum_buffer_list.append(state['momentum_buffer'])
-            else:
-                momentum_buffer_list.append(None)
-            
-            sgd(
-                [param],
-                [param.grad],
-                momentum_buffer_list,
-                weight_decay=group.get('weight_decay', 0),
-                momentum=group.get('momentum', 0),
-                lr=group['lr'],
-                dampening=group.get('dampening', 0),
-                nesterov=group.get('nesterov', False),
-                maximize=group.get('maximize', False),
-                foreach=False,
-                fused=False,
-                grad_scale=None,
-                found_inf=None
-            )
-            
-            # 更新momentum buffer
-            if momentum_buffer_list[0] is not None:
-                state['momentum_buffer'] = momentum_buffer_list[0]
-    
-    def _step_generic(self, params: List[torch.nn.Parameter]):
-        """
-        通用的参数更新方法（用于不支持的优化器类型）
-        通过临时修改param_groups来实现
-        """
-        # 保存原始的param_groups
-        original_param_groups = self.optimizer.param_groups
-        
-        # 创建临时param_group（只包含当前要更新的参数）
-        temp_param_group = {
-            'params': params,
-            **{k: v for k, v in original_param_groups[0].items() if k != 'params'}
-        }
-        
-        # 临时替换param_groups
-        self.optimizer.param_groups = [temp_param_group]
-        
-        # 执行标准的step
-        self.optimizer.step()
-        
-        # 恢复原始的param_groups
-        self.optimizer.param_groups = original_param_groups
-    
+        for gi, tg in zip(order, temp_groups):
+            changed = {k: v for k, v in tg.items()
+                       if k != 'params' and (k not in snapshot[gi] or snapshot[gi][k] is not v)}
+            if changed:
+                self._group_updates.setdefault(gi, {}).update(changed)
+        if self._group_snapshot is None:
+            for gi, updates in self._group_updates.items():
+                original_param_groups[gi].update(updates)
+            self._group_updates = {}
+
     def step(self, closure=None):
         """
         标准的step方法（一次性更新所有参数，不触发回调）
@@ -456,6 +378,7 @@ class MultiStreamWriter:
             rank: 当前进程rank
             world_size: 总进程数
         """
+        self._lib_path = lib_path
         self.lib = cdll.LoadLibrary(lib_path)
         self.num_streams = num_streams
         self.max_async = max_async
@@ -537,6 +460,9 @@ class MultiStreamWriter:
         
         self.lib.sync_all_streams.restype = None
         self.lib.sync_all_streams.argtypes = [c_void_p, c_int]
+        if hasattr(self.lib, 'abort_checkpoint'):
+            self.lib.abort_checkpoint.restype = None
+            self.lib.abort_checkpoint.argtypes = [c_void_p, c_int]
         
         # ✅ 注册borrow_cpu_slot和return_cpu_slot的返回类型
         self.lib.borrow_cpu_slot.restype = c_void_p
@@ -693,6 +619,14 @@ class MultiStreamWriter:
     def sync_all_streams(self, parall_iter):
         """同步所有流到磁盘并更新检查点元数据（沿用原pccheck的槽位管理）"""
         self.lib.sync_all_streams(self.writer_obj, parall_iter)
+
+    def abort_checkpoint(self, parall_iter):
+        """放弃一个未发布的 slot：等在途 AIO 收尾后归还空闲队列，不做 CAS 发布。"""
+        if not hasattr(self.lib, 'abort_checkpoint'):
+            print(f"[WARN] {self._lib_path} lacks abort_checkpoint (rebuild libtest_ssd.so); "
+                  f"slot {parall_iter} is leaked and will not be reused")
+            return
+        self.lib.abort_checkpoint(self.writer_obj, parall_iter)
     
     def register(self):
         """注册新的检查点槽位（沿用原pccheck的槽位管理）"""
@@ -816,6 +750,29 @@ class MultiStreamCheckpoint:
         # 统一转为 self.gpu_buffers: List[Tensor]，长度 = num_streams。
         self.gpu_buffers = self._make_gpu_buffers(gpu_ar)
         self.gpu_ar = gpu_ar if not isinstance(gpu_ar, dict) else None
+
+        # 量化 + 零拷贝（PP 路径）：gpu_ar 的 moment 缓冲就是训练用的 fp32 存储，
+        # 尺寸是 N 而 packed 流只有 ~N/4。不能按 packed 偏移直接读它（旧实现
+        # 因此把未量化的 fp32 片段当 packed 字节写盘）。改为独立 packed 暂存，
+        # save_full_checkpoint 在 D2H 前从 optimizer.state 量化填充
+        # （需 attach_moment_sources）；create_optimizer 路径在 save_callback 中填充。
+        self._quant_staging = False
+        self._moment_params = None
+        self._moment_optimizer = None
+        self._pack_stream = None
+        if self.quant_moments:
+            for sid in (2, 3):
+                b = self.gpu_buffers[sid]
+                if b is None or b.numel() != self.stream_sizes[sid]:
+                    self._quant_staging = True
+            if self._quant_staging:
+                dev = next(b.device for b in self.gpu_buffers if b is not None)
+                for sid in (2, 3):
+                    self.gpu_buffers[sid] = torch.zeros(
+                        self.stream_sizes[sid], dtype=torch.float32, device=dev)
+                print(f"  Quant staging: packed moment buffers "
+                      f"{(self.stream_sizes[2] + self.stream_sizes[3]) * 4 / 1e9:.2f} GB "
+                      f"(filled from optimizer state before each D2H)")
         print(f"\nMultiStreamCheckpoint Configuration:")
         print(f"  Total size: {total_size:,} floats ({total_size*4/1e9:.2f} GB)")
         print(f"  Num streams: {num_streams}")
@@ -935,6 +892,9 @@ class MultiStreamCheckpoint:
         
         # 统计信息
         self.save_times = []
+        # 错误闩统计：失败（未发布）的 checkpoint 数与最近一次错误
+        self.failed_checkpoints = 0
+        self.last_checkpoint_error = None
         
         # IO统计回调
         self.io_callback = None
@@ -955,6 +915,7 @@ class MultiStreamCheckpoint:
         # _layer_copy_events[group_idx] = [event0, event1, event2, event3] (每个流一个事件)
         # 新检查点更新该层组之前，需要等待所有 4 个事件
         self._layer_copy_events = {}  # {group_idx: [events]}
+        self._layer_copy_futures = {}  # {group_idx: [copy futures]}，事件 record 前的 CPU 侧屏障
         self._layer_copy_events_lock = Lock()
         # metadata JSON 的读-改-写串行化（export_metadata / _update_latest_parall_iter
         # 分别在主线程与后台 finalize 线程并发访问同一文件）
@@ -1488,12 +1449,55 @@ class MultiStreamCheckpoint:
             )
             futures.append(future)
         
-        # ✅ 立即更新层组的拷贝完成事件列表（事件会在各自的流中被记录）
+        # ✅ 立即更新层组的拷贝完成事件列表（事件会在各自的流中被记录）。
+        # 事件由拷贝线程稍后 record；在 record 之前对它 wait_event 是空操作，
+        # 所以同时登记 futures，等待方须先等 future（见 wait_group_copies）。
         with self._layer_copy_events_lock:
             self._layer_copy_events[group_idx] = copy_done_events
+            self._layer_copy_futures[group_idx] = futures
         
         # 不阻塞，直接返回futures，让调用者决定何时等待
         return futures
+
+    def snapshot_group_copies(self, group_idxs=None):
+        """取 {group_idx: (events, futures)} 快照（默认全部组）。"""
+        with self._layer_copy_events_lock:
+            keys = self._layer_copy_events.keys() if group_idxs is None else group_idxs
+            return {g: (self._layer_copy_events.get(g) or [],
+                        self._layer_copy_futures.get(g) or [])
+                    for g in keys if g in self._layer_copy_events}
+
+    @staticmethod
+    def wait_group_copies(snapshot, group_idxs=None, stream=None):
+        """写后读屏障：在 stream 上等待指定组（默认快照内全部组）的 D2H 完成。
+
+        先在 CPU 上等拷贝任务的 future（任务结束 ⇒ 全部 D2H 已入队且完成事件
+        已 record），再让 stream 在 GPU 侧 wait_event。只做后者时，若拷贝线程
+        还没执行到 record（慢盘背压下卡在 borrow_chunk），wait_event 是空操作，
+        随后的 update 会覆写尚未拷贝的源数据。拷贝失败的组无需等待：
+        该 checkpoint 会被错误闩放弃。"""
+        stream = stream or torch.cuda.current_stream()
+        keys = snapshot.keys() if group_idxs is None else group_idxs
+        for g in keys:
+            entry = snapshot.get(g)
+            if entry is None:
+                continue
+            events, futures = entry
+            failed = False
+            for f in futures:
+                try:
+                    f.result()
+                except Exception:  # noqa: BLE001
+                    failed = True
+            if failed:
+                continue
+            for ev in events:
+                if ev is not None:
+                    stream.wait_event(ev)
+
+    def wait_copies_before_update(self, group_idxs=None, stream=None):
+        """便捷入口：对当前已登记的组拷贝做写后读屏障（PP fallback 的 optimizer.step 前使用）。"""
+        self.wait_group_copies(self.snapshot_group_copies(group_idxs), stream=stream)
 
     def _register_layer_group_futures(self, parall_iter, futures):
         """将异步future登记到指定槽位，供finalize阶段统一等待"""
@@ -1644,9 +1648,12 @@ class MultiStreamCheckpoint:
                                 native_async=bool(native_async),
                             )
                     except Exception as e:
+                        # 必须向上传播：finalize 据此放弃本 slot（不发布、回收），
+                        # 否则写失败的 checkpoint 仍会走 durability barrier + CAS 被发布。
                         print(f"[ERROR] SSD write failed for stream {stream_id}: {e}")
                         import traceback
                         traceback.print_exc()
+                        raise
                     finally:
                         for base_ptr, _, _, _, _, _ in chunks:
                             if base_ptr not in native_owned:
@@ -1802,6 +1809,7 @@ class MultiStreamCheckpoint:
             print(f"[ERROR] Stream {stream_id} ({param_type}) failed: {e}")
             import traceback
             traceback.print_exc()
+            raise
     
     def set_io_callback(self, callback):
         """
@@ -1889,39 +1897,48 @@ class MultiStreamCheckpoint:
                 
                 # ✅ 跨检查点同步：只在检查点开始时获取需要等待的事件快照
                 # 这样可以避免在同一个检查点内等待自己刚刚创建的事件
-                with self._checkpoint._layer_copy_events_lock:
-                    # 复制当前的事件映射（这些是上一个检查点的事件）
-                    prev_checkpoint_events = dict(self._checkpoint._layer_copy_events)
-                
+                # （这些是上一个检查点的事件及其拷贝任务 future）
+                prev_checkpoint_copies = self._checkpoint.snapshot_group_copies()
+
                 def pre_update_callback(group_idxs):
                     # 一致性要求：更新本批 tensor 前，必须等待上一检查点所有
                     # 覆盖这些 tensor 的组（张量内切分后可能不止一个）的全部
                     # 4 个状态流 D2H 完成，否则本次 update/D2D 会在上一检查点
                     # 仍从 gpu_buffers 读取时覆写源数据，导致动量流撕裂。
-                    # wait_event 为 GPU 流侧等待，不阻塞 CPU。
-                    for group_idx in group_idxs:
-                        prev_events = prev_checkpoint_events.get(group_idx)
-                        if prev_events is not None:
-                            for event in prev_events:
-                                torch.cuda.current_stream().wait_event(event)
+                    # 先 CPU 等拷贝任务（保证事件已 record），再 GPU 流侧 wait_event。
+                    MultiStreamCheckpoint.wait_group_copies(
+                        prev_checkpoint_copies, group_idxs)
                 
                 # 优化：使用专门的拷贝流，避免阻塞默认流 (问题6)
                 copy_stream = torch.cuda.Stream()
                 
-                # 检测零拷贝：第一个参数是否位于 gpu_buffers[0]（param buffer）内
-                is_zero_copy_enabled = False
-                if (hasattr(self._checkpoint, '_pending_param_list')
-                        and self._checkpoint._pending_param_list
-                        and hasattr(self._checkpoint, 'gpu_buffers')
-                        and self._checkpoint.gpu_buffers
-                        and self._checkpoint.gpu_buffers[0] is not None):
-                    first_param = self._checkpoint._pending_param_list[0]
-                    buf = self._checkpoint.gpu_buffers[0]
-                    buf_ptr = buf.data_ptr()
-                    buf_end = buf_ptr + buf.numel() * buf.element_size()
-                    if buf_ptr <= first_param.data_ptr() < buf_end:
-                        is_zero_copy_enabled = True
-                        print("  \u2713 Zero-copy mode detected: skipping D2D copies in save_callback")
+                # 按流检测零拷贝：param 流看首个参数是否位于 gpu_buffers[0] 内；
+                # moment 流看其 exp_avg/exp_avg_sq 是否位于 gpu_buffers[2]/[3] 内
+                # （量化时 [2]/[3] 是 packed 暂存，永远需要量化填充）。
+                # 旧实现只看首个参数就跳过全部拷贝 → 量化 + 零拷贝时 moment 从不 pack。
+                def _inside(t, buf):
+                    if t is None or buf is None:
+                        return False
+                    lo = buf.data_ptr()
+                    hi = lo + buf.numel() * buf.element_size()
+                    return lo <= t.data_ptr() < hi
+
+                ck = self._checkpoint
+                plist = getattr(ck, '_pending_param_list', None) or []
+                bufs0 = getattr(ck, 'gpu_buffers', None) or [None] * 4
+                params_alias = bool(plist) and _inside(plist[0], bufs0[0])
+                moments_alias = False
+                if plist and not getattr(ck, 'quant_moments', False):
+                    st0 = self._real_optimizer.state.get(plist[0], {})
+                    moments_alias = (_inside(st0.get('exp_avg'), bufs0[2])
+                                     and _inside(st0.get('exp_avg_sq'), bufs0[3]))
+                copy_params = not params_alias
+                copy_moments = not moments_alias
+                is_zero_copy_enabled = not copy_params and not copy_moments
+                if is_zero_copy_enabled:
+                    print("  \u2713 Zero-copy mode detected: skipping D2D copies in save_callback")
+                elif not copy_params:
+                    print("  \u2713 Zero-copy params; moments staged/quantized in save_callback")
 
                 # 创建回调函数，捕获parall_iter
                 def save_callback(group_idx, group_pieces):
@@ -1961,9 +1978,10 @@ class MultiStreamCheckpoint:
                                     if seg <= 0:
                                         continue
 
-                                    off = li["param_offset"] + ps
-                                    bufs[0][off : off + seg].copy_(
-                                        param.detach().view(-1)[ps:pe].float(), non_blocking=True)
+                                    if copy_params:
+                                        off = li["param_offset"] + ps
+                                        bufs[0][off : off + seg].copy_(
+                                            param.detach().view(-1)[ps:pe].float(), non_blocking=True)
 
                                     state = self._real_optimizer.state.get(param, {})
 
@@ -1971,7 +1989,7 @@ class MultiStreamCheckpoint:
                                     # 纯 fp32 训练时 master_size=0，此流不写任何字节。
                                     # 梯度不再保存：resume 后可由反向重算，非必须。）
                                     msz = li.get("master_size", 0)
-                                    if msz > 0 and bufs[1] is not None:
+                                    if copy_params and msz > 0 and bufs[1] is not None:
                                         moff = li.get("master_offset", 0) + ps
                                         m = _resolve_master_weight(
                                             param, self._real_optimizer,
@@ -1982,6 +2000,8 @@ class MultiStreamCheckpoint:
                                             bufs[1][moff : moff + seg].copy_(
                                                 m.detach().view(-1)[ps:pe].float(), non_blocking=True)
 
+                                    if not copy_moments:
+                                        continue
                                     q_moments = getattr(self._checkpoint, 'quant_moments', False)
                                     q_block = getattr(self._checkpoint, 'quant_block', QUANT_BLOCK_DEFAULT)
 
@@ -2091,6 +2111,37 @@ class MultiStreamCheckpoint:
         
         return OptimizerWrapper(self, optimizer)
     
+    def attach_moment_sources(self, model, optimizer):
+        """登记 moment 的来源（量化暂存模式下 save_full_checkpoint 需要）。
+
+        参数顺序必须与 build_param_layout 一致：model.named_parameters() 中
+        requires_grad 的参数。"""
+        params = [p for _, p in model.named_parameters() if p.requires_grad]
+        if len(params) != len(self.param_layout):
+            raise ValueError(
+                f"attach_moment_sources: {len(params)} trainable params vs "
+                f"{len(self.param_layout)} layout entries")
+        self._moment_params = params
+        self._moment_optimizer = _unwrap_optimizer(optimizer)
+
+    def _pack_moments_for_pieces(self, group_pieces):
+        """把一组 piece 的 exp_avg / exp_avg_sq 量化写入 packed 暂存（在当前流上排队）。"""
+        bufs = self.gpu_buffers
+        q_block = self.quant_block
+        for (layer_id, ps, pe) in group_pieces:
+            if layer_id >= len(self.param_layout) or pe <= ps:
+                continue
+            li = self.param_layout[layer_id]
+            state = self._moment_optimizer.state.get(self._moment_params[layer_id], {})
+            for sid, key, sqrt in ((2, 'exp_avg', False), (3, 'exp_avg_sq', True)):
+                t = state.get(key)
+                if t is None:
+                    off, sz = piece_extent(li, key, ps, pe)
+                    bufs[sid][off: off + sz].zero_()
+                else:
+                    _pack_moment_int8(bufs[sid], li[f"{key}_offset"], t.detach().view(-1),
+                                      q_block, sqrt=sqrt, ps=ps, pe=pe)
+
     def save_full_checkpoint(self, sync: bool = True, stream: Optional[torch.cuda.Stream] = None) -> Tuple[int, float]:
         """
         手动触发一次完整的多流保存，常用于快照模式或分布式rank独立保存。
@@ -2102,12 +2153,29 @@ class MultiStreamCheckpoint:
         Returns:
             Tuple[int, float]: (parall_iter, finalize_result)
         """
+        if self._quant_staging and self._moment_params is None:
+            raise RuntimeError(
+                "quantized moments with live fp32 moment buffers need "
+                "attach_moment_sources(model, optimizer) before save_full_checkpoint")
+        # packed 暂存被各 checkpoint 复用：重写某组前，上一 checkpoint 对该组的 D2H 必须完成
+        prev_copies = self.snapshot_group_copies() if self._quant_staging else None
         parall_iter = self.begin_checkpoint()
         working_stream = stream or torch.cuda.current_stream()
-        
+        if self._quant_staging and self._pack_stream is None:
+            self._pack_stream = torch.cuda.Stream()
+
         for group_idx, layer_ids in enumerate(self.layer_groups):
             sync_event = torch.cuda.Event()
             sync_event.record(working_stream)
+            if self._quant_staging:
+                pack_stream = self._pack_stream
+                with torch.cuda.stream(pack_stream):
+                    pack_stream.wait_event(sync_event)
+                    self.wait_group_copies(prev_copies, [group_idx], stream=pack_stream)
+                    with torch.no_grad():
+                        self._pack_moments_for_pieces(_norm_pieces(layer_ids, self.param_layout))
+                    sync_event = torch.cuda.Event()
+                    sync_event.record(pack_stream)
             futures = self.save_layer_group(layer_ids, parall_iter, group_idx, sync_event)
             self._register_layer_group_futures(parall_iter, futures)
         
@@ -2173,6 +2241,109 @@ class MultiStreamCheckpoint:
         
         return parall_iter
     
+    def _wait_slot_futures(self, futures):
+        """等待某 slot 的全部拷贝/写盘任务，返回首个异常（无则 None）。
+
+        不在首个异常处停下：其余任务可能仍在写这个 slot 或持有 pinned chunk，
+        必须全部结束后才能回收 slot。列表在拷贝任务执行期间会被追加 SSD
+        future（_submit_ssd），所以按下标遍历直到末尾。"""
+        first_exc = None
+        i = 0
+        while i < len(futures):
+            try:
+                futures[i].result()
+            except Exception as e:  # noqa: BLE001 — 任何失败都必须阻止发布
+                if first_exc is None:
+                    first_exc = e
+            i += 1
+        return first_exc
+
+    def _release_slot(self, parall_iter):
+        with self._slot_lock:
+            # 可能在 drain() 与后台 async finalize 并发时被其他线程抢先删除
+            self._checkpoint_slots.pop(parall_iter, None)
+            self._profile_parall_to_checkpoint_id.pop(parall_iter, None)
+        self._slot_available_event.set()  # 通知等待的 begin_checkpoint
+
+    def _abort_slot(self, parall_iter, checkpoint_id, start_time, exc):
+        """错误闩：任一 chunk/流失败 → 本 slot 不做 durability barrier、不 CAS 发布，
+        等在途 AIO 收尾后把 slot 还给空闲队列。上一份已发布的 checkpoint 保持有效。"""
+        self.failed_checkpoints += 1
+        self.last_checkpoint_error = exc
+        try:
+            self.writer.abort_checkpoint(parall_iter)
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] abort_checkpoint({parall_iter}) failed: {e}")
+        _ms_profile_event(
+            "checkpoint_abort",
+            checkpoint_id=int(checkpoint_id),
+            parall_iter=int(parall_iter),
+            total_ms=(time.time() - start_time) * 1000.0,
+            error=repr(exc),
+        )
+        print(f"✗ Checkpoint {parall_iter} ABORTED, not published "
+              f"(failed so far: {self.failed_checkpoints}): {exc!r}")
+        self._release_slot(parall_iter)
+
+    def _complete_slot(self, parall_iter, futures, extra_blob, start_time, checkpoint_id, wait):
+        """等待 → 写 extra → durability barrier + CAS 发布 → 释放 slot。
+        失败时走 _abort_slot 并返回 (False, exc)。"""
+        exc = self._wait_slot_futures(futures)
+        if exc is None:
+            try:
+                # extra 流写入必须先于 sync_all_streams（durability barrier + CAS 是提交点）
+                self._write_extra_state(parall_iter, extra_blob)
+            except Exception as e:  # noqa: BLE001
+                exc = e
+        if exc is not None:
+            self._abort_slot(parall_iter, checkpoint_id, start_time, exc)
+            return False, exc
+
+        sync_start = time.time()
+        self.writer.sync_all_streams(parall_iter)
+        sync_time = time.time() - sync_start
+        # 已发布：之后的统计/metadata/回调失败只记录，绝不能再回收（abort）这个 slot。
+        total_time = time.time() - start_time
+        try:
+            io_stats = self.writer.io_stats()
+            throughput = (self.total_size * 4 / 1e9) / total_time
+
+            self.save_times.append(total_time)
+            _ms_profile_event(
+                "checkpoint_finalize",
+                checkpoint_id=int(checkpoint_id),
+                parall_iter=int(parall_iter),
+                wait=bool(wait),
+                total_ms=float(total_time) * 1000.0,
+                sync_ms=float(sync_time) * 1000.0,
+                throughput_gbps=float(throughput),
+                inflight_ssd_tasks=int(self._inflight_ssd_tasks),
+                inflight_ssd_bytes=int(self._inflight_ssd_bytes),
+                free_chunks=int(self.num_chunks - self._borrowed_chunks),
+                **io_stats,
+                **_memory_pressure_snapshot(),
+            )
+            if wait:
+                print(f"\n{'='*60}")
+                print(f"✓ Checkpoint finalized (SYNC)!")
+                print(f"  Slot (parall_iter): {parall_iter}")
+                print(f"  Finalize time: {total_time:.2f}s")
+                print(f"  Sync time: {sync_time:.2f}s")
+                print(f"  Throughput: {throughput:.2f} GB/s")
+                print(f"{'='*60}\n")
+            else:
+                print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
+
+            # ✅ 更新 metadata 中的 latest_parall_iter
+            self._update_latest_parall_iter(parall_iter)
+            if not wait and self.io_callback is not None:
+                self.io_callback(total_time, throughput)
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] post-publish bookkeeping failed for slot {parall_iter}: {e!r}")
+        finally:
+            self._release_slot(parall_iter)
+        return True, total_time
+
     def finalize_checkpoint(self, parall_iter, wait=True):
         """
         完成检查点保存流程
@@ -2181,7 +2352,9 @@ class MultiStreamCheckpoint:
             parall_iter: 检查点槽位ID（由begin_checkpoint返回）
             wait: 是否等待所有异步保存完成（True=同步模式，False=异步模式）
         
-        在optimizer.step_with_callback()之后调用
+        在optimizer.step_with_callback()之后调用。任一拷贝/写盘任务失败时本 slot
+        不会被发布（错误闩）：wait=True 抛出 RuntimeError；wait=False 只记录到
+        failed_checkpoints / last_checkpoint_error，训练继续，上一份 checkpoint 仍有效。
         """
         # P1：非分层状态必须在此刻（主训练线程、优化器更新刚完成）捕获；
         # 序列化后的字节交给后台在 sync_all_streams 之前写入 extra 流。
@@ -2197,135 +2370,34 @@ class MultiStreamCheckpoint:
             start_time = slot_info['start_time']
             checkpoint_id = self._profile_parall_to_checkpoint_id.get(parall_iter, -1)
 
-        with self._inflight_ssd_lock:
-            inflight_ssd = int(self._inflight_ssd_tasks)
-            
         if wait:
-            # 同步模式：等待所有保存完成
-            # 等待所有异步保存任务完成
             print(f"\n  Waiting for all layer groups to complete (parall_iter: {parall_iter})...")
-            for future in futures:
-                future.result()
+            ok, result = self._complete_slot(parall_iter, futures, extra_blob,
+                                             start_time, checkpoint_id, wait=True)
+            if not ok:
+                raise RuntimeError(
+                    f"checkpoint slot {parall_iter} failed and was not published") from result
+            return result
 
-            # extra 流写入必须先于 sync_all_streams（merged msync + CAS 是提交点）
-            self._write_extra_state(parall_iter, extra_blob)
+        # 异步模式：立即返回，后台继续保存
+        def async_finalize():
+            try:
+                self._complete_slot(parall_iter, futures, extra_blob,
+                                    start_time, checkpoint_id, wait=False)
+            except Exception as e:  # noqa: BLE001 — 后台线程不能静默丢 slot
+                print(f"✗ Background checkpoint {parall_iter} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                self._abort_slot(parall_iter, checkpoint_id, start_time, e)
 
-            # 同步所有流到磁盘
-            print(f"\n  Syncing all streams to disk (parall_iter: {parall_iter})...")
-            sync_start = time.time()
-            self.writer.sync_all_streams(parall_iter)
-            sync_time = time.time() - sync_start
-            io_stats = self.writer.io_stats()
-            
-            total_time = time.time() - start_time
-            throughput = (self.total_size * 4 / 1e9) / total_time
-            
-            self.save_times.append(total_time)
-            _ms_profile_event(
-                "checkpoint_finalize",
-                checkpoint_id=int(checkpoint_id),
-                parall_iter=int(parall_iter),
-                wait=True,
-                total_ms=float(total_time) * 1000.0,
-                sync_ms=float(sync_time) * 1000.0,
-                throughput_gbps=float(throughput),
-                inflight_ssd_tasks=int(self._inflight_ssd_tasks),
-                inflight_ssd_bytes=int(self._inflight_ssd_bytes),
-                free_chunks=int(self.num_chunks - self._borrowed_chunks),
-                **io_stats,
-                **_memory_pressure_snapshot(),
-            )
-            
-            print(f"\n{'='*60}")
-            print(f"✓ Checkpoint finalized (SYNC)!")
-            print(f"  Slot (parall_iter): {parall_iter}")
-            print(f"  Finalize time: {total_time:.2f}s")
-            print(f"  Sync time: {sync_time:.2f}s")
-            print(f"  Throughput: {throughput:.2f} GB/s")
-            print(f"{'='*60}\n")
-            
-            # ✅ 更新 metadata 中的 latest_parall_iter
-            self._update_latest_parall_iter(parall_iter)
-            
-            # ✅ 修复：释放槽位
-            with self._slot_lock:
-                # 可能在 drain() 与后台 async finalize 并发时被其他线程抢先删除
-                self._checkpoint_slots.pop(parall_iter, None)
-                self._profile_parall_to_checkpoint_id.pop(parall_iter, None)
-            self._slot_available_event.set()  # 通知等待的 begin_checkpoint
-            
-            return total_time
-        else:
-            # 异步模式：立即返回，后台继续保存
-            def async_finalize():
-                try:
-                    # 等待所有异步保存任务完成（GPU→CPU拷贝）
-                    for future in futures:
-                        future.result()
+        # 提交到兼容线程池：finalize 与 copy path 共享 copy_thread_pool。
+        self.thread_pool.submit(async_finalize)
 
-                    # extra 流写入必须先于 sync_all_streams（提交点）；
-                    # blob 字节已在主线程捕获，此处仅 memcpy 到 mmap。
-                    self._write_extra_state(parall_iter, extra_blob)
+        # 立即返回（不阻塞）
+        submit_time = time.time() - start_time
+        print(f"✓ Checkpoint {parall_iter} submitted to background (Async submit time: {submit_time*1000:.2f}ms)")
 
-                    # 同步所有流到磁盘
-                    sync_streams_start = time.time()
-                    self.writer.sync_all_streams(parall_iter)
-                    
-                    sync_streams_time = time.time() - sync_streams_start
-                    io_stats = self.writer.io_stats()
-                    
-                    total_time = time.time() - start_time
-                    throughput = (self.total_size * 4 / 1e9) / total_time
-                    
-                    self.save_times.append(total_time)
-                    _ms_profile_event(
-                        "checkpoint_finalize",
-                        checkpoint_id=int(checkpoint_id),
-                        parall_iter=int(parall_iter),
-                        wait=False,
-                        total_ms=float(total_time) * 1000.0,
-                        sync_ms=float(sync_streams_time) * 1000.0,
-                        throughput_gbps=float(throughput),
-                        inflight_ssd_tasks=int(self._inflight_ssd_tasks),
-                        inflight_ssd_bytes=int(self._inflight_ssd_bytes),
-                        free_chunks=int(self.num_chunks - self._borrowed_chunks),
-                        **io_stats,
-                        **_memory_pressure_snapshot(),
-                    )
-                    
-                    print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
-                    
-                    # ✅ 更新 metadata 中的 latest_parall_iter
-                    self._update_latest_parall_iter(parall_iter)
-                    
-                    # 调用IO统计回调
-                    if self.io_callback is not None:
-                        self.io_callback(total_time, throughput)
-                    
-                    # ✅ 修复：释放槽位（sync_all_streams完成后）
-                    with self._slot_lock:
-                        if parall_iter in self._checkpoint_slots:
-                            del self._checkpoint_slots[parall_iter]
-                        self._profile_parall_to_checkpoint_id.pop(parall_iter, None)
-                    self._slot_available_event.set()  # 通知等待的 begin_checkpoint
-                except Exception as e:
-                    print(f"✗ Background checkpoint {parall_iter} failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # ✅ 修复：即使失败也要确保槽位被释放
-                    with self._slot_lock:
-                        self._checkpoint_slots.pop(parall_iter, None)
-                        self._profile_parall_to_checkpoint_id.pop(parall_iter, None)
-                    self._slot_available_event.set()  # 通知等待的 begin_checkpoint
-            
-            # 提交到兼容线程池：finalize 与 copy path 共享 copy_thread_pool。
-            self.thread_pool.submit(async_finalize)
-            
-            # 立即返回（不阻塞）
-            submit_time = time.time() - start_time
-            print(f"✓ Checkpoint {parall_iter} submitted to background (Async submit time: {submit_time*1000:.2f}ms)")
-            
-            return submit_time
+        return submit_time
 
     def drain(self):
         """等待所有尚未完成的异步 checkpoint 完成并落盘。
@@ -2452,7 +2524,14 @@ def piece_extent(layer_info, stream, ps, pe):
 
 def quantize_int8_blocks(x, block, sqrt_domain=False):
     """per-block 对称 int8 量化。返回 (int8[N], scale_fp32[nblocks])。
-    sqrt_domain=True 用于非负、动态范围大的 exp_avg_sq（在 sqrt 域量化，恢复端平方还原）。"""
+    sqrt_domain=True 用于非负、动态范围大的 exp_avg_sq（在 sqrt 域量化，恢复端平方还原）。
+
+    sqrt 域下溢防护：s=√v 小于半个量化步长时，普通舍入得到 0，恢复后 Adam
+    分母只剩 ε，而同一元素的 exp_avg 可能非零 → 更新量 ≈ m/ε 爆炸。
+    这里把 sqrt 域的码字下限钳到 1（还原值 = 一个量化步长 Δ），保证
+    s̃ ≥ max(s/2, Δ/2)，更新量被 Adam 自身界的常数倍约束
+    （见 THESIS_FUSED_AND_QUANT_THEORY_20261014.md 定理 1）。
+    下限只会让 v 变大（更新更保守），从不让它变小；恢复端无需改动。"""
     flat = x.detach().reshape(-1).float()
     n = flat.numel()
     y = flat.sqrt() if sqrt_domain else flat
@@ -2462,7 +2541,8 @@ def quantize_int8_blocks(x, block, sqrt_domain=False):
         y = torch.cat([y, y.new_zeros(pad)])
     yb = y.view(nb, block)
     scale = yb.abs().amax(dim=1, keepdim=True).clamp_min(1e-30) / 127.0
-    q = torch.clamp((yb / scale).round(), -127, 127).to(torch.int8).view(-1)[:n]
+    lo = 1 if sqrt_domain else -127
+    q = torch.clamp((yb / scale).round(), lo, 127).to(torch.int8).view(-1)[:n]
     return q.contiguous(), scale.view(-1).to(torch.float32).contiguous()
 
 
