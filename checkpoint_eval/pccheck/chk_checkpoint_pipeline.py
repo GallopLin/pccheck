@@ -334,10 +334,15 @@ class Checkpoint:
                 if stop.value == 1:
                     break
 
+            # 先读标志、释放锁，再 sleep。2026-07 的改动（a1c7fa5）把 sleep 放进了
+            # with lock 里：锁 99.9% 的时间被本进程持有，训练进程的
+            # gpu_copy_in_progress() 抢不到锁，出现几十秒到无限期的卡顿
+            # （本地"PCcheck 活性故障"的根因）。上游原版不 sleep（持锁空转）。
             with lock:
-                if start1.value == 0:
-                    time.sleep(0.001)
-                    continue
+                idle = start1.value == 0
+            if idle:
+                time.sleep(0.001)
+                continue
 
             # snapshot here
             stime = time.time()
