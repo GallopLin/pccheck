@@ -7,6 +7,7 @@
 
 import torch
 import numpy as np
+import ctypes
 from ctypes import *
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor
@@ -66,6 +67,39 @@ def _ms_profile_event(event: str, **fields) -> None:
     except Exception:
         # Profiling must never perturb checkpoint correctness.
         return
+
+
+def _memory_pressure_snapshot() -> Dict[str, int]:
+    """Best-effort cgroup/host writeback snapshot for checkpoint boundaries."""
+    snapshot = {}
+    try:
+        snapshot["cgroup_memory_current"] = int(
+            open("/sys/fs/cgroup/memory.current", encoding="ascii").read().strip()
+        )
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory.stat", encoding="ascii") as handle:
+            cgroup_stat = {
+                key: int(value)
+                for key, value in (line.split() for line in handle)
+            }
+        for key in ("file", "file_dirty", "file_writeback"):
+            if key in cgroup_stat:
+                snapshot[f"cgroup_{key}"] = cgroup_stat[key]
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            meminfo = {}
+            for line in handle:
+                key, value = line.split(":", 1)
+                meminfo[key] = int(value.strip().split()[0])
+        snapshot["host_dirty_kb"] = meminfo.get("Dirty", 0)
+        snapshot["host_writeback_kb"] = meminfo.get("Writeback", 0)
+    except Exception:
+        pass
+    return snapshot
 
 class MultiStreamOptimizer:
     def __init__(
@@ -425,6 +459,14 @@ class MultiStreamWriter:
         self.lib = cdll.LoadLibrary(lib_path)
         self.num_streams = num_streams
         self.max_async = max_async
+        self.stream_sizes = [int(size) for size in stream_sizes]
+        self.stream_offsets = []
+        cumulative_offset = 0
+        for size in self.stream_sizes:
+            self.stream_offsets.append(cumulative_offset)
+            cumulative_offset += size
+        self.direct_io_alignment = 4096
+        self._closed = False
 
         # CPU 亲和设置：优先避开 CPU0（主训练线程常驻），其余核轮询分配
         self._affinity_cpus = self._init_affinity_cpus()
@@ -475,6 +517,20 @@ class MultiStreamWriter:
         
         self.lib.write_stream_chunk.restype = None
         self.lib.write_stream_chunk.argtypes = [c_void_p, c_int, c_void_p, c_size_t, c_size_t, c_int, c_int]
+
+        native_async_requested = (
+            os.environ.get("PCCHECK_NATIVE_ASYNC_DIRECT", "1") != "0"
+        )
+        self.native_async_direct = (
+            hasattr(self.lib, 'write_stream_chunk_async') and
+            native_async_requested
+        )
+        if self.native_async_direct:
+            self.lib.write_stream_chunk_async.restype = c_bool
+            self.lib.write_stream_chunk_async.argtypes = [
+                c_void_p, c_int, c_void_p, c_void_p,
+                c_size_t, c_size_t, c_int,
+            ]
         
         self.lib.sync_stream.restype = None
         self.lib.sync_stream.argtypes = [c_void_p, c_int, c_int]
@@ -494,9 +550,21 @@ class MultiStreamWriter:
             self.lib.borrow_chunk.argtypes = [c_void_p]
             self.lib.return_chunk.restype = None
             self.lib.return_chunk.argtypes = [c_void_p, c_void_p]
+
+        if hasattr(self.lib, 'get_io_stat'):
+            self.lib.get_io_stat.restype = c_uint64
+            self.lib.get_io_stat.argtypes = [c_void_p, c_int]
+
+        if hasattr(self.lib, 'close_writer'):
+            self.lib.close_writer.restype = None
+            self.lib.close_writer.argtypes = [c_void_p]
         
         print(f"✓ MultiStreamWriter initialized with {num_streams} streams")
         print(f"  DRAMAlloc: {num_chunks} chunks of size {chunk_size} floats ({chunk_size*4/1e6:.2f} MB)")
+        initial_io = self.io_stats()
+        if initial_io:
+            mode = "O_DIRECT zero-page-cache" if initial_io["direct_enabled"] else "buffered fallback"
+            print(f"  SSD data path: {mode}")
 
     def _init_affinity_cpus(self):
         """选择工作线程的亲和CPU列表。
@@ -602,6 +670,21 @@ class MultiStreamWriter:
             parall_iter,
             num_threads
         )
+
+    def write_stream_chunk_async(self, stream_id, data_ptr, base_ptr,
+                                 offset_in_stream, chunk_size, parall_iter):
+        """Submit a pinned chunk; native completion returns base_ptr to pool."""
+        if not self.native_async_direct:
+            return False
+        return bool(self.lib.write_stream_chunk_async(
+            self.writer_obj,
+            stream_id,
+            c_void_p(data_ptr),
+            c_void_p(base_ptr),
+            offset_in_stream,
+            chunk_size,
+            parall_iter,
+        ))
     
     def sync_stream(self, stream_id, parall_iter):
         """同步单个流到磁盘"""
@@ -628,6 +711,55 @@ class MultiStreamWriter:
     def return_chunk(self, chunk_ptr):
         """归还pinned buffer到DRAMAlloc"""
         self.lib.return_chunk(self.writer_obj, c_void_p(chunk_ptr))
+
+    def aligned_chunk_pointer(self, base_ptr, stream_id, offset_in_stream):
+        """Return a view aligned with the physical file offset for O_DIRECT.
+
+        The checkpoint header and per-slot stride are both 4 KiB aligned, so
+        the residue depends only on the stream's logical offset.  DRAMAlloc
+        reserves one page of slack after every logical chunk for this view.
+        """
+        file_residue = (
+            (self.stream_offsets[stream_id] + int(offset_in_stream)) * 4
+        ) % self.direct_io_alignment
+        base_residue = int(base_ptr) % self.direct_io_alignment
+        prefix_bytes = (
+            file_residue - base_residue
+        ) % self.direct_io_alignment
+        if prefix_bytes % sizeof(c_float) != 0:
+            raise RuntimeError(
+                f"unalignable chunk pointer {base_ptr:#x}: prefix={prefix_bytes}")
+        return int(base_ptr) + prefix_bytes
+
+    def io_stats(self):
+        if not hasattr(self.lib, 'get_io_stat') or self._closed:
+            return {}
+        names = (
+            "direct_enabled",
+            "direct_bytes",
+            "buffered_boundary_bytes",
+            "buffered_fallback_bytes",
+            "direct_calls",
+            "fallback_calls",
+            "direct_errors",
+            "durable_sync_calls",
+            "durable_sync_ns",
+            "direct_aio_enabled",
+            "direct_aio_subrequests",
+            "direct_aio_outstanding",
+        )
+        return {
+            name: int(self.lib.get_io_stat(self.writer_obj, index))
+            for index, name in enumerate(names)
+        }
+
+    def close(self):
+        if self._closed:
+            return
+        if hasattr(self.lib, 'close_writer') and self.writer_obj:
+            self.lib.close_writer(self.writer_obj)
+        self.writer_obj = None
+        self._closed = True
 
 
 class MultiStreamCheckpoint:
@@ -780,8 +912,18 @@ class MultiStreamCheckpoint:
         copy_pool_workers = max(1, num_streams * (max_async + 1))
         self.copy_thread_pool = ThreadPoolExecutor(max_workers=copy_pool_workers, thread_name_prefix="copy_worker")
         
-        # SSD 写入线程池：IO 密集型，可以多一些线程
-        ssd_pool_workers = min(num_streams * max_async * 2, cpu_count)
+        # O_DIRECT workers block until their submitted buffer is complete, so
+        # use a deeper queue than the buffered page-cache path.  The value is
+        # explicit/rollbackable for model-level A/B experiments.
+        direct_enabled = os.environ.get("PCCHECK_DATA_DIRECT", "1") != "0"
+        native_async_enabled = (
+            os.environ.get("PCCHECK_NATIVE_ASYNC_DIRECT", "1") != "0"
+        )
+        worker_factor = 4 if direct_enabled and native_async_enabled else 2
+        default_ssd_workers = num_streams * max_async * worker_factor
+        requested_ssd_workers = int(os.environ.get(
+            "PCCHECK_SSD_WORKERS", str(default_ssd_workers)))
+        ssd_pool_workers = min(max(1, requested_ssd_workers), cpu_count)
         self.ssd_thread_pool = ThreadPoolExecutor(max_workers=ssd_pool_workers, thread_name_prefix="ssd_worker")
         
         # 保留旧名称以兼容性（指向 copy_thread_pool）
@@ -797,6 +939,8 @@ class MultiStreamCheckpoint:
         # IO统计回调
         self.io_callback = None
         self._inflight_ssd_tasks = 0
+        self._inflight_ssd_bytes = 0
+        self._borrowed_chunks = 0
         self._inflight_ssd_lock = Lock()
         
         # ✅ 修复：槽位管理器（支持多个并行检查点）
@@ -1144,6 +1288,19 @@ class MultiStreamCheckpoint:
         # _update_latest_parall_iter（后台 finalize 线程）并发读写同一 JSON，
         # 直接覆写会让并发读者（含跨进程的 pipelayer 恢复端）读到半截文件。
         with self._metadata_io_lock:
+            # Trainer exports metadata once more after drain/save_model.  Keep
+            # the durable slot selected by the background finalize path;
+            # otherwise the final static export silently removes it and makes
+            # cross-process recovery depend on native header probing.
+            if os.path.exists(output_path):
+                try:
+                    with open(output_path, "r", encoding="utf-8") as old_file:
+                        old_metadata = json.load(old_file)
+                    if "latest_parall_iter" in old_metadata:
+                        metadata["latest_parall_iter"] = int(
+                            old_metadata["latest_parall_iter"])
+                except Exception:
+                    pass
             tmp_path = output_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -1268,13 +1425,23 @@ class MultiStreamCheckpoint:
             return None
 
     def _write_extra_state(self, parall_iter, blob):
-        """把 blob 写入本 slot 的 extra 流（mmap memcpy，须在 sync_all_streams 之前）。"""
+        """Write the extra-state blob through the same pinned/direct path."""
         if not blob:
             return
-        arr = np.frombuffer(blob, dtype=np.float32).copy()  # as_ctypes 需要可写数组
-        self.writer.write_stream_chunk(
-            self.extra_stream_id, arr, 0, len(arr), parall_iter, 1)
-        self._extra_state_debug[parall_iter] = blob
+        chunk_ptr = self.writer.borrow_chunk()
+        if not chunk_ptr:
+            raise RuntimeError("borrow_chunk failed for extra state")
+        try:
+            data_ptr = self.writer.aligned_chunk_pointer(
+                chunk_ptr, self.extra_stream_id, 0)
+            ctypes.memmove(data_ptr, blob, len(blob))
+            self.writer.write_stream_chunk(
+                self.extra_stream_id, data_ptr, 0, len(blob) // 4,
+                parall_iter, 1,
+            )
+            self._extra_state_debug[parall_iter] = blob
+        finally:
+            self.writer.return_chunk(chunk_ptr)
 
     @classmethod
     def parse_extra_state_blob(cls, raw_bytes):
@@ -1408,8 +1575,11 @@ class MultiStreamCheckpoint:
                 def ssd_write_task(chunks, stream_id, offset_in_stream, parall_iter, num_threads, writer):
                     task_start = time.perf_counter()
                     task_bytes = 0
+                    expected_bytes = int(sum(c[2] for c in chunks) * 4)
+                    native_owned = set()
                     try:
-                        for chunk_ptr, chunk_size, offset, d2h_event, d2h_meta in chunks:
+                        for (base_ptr, data_ptr, chunk_size, offset,
+                             d2h_event, d2h_meta) in chunks:
                             # ✅ 事件化流水：写盘前仅等待本 chunk 的 D2H 完成事件。
                             # cudaEventSynchronize 线程安全；等待下沉到 SSD 线程后，
                             # 拷贝线程可背靠背入队后续 chunk 的 D2H。
@@ -1441,16 +1611,23 @@ class MultiStreamCheckpoint:
                                     d2h_cuda_ms=d2h_cuda_ms,
                                     d2h_event_wait_ms=d2h_wait_ms,
                                 )
-                            float_ptr = cast(chunk_ptr, POINTER(c_float))
                             write_start = time.perf_counter()
-                            writer.write_stream_chunk(
-                                stream_id,
-                                float_ptr,
-                                offset_in_stream + offset,
-                                chunk_size,
+                            native_async = writer.write_stream_chunk_async(
+                                stream_id, data_ptr, base_ptr,
+                                offset_in_stream + offset, chunk_size,
                                 parall_iter,
-                                num_threads,
                             )
+                            if native_async:
+                                native_owned.add(base_ptr)
+                            else:
+                                writer.write_stream_chunk(
+                                    stream_id,
+                                    cast(data_ptr, POINTER(c_float)),
+                                    offset_in_stream + offset,
+                                    chunk_size,
+                                    parall_iter,
+                                    num_threads,
+                                )
                             write_ms = (time.perf_counter() - write_start) * 1000.0
                             chunk_bytes = int(chunk_size) * 4
                             task_bytes += chunk_bytes
@@ -1464,17 +1641,23 @@ class MultiStreamCheckpoint:
                                 chunk_floats=int(chunk_size),
                                 bytes=chunk_bytes,
                                 writer_call_ms=write_ms,
+                                native_async=bool(native_async),
                             )
                     except Exception as e:
                         print(f"[ERROR] SSD write failed for stream {stream_id}: {e}")
                         import traceback
                         traceback.print_exc()
                     finally:
-                        for chunk_ptr, _, _, _, _ in chunks:
-                            writer.return_chunk(chunk_ptr)
+                        for base_ptr, _, _, _, _, _ in chunks:
+                            if base_ptr not in native_owned:
+                                writer.return_chunk(base_ptr)
                         with self._inflight_ssd_lock:
                             self._inflight_ssd_tasks -= 1
+                            self._inflight_ssd_bytes -= expected_bytes
+                            self._borrowed_chunks -= len(chunks)
                             inflight_after = int(self._inflight_ssd_tasks)
+                            inflight_bytes_after = int(self._inflight_ssd_bytes)
+                            free_chunks_after = int(self.num_chunks - self._borrowed_chunks)
                         _ms_profile_event(
                             "ssd_task",
                             checkpoint_id=int(checkpoint_id),
@@ -1485,12 +1668,18 @@ class MultiStreamCheckpoint:
                             bytes=int(task_bytes),
                             total_ms=(time.perf_counter() - task_start) * 1000.0,
                             inflight_after=inflight_after,
+                            inflight_bytes_after=inflight_bytes_after,
+                            free_chunks_after=free_chunks_after,
                         )
 
                 def _submit_ssd(chunks):
+                    submitted_bytes = int(sum(c[2] for c in chunks) * 4)
                     with self._inflight_ssd_lock:
                         self._inflight_ssd_tasks += 1
+                        self._inflight_ssd_bytes += submitted_bytes
                         inflight_before_submit = int(self._inflight_ssd_tasks)
+                        inflight_bytes_before_submit = int(self._inflight_ssd_bytes)
+                        free_chunks_after_borrow = int(self.num_chunks - self._borrowed_chunks)
                     submit_start = time.perf_counter()
                     fut = self.writer._submit_with_affinity(
                         self.ssd_thread_pool,
@@ -1510,9 +1699,11 @@ class MultiStreamCheckpoint:
                         stream_id=int(stream_id),
                         group_idx=int(group_idx) if group_idx is not None else -1,
                         chunks=int(len(chunks)),
-                        bytes=int(sum(c[1] for c in chunks) * 4),
+                        bytes=submitted_bytes,
                         submit_ms=(time.perf_counter() - submit_start) * 1000.0,
                         inflight_before_submit=inflight_before_submit,
+                        inflight_bytes_before_submit=inflight_bytes_before_submit,
+                        free_chunks_after_borrow=free_chunks_after_borrow,
                     )
 
                 # ========== 阶段1：GPU→CPU 拷贝（按 chunk 流式提交 SSD 写入） ==========
@@ -1529,8 +1720,14 @@ class MultiStreamCheckpoint:
                     
                     if chunk_ptr is None or chunk_ptr == 0:
                         raise RuntimeError(f"borrow_chunk() returned invalid pointer: {chunk_ptr}")
+                    with self._inflight_ssd_lock:
+                        self._borrowed_chunks += 1
 
-                    chunk_array = np.ctypeslib.as_array((ctypes.c_float * self.chunk_size).from_address(chunk_ptr))
+                    data_offset = offset_in_stream + current_offset
+                    data_ptr = self.writer.aligned_chunk_pointer(
+                        chunk_ptr, stream_id, data_offset)
+                    chunk_array = np.ctypeslib.as_array(
+                        (ctypes.c_float * self.chunk_size).from_address(data_ptr))
                     # ✅ 修复段错误：使用 detach() 彻底断开 autograd 图
                     # 
                     # 问题根因：
@@ -1594,8 +1791,8 @@ class MultiStreamCheckpoint:
                             "start_ev": d2h_start_event,
                             "end_ev": d2h_end_event,
                         }
-                    _submit_ssd([(chunk_ptr, elements_to_process, chunk_offset,
-                                  d2h_done_event, d2h_meta)])
+                    _submit_ssd([(chunk_ptr, data_ptr, elements_to_process,
+                                  chunk_offset, d2h_done_event, d2h_meta)])
 
                 # ✅ 所有 GPU→CPU 拷贝命令已完成/已提交，记录跨检查点同步事件
                 if copy_done_event is not None:
@@ -1952,6 +2149,10 @@ class MultiStreamCheckpoint:
             active_slots=int(len(self._checkpoint_slots) + 1),
             max_async=int(self._max_async),
             slot_wait_ms=(time.perf_counter() - wait_start) * 1000.0,
+            inflight_ssd_tasks=int(self._inflight_ssd_tasks),
+            inflight_ssd_bytes=int(self._inflight_ssd_bytes),
+            free_chunks=int(self.num_chunks - self._borrowed_chunks),
+            **_memory_pressure_snapshot(),
         )
         
         # ✅ 内存优化：不再预先借用巨大的pinned buffer
@@ -2014,6 +2215,7 @@ class MultiStreamCheckpoint:
             sync_start = time.time()
             self.writer.sync_all_streams(parall_iter)
             sync_time = time.time() - sync_start
+            io_stats = self.writer.io_stats()
             
             total_time = time.time() - start_time
             throughput = (self.total_size * 4 / 1e9) / total_time
@@ -2027,6 +2229,11 @@ class MultiStreamCheckpoint:
                 total_ms=float(total_time) * 1000.0,
                 sync_ms=float(sync_time) * 1000.0,
                 throughput_gbps=float(throughput),
+                inflight_ssd_tasks=int(self._inflight_ssd_tasks),
+                inflight_ssd_bytes=int(self._inflight_ssd_bytes),
+                free_chunks=int(self.num_chunks - self._borrowed_chunks),
+                **io_stats,
+                **_memory_pressure_snapshot(),
             )
             
             print(f"\n{'='*60}")
@@ -2065,6 +2272,7 @@ class MultiStreamCheckpoint:
                     self.writer.sync_all_streams(parall_iter)
                     
                     sync_streams_time = time.time() - sync_streams_start
+                    io_stats = self.writer.io_stats()
                     
                     total_time = time.time() - start_time
                     throughput = (self.total_size * 4 / 1e9) / total_time
@@ -2078,6 +2286,11 @@ class MultiStreamCheckpoint:
                         total_ms=float(total_time) * 1000.0,
                         sync_ms=float(sync_streams_time) * 1000.0,
                         throughput_gbps=float(throughput),
+                        inflight_ssd_tasks=int(self._inflight_ssd_tasks),
+                        inflight_ssd_bytes=int(self._inflight_ssd_bytes),
+                        free_chunks=int(self.num_chunks - self._borrowed_chunks),
+                        **io_stats,
+                        **_memory_pressure_snapshot(),
                     )
                     
                     print(f"✓ Checkpoint {parall_iter} completed in background: {total_time:.2f}s, {throughput:.2f} GB/s")
@@ -2154,6 +2367,8 @@ class MultiStreamCheckpoint:
         if hasattr(self, 'ssd_thread_pool'):
             self.ssd_thread_pool.shutdown(wait=True)
             print("✓ SSD thread pool shutdown")
+        if hasattr(self, 'writer'):
+            self.writer.close()
     
     def __del__(self):
         """析构时自动关闭线程池"""

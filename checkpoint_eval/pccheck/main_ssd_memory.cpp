@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <cerrno>
 #include <unistd.h>
 #include <fstream>
 #include <pthread.h>
@@ -17,6 +18,7 @@
 #include <linux/mman.h>
 #include <sys/types.h>
 #include <fcntl.h> /* Definition of AT_* constants */
+#include <libaio.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <libpmem.h>
@@ -27,6 +29,7 @@
 #include <memory>
 #include <stdint.h>
 #include <queue>
+#include <deque>
 #include <condition_variable>
 #include <functional>
 #include <unordered_map>
@@ -91,6 +94,27 @@ struct checkpoint
     int64_t counter;
 } __attribute__((aligned(64)));
 
+// Relocatable publication record.  The original format stores an absolute
+// mmap pointer at byte 0, which is only valid inside the writer process.  New
+// writers also persist this record in unused header space; readers fall back
+// to scanning metadata counters for clean legacy files.
+struct published_checkpoint_record
+{
+    uint64_t magic;
+    int64_t area;
+    int64_t counter;
+    uint64_t checksum;
+};
+
+static constexpr uint64_t PUBLISHED_RECORD_MAGIC = 0x43534E4150534C54ULL;
+static constexpr size_t PUBLISHED_RECORD_BYTE_OFFSET = 64;
+
+static uint64_t published_record_checksum(int64_t area, int64_t counter)
+{
+    return PUBLISHED_RECORD_MAGIC ^ (uint64_t)area ^
+           ((uint64_t)counter * 0x9E3779B185EBCA87ULL);
+}
+
 // NUM_THREADS = # of parallel threads that works on a single checkpoint
 // ASYNC_CHECK = # of maximal parallel checkpoints
 // SIZE = writing size of a single write
@@ -106,8 +130,17 @@ static atomic<int64_t> counter __attribute__((aligned(64)));
 // static MSQueue<int> free_space;
 static FAAArrayQueue<int> free_space;
 
-int fd;
+int fd = -1;
+int fd_direct = -1;
 DRAMAlloc dram;
+
+static constexpr size_t DIRECT_IO_ALIGNMENT = 4096;
+
+static bool data_direct_requested()
+{
+    const char *e = getenv("PCCHECK_DATA_DIRECT");
+    return e == nullptr || strcmp(e, "0") != 0;
+}
 
 // for distributed
 bool is_distributed;
@@ -263,9 +296,31 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     bool newfile = (stat(filename, &buffer) == -1);
 
     fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, (mode_t)0666);
+    if (fd < 0) {
+        perror("open checkpoint file");
+        exit(1);
+    }
     if (ftruncate(fd, REGION_SIZE) != 0) {
         perror("ftruncate");
         exit(1);
+    }
+
+    // The metadata mapping and small unaligned boundaries retain a normal
+    // descriptor.  Bulk checkpoint data uses a second descriptor for the same
+    // inode with O_DIRECT, so the already-pinned CUDA host buffer is submitted
+    // to storage without creating a second checkpoint-sized page-cache copy.
+    if (data_direct_requested()) {
+        fd_direct = open(filename, O_RDWR | O_DIRECT, (mode_t)0666);
+        if (fd_direct < 0) {
+            fprintf(stderr,
+                    "[WARN] O_DIRECT unavailable for %s (%s); using buffered pwrite\n",
+                    filename, strerror(errno));
+        } else {
+            printf("Checkpoint data path: O_DIRECT enabled (alignment=%zu bytes)\n",
+                   DIRECT_IO_ALIGNMENT);
+        }
+    } else {
+        printf("Checkpoint data path: buffered pwrite (PCCHECK_DATA_DIRECT=0)\n");
     }
 
     MAPPED_SIZE = REGION_SIZE;
@@ -279,6 +334,15 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
     // 的 metadata 槽（位于 OFFSET_SIZE*(max_async+3)）与 slot0 数据区前 64 字节
     // 重叠——每次发布最后一个槽位都会覆写 slot0 param 流开头（byte-diff 实锤）。
     PR_ADDR_DATA = PR_ADDR + (max_async+4)*OFFSET_SIZE;
+
+    published_checkpoint_record published = {
+        PUBLISHED_RECORD_MAGIC, -1, 0, published_record_checksum(-1, 0)};
+    memcpy((char *)PR_ADDR + PUBLISHED_RECORD_BYTE_OFFSET,
+           &published, sizeof(published));
+    if (msync((void *)PR_ADDR, 4096, MS_SYNC) == -1) {
+        perror("msync - initialize publication record");
+        exit(1);
+    }
 
     printf("PR_ADDR_DATA is %p, PR_ADDR is %p, PEER_CHECK_ADDR is %p\n", PR_ADDR_DATA, PR_ADDR, PEER_CHECK_ADDR);
 
@@ -369,6 +433,7 @@ static void initialize(const char *filename, int max_async, size_t batch_size_fl
 
 static void initialize_for_read(const char *filename, int max_async)
 {
+    fd_direct = -1;
     fd = open(filename, O_RDWR, (mode_t)0666);
     if (fd < 0)
     {
@@ -487,6 +552,45 @@ public:
 class NVM_write
 {
 private:
+    struct DirectAioBatch;
+
+    struct DirectAioRequest {
+        struct iocb control{};
+        std::mutex mutex;
+        std::condition_variable ready;
+        bool complete = false;
+        long result = 0;
+        long result2 = 0;
+        size_t expected_bytes = 0;
+        DirectAioBatch *batch = nullptr;
+    };
+
+    struct DirectAioBatch {
+        std::vector<std::unique_ptr<DirectAioRequest>> requests;
+        std::mutex mutex;
+        std::condition_variable ready;
+        size_t remaining = 0;
+        size_t completed_bytes = 0;
+        bool complete = false;
+        bool success = true;
+        bool submission_finished = false;
+        bool buffer_return_scheduled = false;
+        bool buffer_returned = false;
+        float *base_buffer = nullptr;
+        const char *full_src = nullptr;
+        char *mmap_target = nullptr;
+        size_t full_bytes = 0;
+        off64_t full_offset = 0;
+        size_t direct_bytes = 0;
+        int parall_iter = -1;
+    };
+
+    struct PendingReclaimSegment {
+        off64_t start;
+        off64_t len;
+        int parall_iter;
+    };
+
     std::vector<std::unique_ptr<StreamWriter>> streams;
     std::atomic<int> active_streams;
     bool multistream_mode;
@@ -499,6 +603,608 @@ private:
     // - pool_num_threads: 线程池大小
     std::unordered_map<int, float*> slot_buffers;  // 槽位→pinned buffer映射（用于DRAM复用）
     std::mutex slot_mutex;             // 保护slot_buffers的互斥锁
+    std::mutex publish_mutex;
+    int metadata_max_async = -1;
+    // Process-wide reclaim accounting for this writer.  The former
+    // thread_local windows silently multiplied the dirty-page allowance by
+    // the Python SSD worker count.  A shared FIFO makes the configured budget
+    // independent of that worker count.
+    std::mutex reclaim_mutex;
+    std::deque<PendingReclaimSegment> reclaim_pending;
+    size_t reclaim_pending_bytes = 0;
+
+    // Cumulative counters are intentionally lock-free: Python SSD workers
+    // issue disjoint chunks concurrently.  They make direct-I/O coverage and
+    // any unexpected buffered fallback observable in production profiles.
+    std::atomic<uint64_t> direct_bytes{0};
+    std::atomic<uint64_t> buffered_boundary_bytes{0};
+    std::atomic<uint64_t> buffered_fallback_bytes{0};
+    std::atomic<uint64_t> direct_calls{0};
+    std::atomic<uint64_t> fallback_calls{0};
+    std::atomic<uint64_t> direct_errors{0};
+    std::atomic<uint64_t> durable_sync_calls{0};
+    std::atomic<uint64_t> durable_sync_ns{0};
+    std::atomic<uint64_t> direct_aio_subrequests{0};
+    std::once_flag direct_aio_once;
+    io_context_t direct_aio_context = 0;
+    std::atomic<bool> direct_aio_ready{false};
+    std::atomic<bool> direct_aio_stop{false};
+    std::atomic<uint64_t> direct_aio_outstanding{0};
+    std::thread direct_aio_completion_thread;
+    std::mutex direct_async_batches_mutex;
+    std::vector<std::shared_ptr<DirectAioBatch>> direct_async_batches;
+
+    static bool direct_aio_requested() {
+        const char *e = getenv("PCCHECK_DIRECT_AIO");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }
+
+    static size_t direct_aio_request_bytes() {
+        static const size_t bytes = [] {
+            const char *e = getenv("PCCHECK_DIRECT_AIO_REQUEST_MB");
+            long mb = (e != nullptr && e[0] != '\0') ? atol(e) : 64;
+            if (mb < 1) mb = 1;
+            if (mb > 64) mb = 64;
+            size_t value = (size_t)mb * 1024 * 1024;
+            return (value / DIRECT_IO_ALIGNMENT) * DIRECT_IO_ALIGNMENT;
+        }();
+        return bytes;
+    }
+
+    void direct_aio_completion_loop() {
+        constexpr long max_events = 64;
+        struct io_event events[max_events];
+        while (!direct_aio_stop.load(std::memory_order_acquire) ||
+               direct_aio_outstanding.load(std::memory_order_acquire) != 0) {
+            struct timespec timeout{0, 100000000};  // 100 ms
+            int count = io_getevents(direct_aio_context, 1, max_events,
+                                     events, &timeout);
+            if (count < 0) {
+                if (count == -EINTR) continue;
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    errno = -count;
+                    perror("[WARN] io_getevents");
+                }
+                continue;
+            }
+            for (int index = 0; index < count; ++index) {
+                auto *request = static_cast<DirectAioRequest *>(
+                    events[index].data);
+                if (request->batch != nullptr) {
+                    DirectAioBatch *batch = request->batch;
+                    bool return_buffer = false;
+                    bool batch_completed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(batch->mutex);
+                        request->result = events[index].res;
+                        request->result2 = events[index].res2;
+                        request->complete = true;
+                        if (request->result > 0) {
+                            batch->completed_bytes += (size_t)request->result;
+                        }
+                        if (request->result != (long)request->expected_bytes ||
+                            request->result2 != 0) {
+                            batch->success = false;
+                        }
+                        if (--batch->remaining == 0 &&
+                            batch->submission_finished) {
+                            batch->complete = true;
+                            batch_completed = true;
+                            return_buffer = batch->success &&
+                                            !batch->buffer_return_scheduled;
+                            if (return_buffer) {
+                                batch->buffer_return_scheduled = true;
+                            }
+                        }
+                    }
+                    if (return_buffer) {
+                        direct_bytes.fetch_add(batch->direct_bytes,
+                                               std::memory_order_relaxed);
+                        dram.put_add(batch->base_buffer, 0);
+                        {
+                            std::lock_guard<std::mutex> lock(batch->mutex);
+                            batch->buffer_returned = true;
+                        }
+                    }
+                    direct_aio_outstanding.fetch_sub(
+                        1, std::memory_order_release);
+                    if (batch_completed) batch->ready.notify_all();
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(request->mutex);
+                    request->result = events[index].res;
+                    request->result2 = events[index].res2;
+                    request->complete = true;
+                }
+                direct_aio_outstanding.fetch_sub(1,
+                                                  std::memory_order_release);
+                request->ready.notify_one();
+            }
+        }
+    }
+
+    bool ensure_direct_aio() {
+        if (!direct_aio_requested()) return false;
+        std::call_once(direct_aio_once, [this] {
+            int result = io_setup(256, &direct_aio_context);
+            if (result < 0) {
+                errno = -result;
+                perror("[WARN] io_setup for O_DIRECT; using synchronous pwrite");
+                direct_aio_context = 0;
+                return;
+            }
+            direct_aio_ready.store(true, std::memory_order_release);
+            direct_aio_completion_thread = std::thread(
+                [this] { direct_aio_completion_loop(); });
+        });
+        return direct_aio_ready.load(std::memory_order_acquire);
+    }
+
+    bool direct_aio_write(const char *src, size_t bytes, off64_t offset,
+                          size_t *completed) {
+        if (!ensure_direct_aio()) return false;
+        const size_t request_bytes = direct_aio_request_bytes();
+        const size_t request_count =
+            (bytes + request_bytes - 1) / request_bytes;
+        std::vector<std::unique_ptr<DirectAioRequest>> owned;
+        std::vector<struct iocb *> controls;
+        owned.reserve(request_count);
+        controls.reserve(request_count);
+
+        size_t prepared = 0;
+        for (size_t index = 0; index < request_count; ++index) {
+            size_t length = std::min(request_bytes, bytes - prepared);
+            auto request = std::make_unique<DirectAioRequest>();
+            io_prep_pwrite(&request->control, fd_direct,
+                           const_cast<char *>(src + prepared), length,
+                           offset + (off64_t)prepared);
+            request->control.data = request.get();
+            controls.push_back(&request->control);
+            owned.push_back(std::move(request));
+            prepared += length;
+        }
+
+        size_t submitted_total = 0;
+        int transient_retries = 0;
+        bool submission_ok = true;
+        while (submitted_total < request_count) {
+            int remaining = (int)(request_count - submitted_total);
+            direct_aio_outstanding.fetch_add((uint64_t)remaining,
+                                              std::memory_order_release);
+            int submitted = io_submit(direct_aio_context, remaining,
+                                      controls.data() + submitted_total);
+            if (submitted <= 0) {
+                direct_aio_outstanding.fetch_sub((uint64_t)remaining,
+                                                  std::memory_order_release);
+                if ((submitted == -EAGAIN || submitted == 0) &&
+                    transient_retries++ < 10000) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                if (submitted < 0) errno = -submitted;
+                submission_ok = false;
+                break;
+            }
+            transient_retries = 0;
+            if (submitted < remaining) {
+                direct_aio_outstanding.fetch_sub(
+                    (uint64_t)(remaining - submitted),
+                    std::memory_order_release);
+            }
+            submitted_total += (size_t)submitted;
+            direct_aio_subrequests.fetch_add((uint64_t)submitted,
+                                              std::memory_order_relaxed);
+        }
+
+        size_t total_completed = 0;
+        bool completions_ok = true;
+        for (size_t index = 0; index < submitted_total; ++index) {
+            DirectAioRequest &request = *owned[index];
+            std::unique_lock<std::mutex> lock(request.mutex);
+            request.ready.wait(lock, [&request] { return request.complete; });
+            if (request.result > 0) total_completed += (size_t)request.result;
+            if (request.result != (long)request.control.u.c.nbytes ||
+                request.result2 != 0) {
+                completions_ok = false;
+                if (request.result < 0) errno = (int)-request.result;
+                else if (request.result2 < 0) errno = (int)-request.result2;
+            }
+        }
+        if (completed != nullptr) *completed = total_completed;
+        return submission_ok && submitted_total == request_count &&
+               completions_ok && total_completed == bytes;
+    }
+
+    bool direct_aio_submit_async(const char *src, size_t bytes, off64_t offset,
+                                 float *base_buffer, const char *full_src,
+                                 char *mmap_target, size_t full_bytes,
+                                 off64_t full_offset, int parall_iter) {
+        if (!ensure_direct_aio()) return false;
+        auto batch = std::make_shared<DirectAioBatch>();
+        batch->base_buffer = base_buffer;
+        batch->full_src = full_src;
+        batch->mmap_target = mmap_target;
+        batch->full_bytes = full_bytes;
+        batch->full_offset = full_offset;
+        batch->direct_bytes = bytes;
+        batch->parall_iter = parall_iter;
+
+        const size_t request_bytes = direct_aio_request_bytes();
+        const size_t request_count =
+            (bytes + request_bytes - 1) / request_bytes;
+        batch->requests.reserve(request_count);
+        size_t prepared = 0;
+        for (size_t index = 0; index < request_count; ++index) {
+            size_t length = std::min(request_bytes, bytes - prepared);
+            auto request = std::make_unique<DirectAioRequest>();
+            request->expected_bytes = length;
+            request->batch = batch.get();
+            io_prep_pwrite(&request->control, fd_direct,
+                           const_cast<char *>(src + prepared), length,
+                           offset + (off64_t)prepared);
+            request->control.data = request.get();
+            batch->requests.push_back(std::move(request));
+            prepared += length;
+        }
+
+        bool submission_ok = true;
+        for (auto &owned_request : batch->requests) {
+            struct iocb *control = &owned_request->control;
+            int retries = 0;
+            while (true) {
+                {
+                    std::lock_guard<std::mutex> lock(batch->mutex);
+                    ++batch->remaining;
+                }
+                direct_aio_outstanding.fetch_add(1,
+                                                  std::memory_order_release);
+                int submitted = io_submit(direct_aio_context, 1, &control);
+                if (submitted == 1) {
+                    direct_aio_subrequests.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                }
+                direct_aio_outstanding.fetch_sub(1,
+                                                  std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(batch->mutex);
+                    --batch->remaining;
+                }
+                if ((submitted == -EAGAIN || submitted == 0) &&
+                    retries++ < 10000) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                if (submitted < 0) errno = -submitted;
+                submission_ok = false;
+                break;
+            }
+            if (!submission_ok) break;
+        }
+
+        if (submission_ok) {
+            std::lock_guard<std::mutex> lock(direct_async_batches_mutex);
+            direct_async_batches.push_back(batch);
+        }
+
+        bool return_buffer = false;
+        bool batch_completed = false;
+        {
+            std::lock_guard<std::mutex> lock(batch->mutex);
+            batch->submission_finished = true;
+            if (!submission_ok) batch->success = false;
+            if (batch->remaining == 0) {
+                batch->complete = true;
+                batch_completed = true;
+                return_buffer = batch->success &&
+                                !batch->buffer_return_scheduled;
+                if (return_buffer) batch->buffer_return_scheduled = true;
+            }
+        }
+        if (return_buffer) {
+            direct_bytes.fetch_add(batch->direct_bytes,
+                                   std::memory_order_relaxed);
+            dram.put_add(batch->base_buffer, 0);
+            {
+                std::lock_guard<std::mutex> lock(batch->mutex);
+                batch->buffer_returned = true;
+            }
+        }
+        if (batch_completed) batch->ready.notify_all();
+
+        if (!submission_ok) {
+            std::unique_lock<std::mutex> lock(batch->mutex);
+            batch->ready.wait(lock, [&batch] { return batch->complete; });
+            size_t partial_bytes = batch->completed_bytes;
+            lock.unlock();
+            if (partial_bytes > 0) fdatasync(fd_direct);
+            return false;
+        }
+        return true;
+    }
+
+    void wait_async_direct(int parall_iter) {
+        std::vector<std::shared_ptr<DirectAioBatch>> selected;
+        {
+            std::lock_guard<std::mutex> lock(direct_async_batches_mutex);
+            auto it = direct_async_batches.begin();
+            while (it != direct_async_batches.end()) {
+                if (parall_iter < 0 || (*it)->parall_iter == parall_iter) {
+                    selected.push_back(*it);
+                    it = direct_async_batches.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto &batch : selected) {
+            std::unique_lock<std::mutex> lock(batch->mutex);
+            batch->ready.wait(lock, [&batch] {
+                return batch->complete &&
+                       (!batch->success || batch->buffer_returned);
+            });
+            bool success = batch->success;
+            size_t partial_bytes = batch->completed_bytes;
+            lock.unlock();
+            if (success) continue;
+
+            direct_errors.fetch_add(1, std::memory_order_relaxed);
+            if (partial_bytes > 0) fdatasync(fd_direct);
+            fallback_calls.fetch_add(1, std::memory_order_relaxed);
+            buffered_fallback_bytes.fetch_add(batch->full_bytes,
+                                              std::memory_order_relaxed);
+            if (!write_buffered(batch->full_src, batch->full_bytes,
+                                batch->full_offset)) {
+                memcpy(batch->mmap_target, batch->full_src,
+                       batch->full_bytes);
+            }
+            dram.put_add(batch->base_buffer, 0);
+            {
+                std::lock_guard<std::mutex> relock(batch->mutex);
+                batch->buffer_returned = true;
+            }
+        }
+    }
+
+    void persist_published_record(int area, int64_t published_counter) {
+        published_checkpoint_record record = {
+            PUBLISHED_RECORD_MAGIC,
+            area,
+            published_counter,
+            published_record_checksum(area, published_counter),
+        };
+        memcpy((char *)PR_ADDR + PUBLISHED_RECORD_BYTE_OFFSET,
+               &record, sizeof(record));
+        if (msync((void *)PR_ADDR, 4096, MS_SYNC) == -1) {
+            perror("msync - published checkpoint record");
+            exit(1);
+        }
+    }
+
+    static bool pwrite_all(int out_fd, const char *src, size_t bytes,
+                           off64_t offset, size_t *completed = nullptr) {
+        size_t done = 0;
+        while (done < bytes) {
+            ssize_t written = pwrite(out_fd, src + done, bytes - done,
+                                     offset + (off64_t)done);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) break;
+            done += (size_t)written;
+        }
+        if (completed != nullptr) *completed = done;
+        return done == bytes;
+    }
+
+    bool write_buffered(const char *src, size_t bytes, off64_t offset) {
+        if (bytes == 0) return true;
+        if (pwrite_all(fd, src, bytes, offset)) return true;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            perror("[WARN] buffered pwrite data region");
+        }
+        return false;
+    }
+
+    // Write one chunk without a CPU bounce buffer.  The unaligned head/tail
+    // are each <4 KiB; the checkpoint-sized middle goes straight from the
+    // cudaMallocHost buffer through O_DIRECT.  Python arranges the source
+    // pointer residue to match the file-offset residue.
+    bool write_direct_chunk(const char *src, size_t bytes, off64_t offset) {
+        if (fd_direct < 0 || bytes == 0) return false;
+
+        const size_t file_residue = (size_t)offset % DIRECT_IO_ALIGNMENT;
+        size_t head = file_residue == 0 ? 0 : DIRECT_IO_ALIGNMENT - file_residue;
+        if (head > bytes) head = bytes;
+        const size_t remaining = bytes - head;
+        const size_t middle = (remaining / DIRECT_IO_ALIGNMENT) * DIRECT_IO_ALIGNMENT;
+        const size_t tail = remaining - middle;
+
+        // No full direct-I/O block, or the caller did not provide the matching
+        // aligned view.  This is expected for the tiny extra-state stream and
+        // remains a bounded buffered fallback.
+        if (middle == 0 ||
+            ((uintptr_t)(src + head) % DIRECT_IO_ALIGNMENT) != 0 ||
+            (((size_t)offset + head) % DIRECT_IO_ALIGNMENT) != 0) {
+            return false;
+        }
+
+        direct_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!write_buffered(src, head, offset)) return false;
+
+        size_t direct_done = 0;
+        bool direct_ok;
+        if (ensure_direct_aio()) {
+            direct_ok = direct_aio_write(src + head, middle,
+                                         offset + (off64_t)head,
+                                         &direct_done);
+            // Submission-layer failure is not a reason to abandon direct I/O.
+            // If no byte reached storage, retry through synchronous O_DIRECT.
+            if (!direct_ok && direct_done == 0) {
+                direct_ok = pwrite_all(fd_direct, src + head, middle,
+                                       offset + (off64_t)head, &direct_done);
+            }
+        } else {
+            direct_ok = pwrite_all(fd_direct, src + head, middle,
+                                   offset + (off64_t)head, &direct_done);
+        }
+        if (!direct_ok) {
+            direct_errors.fetch_add(1, std::memory_order_relaxed);
+            // If the kernel ever reports a partial direct write, order it
+            // before the complete buffered rewrite performed by the caller.
+            if (direct_done > 0) fdatasync(fd_direct);
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                perror("[WARN] O_DIRECT pwrite, falling back to buffered path");
+            }
+            return false;
+        }
+
+        if (!write_buffered(src + head + middle, tail,
+                            offset + (off64_t)(head + middle))) {
+            direct_errors.fetch_add(1, std::memory_order_relaxed);
+            fdatasync(fd_direct);
+            return false;
+        }
+
+        direct_bytes.fetch_add(middle, std::memory_order_relaxed);
+        buffered_boundary_bytes.fetch_add(head + tail,
+                                          std::memory_order_relaxed);
+        return true;
+    }
+
+    bool write_direct_chunk_async(const char *src, float *base_buffer,
+                                  char *mmap_target, size_t bytes,
+                                  off64_t offset, int parall_iter) {
+        if (fd_direct < 0 || bytes == 0 || base_buffer == nullptr) return false;
+
+        const size_t file_residue = (size_t)offset % DIRECT_IO_ALIGNMENT;
+        size_t head = file_residue == 0 ? 0 : DIRECT_IO_ALIGNMENT - file_residue;
+        if (head > bytes) head = bytes;
+        const size_t remaining = bytes - head;
+        const size_t middle =
+            (remaining / DIRECT_IO_ALIGNMENT) * DIRECT_IO_ALIGNMENT;
+        const size_t tail = remaining - middle;
+        if (middle == 0 ||
+            ((uintptr_t)(src + head) % DIRECT_IO_ALIGNMENT) != 0 ||
+            (((size_t)offset + head) % DIRECT_IO_ALIGNMENT) != 0) {
+            return false;
+        }
+
+        if (!write_buffered(src, head, offset) ||
+            !write_buffered(src + head + middle, tail,
+                            offset + (off64_t)(head + middle))) {
+            return false;
+        }
+        direct_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!direct_aio_submit_async(
+                src + head, middle, offset + (off64_t)head,
+                base_buffer, src, mmap_target, bytes, offset, parall_iter)) {
+            direct_errors.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        buffered_boundary_bytes.fetch_add(head + tail,
+                                          std::memory_order_relaxed);
+        return true;
+    }
+
+    void durable_sync_data() {
+        const int sync_fd = fd_direct >= 0 ? fd_direct : fd;
+        auto start = std::chrono::steady_clock::now();
+        int res;
+        do {
+            res = fdatasync(sync_fd);
+        } while (res < 0 && errno == EINTR);
+        auto end = std::chrono::steady_clock::now();
+        durable_sync_calls.fetch_add(1, std::memory_order_relaxed);
+        durable_sync_ns.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                end - start).count(),
+            std::memory_order_relaxed);
+        if (res < 0) {
+            perror("fdatasync checkpoint data");
+            exit(1);
+        }
+    }
+
+    static bool group_reclaim_enabled() {
+        static const bool enabled = [] {
+            const char *e = getenv("PCCHECK_GROUP_RECLAIM");
+            return e != nullptr && strcmp(e, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    static size_t process_reclaim_budget_bytes() {
+        static const size_t budget = [] {
+            const char *e = getenv("PCCHECK_RECLAIM_BUDGET_MB");
+            long mb = (e != nullptr && e[0] != '\0') ? atol(e) : 4096;
+            if (mb < 256) mb = 256;
+            return (size_t)mb * 1024 * 1024;
+        }();
+        return budget;
+    }
+
+    void reclaim_segment(const PendingReclaimSegment &seg) {
+        if (sync_file_range(fd, seg.start, seg.len,
+                            SYNC_FILE_RANGE_WAIT_BEFORE |
+                            SYNC_FILE_RANGE_WRITE |
+                            SYNC_FILE_RANGE_WAIT_AFTER) == 0) {
+            int advise_res = posix_fadvise(fd, seg.start, seg.len,
+                                           POSIX_FADV_DONTNEED);
+            if (advise_res != 0) {
+                static std::atomic<bool> fadv_warned{false};
+                if (!fadv_warned.exchange(true)) {
+                    errno = advise_res;
+                    perror("[WARN] posix_fadvise(DONTNEED)");
+                }
+            }
+        } else {
+            static std::atomic<bool> wait_warned{false};
+            if (!wait_warned.exchange(true)) {
+                perror("[WARN] sync_file_range(WAIT_AFTER)");
+            }
+        }
+    }
+
+    void queue_reclaim_segment(off64_t start, off64_t len, int parall_iter) {
+        std::lock_guard<std::mutex> lock(reclaim_mutex);
+        reclaim_pending.push_back({start, len, parall_iter});
+        reclaim_pending_bytes += (size_t)len;
+        const size_t budget = process_reclaim_budget_bytes();
+        while (!reclaim_pending.empty() && reclaim_pending_bytes > budget) {
+            PendingReclaimSegment oldest = reclaim_pending.front();
+            reclaim_pending.pop_front();
+            reclaim_segment(oldest);
+            reclaim_pending_bytes -= (size_t)oldest.len;
+        }
+    }
+
+    void retire_reclaim_segments(int parall_iter) {
+        if (!group_reclaim_enabled()) return;
+        std::lock_guard<std::mutex> lock(reclaim_mutex);
+        auto it = reclaim_pending.begin();
+        while (it != reclaim_pending.end()) {
+            if (it->parall_iter != parall_iter) {
+                ++it;
+                continue;
+            }
+            // The merged MS_SYNC for this slot has already completed, so only
+            // cache eviction is needed here; no additional writeback wait.
+            int advise_res = posix_fadvise(fd, it->start, it->len,
+                                           POSIX_FADV_DONTNEED);
+            if (advise_res != 0) {
+                static std::atomic<bool> retire_warned{false};
+                if (!retire_warned.exchange(true)) {
+                    errno = advise_res;
+                    perror("[WARN] finalize posix_fadvise(DONTNEED)");
+                }
+            }
+            reclaim_pending_bytes -= (size_t)it->len;
+            it = reclaim_pending.erase(it);
+        }
+    }
     
     // ✅ 复用checkpoint基地址计算，避免每次重复计算offset
     float* checkpoint_base_ptr(int parall_iter) {
@@ -513,6 +1219,10 @@ public:
     NVM_write() : active_streams(0), multistream_mode(false), total_checkpoint_size(0), 
                   checkpoint_padding_bytes(0), checkpoint_stride_floats(0) {
         // ✅ 简化：移除 C++ 线程池，由 Python ssd_thread_pool 管理并行
+    }
+
+    void set_metadata_max_async(int max_async) {
+        metadata_max_async = max_async;
     }
     
     // 初始化多个数据流
@@ -590,42 +1300,29 @@ public:
         
         size_t chunk_bytes = chunk_size * sizeof(float);
 
-        // ✅ 数据区写入路径（PCCHECK_DATA_PWRITE=1 默认，=0 回退 mmap memcpy）：
-        // mmap memcpy 写出的脏页 mapcount>0，posix_fadvise(DONTNEED) 无法回收
-        // ——page cache 以内存带宽膨胀顶满 cgroup，触发全局 direct reclaim
-        // 把训练主线程一并拖慢（BLOOM 实测 p50 步时 1.26s→10.5s）。改用
-        // pwrite：同一 inode 的统一 page cache（mmap 读端一致性不变、msync
-        // 兜底语义不变），但页无 mmap 引用，窗口化 fadvise 能真正回收——
-        // 脏页与干净页总量都被窗口硬限。
+        // Bulk data defaults to O_DIRECT.  Unlike buffered pwrite, it does not
+        // duplicate the pinned checkpoint in cgroup-accounted page cache.  A
+        // normal descriptor remains for sub-page boundaries and compatibility.
         static const bool data_pwrite = [] {
             const char *e = getenv("PCCHECK_DATA_PWRITE");
             return e == nullptr || strcmp(e, "0") != 0;
         }();
-        bool wrote_via_fd = false;
-        if (data_pwrite) {
-            size_t woff = (size_t)((char *)target_addr - (char *)PR_ADDR);
-            ssize_t done = 0;
-            while (done < (ssize_t)chunk_bytes) {
-                ssize_t w = pwrite(fd, (const char *)data + done,
-                                   chunk_bytes - done, (off64_t)(woff + done));
-                if (w <= 0) {
-                    if (w < 0 && errno == EINTR) continue;
-                    static std::atomic<bool> pw_warned{false};
-                    if (!pw_warned.exchange(true)) {
-                        perror("[WARN] pwrite data region, fallback to mmap memcpy");
-                    }
-                    break;
-                }
-                done += w;
+        const off64_t file_offset =
+            (off64_t)((char *)target_addr - (char *)PR_ADDR);
+        bool wrote_via_direct = write_direct_chunk(
+            (const char *)data, chunk_bytes, file_offset);
+        bool wrote_via_fd = wrote_via_direct;
+        if (!wrote_via_direct) {
+            fallback_calls.fetch_add(1, std::memory_order_relaxed);
+            buffered_fallback_bytes.fetch_add(chunk_bytes,
+                                              std::memory_order_relaxed);
+            if (data_pwrite) {
+                wrote_via_fd = write_buffered(
+                    (const char *)data, chunk_bytes, file_offset);
             }
-            if (done == (ssize_t)chunk_bytes) {
-                wrote_via_fd = true;
-            } else if (done > 0) {
-                // 部分写入后失败：整段用 memcpy 重写保证完整性
+            if (!wrote_via_fd) {
+                memcpy(target_addr, data, chunk_bytes);
             }
-        }
-        if (!wrote_via_fd) {
-            memcpy(target_addr, data, chunk_bytes);
         }
 
         // ✅ 逐组增量刷盘（group-granular durability 第一阶段）：
@@ -645,20 +1342,10 @@ public:
         // 第一版实现逐 chunk 同步 WAIT_AFTER，实测把盘打成队列深度=1 的单请求
         // 模式（内核失去合并/重排/深队列），checkpoint span 301→446s 反而劣化。
         // 现改窗口化：每 chunk 只发异步 SYNC_FILE_RANGE_WRITE（内核保持批量
-        // 回写），线程本地窗口累计超过 PCCHECK_RECLAIM_WINDOW_MB（默认 512）
-        // 才对最老段做 WAIT_AFTER + fadvise(DONTNEED) 回收——脏页足迹硬限在
-        // O(窗口×线程数)，回写吞吐保持批量模式。finalize 的 msync 仍兜底全量。
-        static const bool group_reclaim = [] {
-            const char *e = getenv("PCCHECK_GROUP_RECLAIM");
-            return e != nullptr && strcmp(e, "1") == 0;
-        }();
-        static const size_t reclaim_window_bytes = [] {
-            const char *e = getenv("PCCHECK_RECLAIM_WINDOW_MB");
-            long mb = (e != nullptr && e[0] != '\0') ? atol(e) : 512;
-            if (mb < 64) mb = 64;
-            return (size_t)mb * 1024 * 1024;
-        }();
-        if (group_flush) {
+        // 回写），进程共享 FIFO 超过 PCCHECK_RECLAIM_BUDGET_MB（默认 4096）
+        // 才对最老段做 WAIT_AFTER + fadvise(DONTNEED) 回收。预算不再随 Python
+        // SSD worker 数隐式倍增；finalize 的 msync 仍兜底全量并清理该 slot。
+        if (group_flush && !wrote_via_direct) {
             const size_t fpage = 4096;
             size_t file_off = (size_t)((char *)target_addr - (char *)PR_ADDR);
             size_t fstart = (file_off / fpage) * fpage;
@@ -670,50 +1357,31 @@ public:
                 if (!sfr_warned.exchange(true)) {
                     perror("[WARN] sync_file_range");
                 }
-            } else if (group_reclaim) {
-                // 线程本地待回收段环形缓冲（SSD 线程各自独立，无锁）
-                struct PendingSeg { off64_t start; off64_t len; };
-                constexpr int RING_CAP = 128;
-                static thread_local PendingSeg ring[RING_CAP];
-                static thread_local int rhead = 0, rcount = 0;
-                static thread_local size_t rbytes = 0;
-
-                auto drain_oldest = [&]() {
-                    PendingSeg &seg = ring[rhead];
-                    // 等该段回写完成后回收其页缓存；失败均不致命（告警一次）
-                    if (sync_file_range(fd, seg.start, seg.len,
-                                        SYNC_FILE_RANGE_WAIT_BEFORE |
-                                        SYNC_FILE_RANGE_WRITE |
-                                        SYNC_FILE_RANGE_WAIT_AFTER) == 0) {
-                        if (posix_fadvise(fd, seg.start, seg.len,
-                                          POSIX_FADV_DONTNEED) != 0) {
-                            static std::atomic<bool> fadv_warned{false};
-                            if (!fadv_warned.exchange(true)) {
-                                perror("[WARN] posix_fadvise(DONTNEED)");
-                            }
-                        }
-                    } else {
-                        static std::atomic<bool> wait_warned{false};
-                        if (!wait_warned.exchange(true)) {
-                            perror("[WARN] sync_file_range(WAIT_AFTER)");
-                        }
-                    }
-                    rbytes -= (size_t)seg.len;
-                    rhead = (rhead + 1) % RING_CAP;
-                    rcount--;
-                };
-
-                // 窗口满（按字节或环容量）先排空最老段，再入队本段
-                while (rcount > 0 && (rbytes >= reclaim_window_bytes ||
-                                      rcount >= RING_CAP)) {
-                    drain_oldest();
-                }
-                int rtail = (rhead + rcount) % RING_CAP;
-                ring[rtail] = {(off64_t)fstart, (off64_t)(fend - fstart)};
-                rcount++;
-                rbytes += fend - fstart;
+            } else if (group_reclaim_enabled()) {
+                queue_reclaim_segment((off64_t)fstart,
+                                      (off64_t)(fend - fstart), parall_iter);
             }
         }
+    }
+
+    bool write_stream_chunk_async(int stream_id, float *data,
+                                  float *base_buffer,
+                                  size_t offset_in_stream,
+                                  size_t chunk_size, int parall_iter) {
+        if (stream_id < 0 || stream_id >= (int)streams.size() ||
+            checkpoint_stride_floats == 0) {
+            return false;
+        }
+        StreamWriter *stream = streams[stream_id].get();
+        float *checkpoint_base = checkpoint_base_ptr(parall_iter);
+        float *target_addr = checkpoint_base + stream->stream_offset +
+                             offset_in_stream;
+        size_t chunk_bytes = chunk_size * sizeof(float);
+        off64_t file_offset =
+            (off64_t)((char *)target_addr - (char *)PR_ADDR);
+        return write_direct_chunk_async(
+            (const char *)data, base_buffer, (char *)target_addr,
+            chunk_bytes, file_offset, parall_iter);
     }
 
     // 读取单个流的数据块到用户缓冲区
@@ -767,7 +1435,12 @@ public:
         void* aligned_addr = (void*)page_start;
         
         auto t1 = std::chrono::high_resolution_clock::now();
-        int res = msync(aligned_addr, aligned_size, MS_SYNC);
+        int res = 0;
+        if (fd_direct >= 0) {
+            durable_sync_data();
+        } else {
+            res = msync(aligned_addr, aligned_size, MS_SYNC);
+        }
         auto t2 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> ms_double = t2 - t1;
         
@@ -793,6 +1466,11 @@ public:
         
         printf("Syncing all %lu streams to parall_iter %d (merged msync)...\n", streams.size(), parall_iter);
         auto t1 = std::chrono::high_resolution_clock::now();
+
+        // Python workers only submit O_DIRECT requests.  The slot durability
+        // barrier owns completion waiting, so hundreds of pinned chunks may
+        // remain queued while training/copy work continues.
+        wait_async_direct(parall_iter);
         
         // ✅ 同步/flush逻辑复用：使用checkpoint_base_ptr，确保和写入路径一致
         float* checkpoint_base = checkpoint_base_ptr(parall_iter);
@@ -815,17 +1493,28 @@ public:
         
         void* aligned_addr = (void*)page_start;
         
-        int msync_res = msync(aligned_addr, aligned_size, MS_SYNC);
+        int msync_res = 0;
+        if (fd_direct >= 0) {
+            // O_DIRECT completion does not imply power-loss durability.  One
+            // fdatasync preserves the old publish contract and also flushes
+            // the tiny buffered boundary/extra-state writes on this inode,
+            // without walking a checkpoint-sized page-cache mapping.
+            durable_sync_data();
+        } else {
+            msync_res = msync(aligned_addr, aligned_size, MS_SYNC);
+        }
         if (msync_res == -1) {
             fprintf(stderr, "[ERROR] Merged msync failed at addr %p (aligned from %p), size %lu (original %lu)\n", 
                    aligned_addr, checkpoint_base, aligned_size, total_sync_bytes);
             perror("msync");
             exit(1);
         }
+        retire_reclaim_segments(parall_iter);
         
         auto t2 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> ms_double = t2 - t1;
-        printf("All streams synced (merged) %.2f GB in %.2f ms (%.2f GB/s)\n",
+        printf("All streams synced (%s) %.2f GB in %.2f ms (%.2f GB/s)\n",
+               fd_direct >= 0 ? "fdatasync/O_DIRECT" : "merged msync",
                total_sync_bytes / 1e9, ms_double.count(), 
                (total_sync_bytes / 1e9) / (ms_double.count() / 1000.0));
         
@@ -850,6 +1539,12 @@ public:
             exit(1);
         }
         
+        // Serialize pointer+relocatable-record publication.  CAS alone orders
+        // the process-local pointer, but without this lock an older publisher
+        // could overwrite the relocatable record after a newer one wins.
+        std::lock_guard<std::mutex> publish_lock(publish_mutex);
+        last_check = *(struct checkpoint *volatile *)PR_ADDR;
+
         // CAS更新检查点指针
         while (true) {
             bool cas_res = __sync_bool_compare_and_swap((checkpoint **)PR_ADDR, last_check, curr_checkpoint);
@@ -857,6 +1552,7 @@ public:
             if (cas_res) {
                 printf("CAS was successful! new counter is %lld\n", (long long)check->counter);
                 BARRIER(PR_ADDR);
+                persist_published_record(parall_iter, check->counter);
                 
                 // 释放旧的槽位
                 int free = (((int *)last_check - PR_ADDR) / OFFSET_SIZE) - 3;
@@ -907,14 +1603,60 @@ public:
     }
 
     int get_latest_parall_iter() {
-        struct checkpoint *volatile last_check = *(struct checkpoint *volatile *)PR_ADDR;
-        if (last_check == nullptr) {
-            return -1;
+        published_checkpoint_record record{};
+        memcpy(&record, (char *)PR_ADDR + PUBLISHED_RECORD_BYTE_OFFSET,
+               sizeof(record));
+        if (record.magic == PUBLISHED_RECORD_MAGIC &&
+            record.checksum == published_record_checksum(record.area,
+                                                          record.counter) &&
+            record.area >= 0 && record.area <= metadata_max_async) {
+            struct checkpoint *slot = (struct checkpoint *)(
+                PR_ADDR + OFFSET_SIZE * (record.area + 3));
+            if (slot->area == record.area && slot->counter == record.counter) {
+                return (int)record.area;
+            }
         }
-        return (int)last_check->area;
+
+        // Legacy compatibility: a cleanly closed old file has no in-flight
+        // registration, so the largest valid counter is its latest slot.  A
+        // crash-time legacy file cannot distinguish registered from published
+        // slots because its only commit marker was the process-local pointer.
+        int best_area = -1;
+        int64_t best_counter = 0;
+        for (int area = 0; area <= metadata_max_async; ++area) {
+            struct checkpoint *slot = (struct checkpoint *)(
+                PR_ADDR + OFFSET_SIZE * (area + 3));
+            if (slot->area == area && slot->counter > best_counter) {
+                best_area = area;
+                best_counter = slot->counter;
+            }
+        }
+        return best_area;
+    }
+
+    uint64_t get_io_stat(int stat_id) const {
+        switch (stat_id) {
+        case 0: return fd_direct >= 0 ? 1 : 0;
+        case 1: return direct_bytes.load(std::memory_order_relaxed);
+        case 2: return buffered_boundary_bytes.load(std::memory_order_relaxed);
+        case 3: return buffered_fallback_bytes.load(std::memory_order_relaxed);
+        case 4: return direct_calls.load(std::memory_order_relaxed);
+        case 5: return fallback_calls.load(std::memory_order_relaxed);
+        case 6: return direct_errors.load(std::memory_order_relaxed);
+        case 7: return durable_sync_calls.load(std::memory_order_relaxed);
+        case 8: return durable_sync_ns.load(std::memory_order_relaxed);
+        case 9: return direct_aio_ready.load(std::memory_order_relaxed) ? 1 : 0;
+        case 10: return direct_aio_subrequests.load(std::memory_order_relaxed);
+        case 11: return direct_aio_outstanding.load(std::memory_order_relaxed);
+        default: return 0;
+        }
     }
 
     void close_writer() {
+        // Defensive drain for abnormal callers that close without publishing
+        // every registered slot.  Normal finalize paths have already removed
+        // their batches above.
+        wait_async_direct(-1);
         if (PR_ADDR != nullptr && MAPPED_SIZE > 0) {
             munmap((void *)PR_ADDR, MAPPED_SIZE);
             PR_ADDR = nullptr;
@@ -924,10 +1666,22 @@ public:
             close(fd);
             fd = -1;
         }
+        if (fd_direct >= 0) {
+            close(fd_direct);
+            fd_direct = -1;
+        }
     }
     
     // 清理资源
     ~NVM_write() {
+        direct_aio_stop.store(true, std::memory_order_release);
+        if (direct_aio_completion_thread.joinable()) {
+            direct_aio_completion_thread.join();
+        }
+        if (direct_aio_context != 0) {
+            io_destroy(direct_aio_context);
+            direct_aio_context = 0;
+        }
         streams.clear();
     }
     
@@ -1211,6 +1965,7 @@ extern "C" // 生成的.so文件暴露出来的接口
     NVM_write *writer(const char *filename, int max_async, size_t batch_size_floats, size_t num_batches, bool dist, int dist_rank, int world_size)
     {
         NVM_write *nvmobj = new NVM_write();
+        nvmobj->set_metadata_max_async(max_async);
         // printf("%s\n", filename);
         // ✅ 内存优化：对于多流pccheck，num_batches应该至少为max_async + 1
         // 这样可以确保DRAMAlloc有足够的pinned buffer槽位供并行检查点复用
@@ -1223,6 +1978,7 @@ extern "C" // 生成的.so文件暴露出来的接口
     NVM_write *reader(const char *filename, int max_async)
     {
         NVM_write *nvmobj = new NVM_write();
+        nvmobj->set_metadata_max_async(max_async);
         initialize_for_read(filename, max_async);
         return nvmobj;
     }
@@ -1270,6 +2026,16 @@ extern "C" // 生成的.so文件暴露出来的接口
         }
         t->write_stream_chunk(stream_id, data, offset_in_stream, chunk_size, 
                              parall_iter, num_threads);
+    }
+
+    bool write_stream_chunk_async(NVM_write *t, int stream_id, float *data,
+                                  float *base_buffer,
+                                  size_t offset_in_stream,
+                                  size_t chunk_size, int parall_iter) {
+        if (t == nullptr) return false;
+        return t->write_stream_chunk_async(
+            stream_id, data, base_buffer, offset_in_stream,
+            chunk_size, parall_iter);
     }
 
     // 读取单个流的数据块
@@ -1343,6 +2109,11 @@ extern "C" // 生成的.so文件暴露出来的接口
             return -1;
         }
         return t->get_latest_parall_iter();
+    }
+
+    uint64_t get_io_stat(NVM_write *t, int stat_id) {
+        if (t == nullptr) return 0;
+        return t->get_io_stat(stat_id);
     }
 
     void close_writer(NVM_write *t) {

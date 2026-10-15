@@ -21,7 +21,15 @@ public:
         
         cudaFree(0);
 
-        cudaError_t err = cudaMallocHost((void **)&array, num * size * 4);
+        // Keep one 4 KiB page of slack per logical chunk.  The Python D2H
+        // path selects a pointer inside this slack whose page residue matches
+        // the destination file offset.  Consequently the aligned middle of a
+        // chunk can be submitted to O_DIRECT without an intermediate bounce
+        // buffer, even when a stream itself does not start on a page boundary.
+        logical_size = size;
+        allocation_stride = size + direct_io_slack_floats;
+        cudaError_t err = cudaMallocHost(
+            (void **)&array, num * allocation_stride * sizeof(float));
         if (err != cudaSuccess) {
             fprintf(stderr, "cudaMallocHost failed: %s (error code %d)\n", cudaGetErrorString(err), err);
             exit(EXIT_FAILURE);
@@ -30,10 +38,15 @@ public:
 
     void initialize(size_t num, size_t size)
     {
+        if (size != logical_size) {
+            fprintf(stderr, "DRAMAlloc initialize size mismatch: %zu != %zu\n",
+                    size, logical_size);
+            exit(EXIT_FAILURE);
+        }
         int tid = thread_tid();
         for (size_t i = 0; i < num; i++)
         {
-            free_add.enqueue(array + (i * size), tid);
+            free_add.enqueue(array + (i * allocation_stride), tid);
         }
     }
 
@@ -55,8 +68,11 @@ public:
     }
 
 private:
+    static constexpr size_t direct_io_slack_floats = 4096 / sizeof(float);
     FAAArrayQueueAdd<float *> free_add;
-    float *array;
+    float *array = nullptr;
+    size_t logical_size = 0;
+    size_t allocation_stride = 0;
 
     static int thread_tid()
     {
