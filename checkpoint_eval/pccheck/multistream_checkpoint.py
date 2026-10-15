@@ -796,7 +796,11 @@ class MultiStreamCheckpoint:
         elif model_size_gb < 5:
             self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB
         else:
-            self.chunk_size = 16 * 1024 * 1024  # 32M floats = 128MB
+            self.chunk_size = 16 * 1024 * 1024  # 16M floats = 64MB（旧注释写 128MB，与代码不符）
+        # 消融自变量：PCCHECK_CHUNK_MB 覆盖 chunk 大小（MB，按 4 KiB 对齐）
+        chunk_mb = os.environ.get("PCCHECK_CHUNK_MB")
+        if chunk_mb:
+            self.chunk_size = max(1024, (int(float(chunk_mb) * 1024 * 1024) // 4 // 1024) * 1024)
         
         # 策略2：基于实际并发需求估算
         # 关键洞察：虽然层组是串行的，但SSD写入慢，chunks会在pipeline中堆积
@@ -816,6 +820,12 @@ class MultiStreamCheckpoint:
         # 确保不少于一个checkpoint的完整需求
         min_chunks = num_streams * chunks_per_stream + num_streams
         self.num_chunks = max(self.num_chunks, min_chunks)
+        # 消融自变量：pinned 池大小（PCCHECK_NUM_CHUNKS 或 PCCHECK_PINNED_POOL_MB）
+        if os.environ.get("PCCHECK_NUM_CHUNKS"):
+            self.num_chunks = max(num_streams * 2, int(os.environ["PCCHECK_NUM_CHUNKS"]))
+        elif os.environ.get("PCCHECK_PINNED_POOL_MB"):
+            pool_floats = int(float(os.environ["PCCHECK_PINNED_POOL_MB"]) * 1024 * 1024 / 4)
+            self.num_chunks = max(num_streams * 2, pool_floats // self.chunk_size)
         
         print(f"  DRAMAlloc chunk size: {self.chunk_size} floats ({self.chunk_size*4/1024/1024:.2f} MB)")
         print(f"  DRAMAlloc num chunks: {self.num_chunks} (chunks/stream={chunks_per_stream}, estimated_usage=60%, Total: {self.num_chunks*self.chunk_size*4/1024/1024/1024:.2f} GB)")
@@ -867,6 +877,8 @@ class MultiStreamCheckpoint:
         # GPU→CPU 拷贝线程池：每个 stream/async slot 一个 worker。
         # OPT-1.3B 单卡实测中继续加倍会和 SSD workers 竞争 CPU/I/O 调度资源。
         copy_pool_workers = max(1, num_streams * (max_async + 1))
+        if os.environ.get("PCCHECK_COPY_WORKERS"):
+            copy_pool_workers = max(1, int(os.environ["PCCHECK_COPY_WORKERS"]))
         self.copy_thread_pool = ThreadPoolExecutor(max_workers=copy_pool_workers, thread_name_prefix="copy_worker")
         
         # O_DIRECT workers block until their submitted buffer is complete, so
@@ -921,6 +933,7 @@ class MultiStreamCheckpoint:
         # 新检查点更新该层组之前，需要等待所有 4 个事件
         self._layer_copy_events = {}  # {group_idx: [events]}
         self._layer_copy_futures = {}  # {group_idx: [copy futures]}，事件 record 前的 CPU 侧屏障
+        self._grouped_update_active = False  # step_with_callback 期间为 True（见 install_update_guard）
         self._layer_copy_events_lock = Lock()
         # metadata JSON 的读-改-写串行化（export_metadata / _update_latest_parall_iter
         # 分别在主线程与后台 finalize 线程并发访问同一文件）
@@ -928,6 +941,41 @@ class MultiStreamCheckpoint:
         self._profile_checkpoint_seq = 0
         self._profile_parall_to_checkpoint_id = {}
         print(f"  ✓ Cross-checkpoint layer synchronization enabled")
+
+        # 实际持久化字节（每份 checkpoint）：吞吐按它计算，而不是 total_size*4
+        self.payload_bytes = int(sum(int(x) for x in self.stream_sizes) * 4
+                                 + self.extra_stream_floats * 4)
+        try:
+            self._io_last = self.writer.io_stats()
+        except Exception:  # noqa: BLE001
+            self._io_last = {}
+        # 本次运行的全部自变量写进 profile，消融分析据此核对“设了什么、实际用了什么”
+        _ms_profile_event(
+            "config",
+            chunk_floats=int(self.chunk_size),
+            chunk_mb=float(self.chunk_size * 4 / 2**20),
+            num_chunks=int(self.num_chunks),
+            pinned_pool_bytes=int(self.num_chunks * self.chunk_size * 4),
+            copy_workers=int(copy_pool_workers),
+            ssd_workers=int(ssd_pool_workers),
+            num_layer_groups=int(len(self.layer_groups)),
+            num_layer_groups_requested=int(num_layer_groups),
+            max_async=int(max_async),
+            quant_moments=bool(self.quant_moments),
+            quant_block=int(self.quant_block) if self.quant_moments else 0,
+            grouping=os.environ.get("PCCHECK_GROUPING", "split"),
+            data_direct=os.environ.get("PCCHECK_DATA_DIRECT", "1"),
+            native_async_direct=os.environ.get("PCCHECK_NATIVE_ASYNC_DIRECT", "1"),
+            direct_aio=os.environ.get("PCCHECK_DIRECT_AIO", ""),
+            aio_request_mb=os.environ.get("PCCHECK_DIRECT_AIO_REQUEST_MB", ""),
+            group_flush=os.environ.get("PCCHECK_GROUP_FLUSH", "1"),
+            group_reclaim=os.environ.get("PCCHECK_GROUP_RECLAIM", "0"),
+            schedule=os.environ.get("PCCHECK_MS_SCHEDULE", "progressive"),
+            war=os.environ.get("PCCHECK_MS_WAR", "group"),
+            stream_sizes=[int(x) for x in self.stream_sizes],
+            extra_stream_floats=int(self.extra_stream_floats),
+            payload_bytes=int(self.payload_bytes),
+        )
 
         # 尝试导出基础 metadata（不含 optimizer state），便于加载端提前准备
         if self.metadata_path:
@@ -1516,6 +1564,79 @@ class MultiStreamCheckpoint:
         """便捷入口：对当前已登记的组拷贝做写后读屏障（PP fallback 的 optimizer.step 前使用）。"""
         self.wait_group_copies(self.snapshot_group_copies(group_idxs), stream=stream)
 
+    def _zero_copy_status(self, param_list, optimizer):
+        """逐张量判定各流是否零拷贝：{"param": ..., "moments": ...}，取值
+        "alias"（全部张量恰在布局偏移处）或 "separate"（都不在缓冲区内）。
+        落在缓冲区内却不在布局偏移处 → 抛错：此时既不能直接 D2H（内容错位），
+        也不能往缓冲区做 D2D 暂存（会覆写训练中的张量）。"""
+        def classify(key, tensors, offsets):
+            sid = {"param": 0, "exp_avg": 2, "exp_avg_sq": 3}[key]
+            buf = self.gpu_buffers[sid]
+            if buf is None:
+                return "separate"
+            lo = buf.data_ptr()
+            hi = lo + buf.numel() * buf.element_size()
+            exact = inside = 0
+            for t, off in zip(tensors, offsets):
+                if t is None:
+                    continue
+                ptr = t.data_ptr()
+                if lo <= ptr < hi:
+                    inside += 1
+                    exact += int(ptr == lo + int(off) * buf.element_size())
+            if inside == 0:
+                return "separate"
+            if exact == inside == len([t for t in tensors if t is not None]):
+                return "alias"
+            raise RuntimeError(
+                f"zero-copy layout mismatch on stream {key}: {inside} tensors inside the "
+                f"checkpoint buffer but only {exact} at their layout offsets (storage order "
+                f"differs from build_param_layout order)")
+
+        n = min(len(param_list), len(self.param_layout))
+        params = list(param_list[:n])
+        layout = self.param_layout[:n]
+        status = {"param": classify("param", params, [li["param_offset"] for li in layout])}
+        if self.quant_moments:
+            status["moments"] = "separate"
+        else:
+            st = [optimizer.state.get(p, {}) for p in params]
+            m1 = classify("exp_avg", [x.get("exp_avg") for x in st],
+                          [li["exp_avg_offset"] for li in layout])
+            m2 = classify("exp_avg_sq", [x.get("exp_avg_sq") for x in st],
+                          [li["exp_avg_sq_offset"] for li in layout])
+            status["moments"] = "alias" if m1 == m2 == "alias" else (
+                "separate" if m1 == m2 == "separate" else "mixed")
+            if status["moments"] == "mixed":
+                raise RuntimeError(f"exp_avg/exp_avg_sq zero-copy status differ: {m1} vs {m2}")
+        return status
+
+    def install_update_guard(self, optimizer):
+        """给底层优化器的 step 装写后读守卫：任何 step()（trainer 的普通步、
+        GradScaler.step、Accelerate 包装层）执行前，先等已登记的全部组拷贝完成。
+
+        零拷贝下 D2H 直接读训练用的参数/moment 存储；cf>1 时 checkpoint 之后的普通步
+        若不等待，会在拷贝未完成时原位更新，存下撕裂的状态（T8 复现）。分组更新
+        （step_with_callback）内部置 _grouped_update_active，跳过全局等待，由逐组的
+        pre_update_callback 负责，以保留组粒度的等待。"""
+        base = _unwrap_optimizer(optimizer)
+        if getattr(base, "_cascadesnap_guard_owner", None) is self:
+            return
+        orig_step = base.step
+        ck = self
+
+        def guarded_step(*args, **kwargs):
+            if not ck._grouped_update_active:
+                t0 = time.perf_counter()
+                ck.wait_copies_before_update()
+                if _ms_profile_enabled():
+                    _ms_profile_event("update_guard",
+                                      wait_ms=(time.perf_counter() - t0) * 1000.0)
+            return orig_step(*args, **kwargs)
+
+        base.step = guarded_step
+        base._cascadesnap_guard_owner = self
+
     def _register_layer_group_futures(self, parall_iter, futures):
         """将异步future登记到指定槽位，供finalize阶段统一等待"""
         if not futures:
@@ -1852,13 +1973,17 @@ class MultiStreamCheckpoint:
         Returns:
             MultiStreamOptimizer实例
         """
-        # 获取模型参数列表
-        param_list = list(model.parameters())
+        # 获取模型参数列表：与 build_param_layout 一致，只含 requires_grad 的参数
+        # （layer_id 按它编号；含冻结参数时旧实现会整体错位）
+        param_list = [p for p in model.parameters() if p.requires_grad]
         
         # ✅ 修复：保存优化器和模型信息，在begin_checkpoint时创建实际的MultiStreamOptimizer
         self._pending_optimizer = optimizer
         self._pending_model = model
         self._pending_param_list = param_list
+        self.install_update_guard(optimizer)
+        self._zero_copy = self._zero_copy_status(param_list, _unwrap_optimizer(optimizer))
+        print(f"  Zero-copy status: {self._zero_copy}")
 
         if self.metadata_path:
             try:
@@ -1929,28 +2054,10 @@ class MultiStreamCheckpoint:
                 # 优化：使用专门的拷贝流，避免阻塞默认流 (问题6)
                 copy_stream = torch.cuda.Stream()
                 
-                # 按流检测零拷贝：param 流看首个参数是否位于 gpu_buffers[0] 内；
-                # moment 流看其 exp_avg/exp_avg_sq 是否位于 gpu_buffers[2]/[3] 内
-                # （量化时 [2]/[3] 是 packed 暂存，永远需要量化填充）。
-                # 旧实现只看首个参数就跳过全部拷贝 → 量化 + 零拷贝时 moment 从不 pack。
-                def _inside(t, buf):
-                    if t is None or buf is None:
-                        return False
-                    lo = buf.data_ptr()
-                    hi = lo + buf.numel() * buf.element_size()
-                    return lo <= t.data_ptr() < hi
-
-                ck = self._checkpoint
-                plist = getattr(ck, '_pending_param_list', None) or []
-                bufs0 = getattr(ck, 'gpu_buffers', None) or [None] * 4
-                params_alias = bool(plist) and _inside(plist[0], bufs0[0])
-                moments_alias = False
-                if plist and not getattr(ck, 'quant_moments', False):
-                    st0 = self._real_optimizer.state.get(plist[0], {})
-                    moments_alias = (_inside(st0.get('exp_avg'), bufs0[2])
-                                     and _inside(st0.get('exp_avg_sq'), bufs0[3]))
-                copy_params = not params_alias
-                copy_moments = not moments_alias
+                # 按流判定零拷贝（create_optimizer 时逐张量核对过地址，见 _zero_copy_status）
+                zc = self._checkpoint._zero_copy
+                copy_params = zc["param"] != "alias"
+                copy_moments = zc["moments"] != "alias"
                 is_zero_copy_enabled = not copy_params and not copy_moments
                 if is_zero_copy_enabled:
                     print("  \u2713 Zero-copy mode detected: skipping D2D copies in save_callback")
@@ -2088,7 +2195,11 @@ class MultiStreamCheckpoint:
                 """执行带回调的step（必须在begin_checkpoint后调用）"""
                 if self._ms_optimizer is None:
                     raise RuntimeError("Must call begin_checkpoint() before step_with_callback()")
-                return self._ms_optimizer.step_with_callback(closure)
+                self._checkpoint._grouped_update_active = True
+                try:
+                    return self._ms_optimizer.step_with_callback(closure)
+                finally:
+                    self._checkpoint._grouped_update_active = False
             
             def finalize_checkpoint(self, wait=True):
                 """完成检查点（必须在begin_checkpoint后调用）"""
@@ -2324,7 +2435,13 @@ class MultiStreamCheckpoint:
         total_time = time.time() - start_time
         try:
             io_stats = self.writer.io_stats()
-            throughput = (self.total_size * 4 / 1e9) / total_time
+            # 累计计数器 → 自上次发布以来的增量（max_async>1 时相邻 checkpoint 会重叠，
+            # 增量按发布区间归属，是近似的单 checkpoint 值）
+            io_delta = {f"d_{k}": int(v) - int(self._io_last.get(k, 0))
+                        for k, v in io_stats.items()
+                        if k not in ("direct_enabled", "direct_aio_enabled", "direct_aio_outstanding")}
+            self._io_last = io_stats
+            throughput = (self.payload_bytes / 1e9) / total_time
 
             self.save_times.append(total_time)
             _ms_profile_event(
@@ -2333,8 +2450,12 @@ class MultiStreamCheckpoint:
                 parall_iter=int(parall_iter),
                 wait=bool(wait),
                 total_ms=float(total_time) * 1000.0,
+                # 持久化延迟 L：begin_checkpoint（做 checkpoint 的那一步）→ 发布
+                durability_latency_ms=float(total_time) * 1000.0,
                 sync_ms=float(sync_time) * 1000.0,
                 throughput_gbps=float(throughput),
+                payload_bytes=int(self.payload_bytes),
+                **io_delta,
                 inflight_ssd_tasks=int(self._inflight_ssd_tasks),
                 inflight_ssd_bytes=int(self._inflight_ssd_bytes),
                 free_chunks=int(self.num_chunks - self._borrowed_chunks),

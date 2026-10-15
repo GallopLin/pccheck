@@ -297,6 +297,8 @@ def create_stage_checkpoint(
     # 旧实现在提交时就写入新 slot/step，而恢复端按它选版本 → 发布前崩溃会加载
     # 在途 slot（撕裂状态 + 步数虚报）。
     ms_ckpt._pending_optimizer = optimizer
+    # 零拷贝：任何 optimizer.step 前都要等上一份 checkpoint 的拷贝（写后读）
+    ms_ckpt.install_update_guard(optimizer)
     ms_ckpt._pp_stage_state = {}
     ms_ckpt.set_publish_payload_provider(lambda: dict(ms_ckpt._pp_stage_state))
     ms_ckpt.add_publish_callback(

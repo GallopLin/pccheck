@@ -172,6 +172,23 @@ class Chk_monitor:
             self.cp_in_progress.value = 1
             self.start.value = 1
 
+    def drain(self, timeout=1800, poll=0.02):
+        """等待在途 checkpoint 全部写完（start==0 且 active_async==0，连续 3 次观测）。
+
+        基准结束时先 drain 再 kill：否则尾部那次 checkpoint 会被 30 s 超时直接终止，
+        既没写完，耗时也不计入 EXECUTION TIME（对比会偏向本基线）。返回等待秒数。"""
+        t0 = time.time()
+        stable = 0
+        while stable < 3:
+            with self.lock:
+                idle = self.start.value == 0 and self.active_async.value == 0
+            stable = stable + 1 if idle else 0
+            if time.time() - t0 > timeout:
+                print(f"[WARN] PCcheck drain timed out after {timeout}s")
+                break
+            time.sleep(poll)
+        return time.time() - t0
+
     def kill_checkpoint(self, timeout=30):
 
         with self.lock:

@@ -107,6 +107,30 @@ def _is_single_buffer_layout_mapped(model, optimizer_list, gpu_ar):
     return matched_any
 
 
+def _stream_order(model, optimizer_list):
+    """四块流式布局中 grad / moment 的摆放顺序：按 model.named_parameters()。
+
+    checkpoint 布局（build_param_layout）按 named_parameters 编号计算各流偏移；
+    若这里按 optimizer.param_groups 的顺序摆放（HF 的 decay/no-decay 两组会打乱
+    顺序），零拷贝 D2H 读到的 moment 就与布局错位。不在模型里的优化器参数排在最后。"""
+    order, seen = [], set()
+    owner = {}
+    for optimizer in optimizer_list:
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                owner.setdefault(id(p), (optimizer, p))
+    for _, ref in model.named_parameters():
+        hit = owner.get(id(ref))
+        if hit is not None and id(ref) not in seen:
+            order.append(hit)
+            seen.add(id(ref))
+    for key, hit in owner.items():
+        if key not in seen:
+            order.append(hit)
+            seen.add(key)
+    return order
+
+
 def _is_stream_buffer_layout_mapped(model, optimizer_list, gpu_buffers):
     buf_param = gpu_buffers.get('param')
     buf_grad = gpu_buffers.get('grad')
@@ -128,51 +152,47 @@ def _is_stream_buffer_layout_mapped(model, optimizer_list, gpu_buffers):
         param_idx = end
 
     grad_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is not None:
-                    if buf_grad is None:
-                        return False
-                    end = grad_idx + p.grad.numel()
-                    if end > buf_grad.numel():
-                        return False
-                    if not _tensor_matches_buffer_view(p.grad, buf_grad[grad_idx:end]):
-                        return False
-                    grad_idx = end
+    for optimizer, p in _stream_order(model, optimizer_list):
+        if p.grad is not None:
+            if buf_grad is None:
+                return False
+            end = grad_idx + p.grad.numel()
+            if end > buf_grad.numel():
+                return False
+            if not _tensor_matches_buffer_view(p.grad, buf_grad[grad_idx:end]):
+                return False
+            grad_idx = end
 
     exp_avg_idx = 0
     exp_avg_sq_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p not in optimizer.state:
-                    continue
+    for optimizer, p in _stream_order(model, optimizer_list):
+        if p not in optimizer.state:
+            continue
 
-                state = optimizer.state[p]
-                momentum_key = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
-                if momentum_key:
-                    if buf_exp_avg is None:
-                        return False
-                    t = state[momentum_key]
-                    end = exp_avg_idx + t.numel()
-                    if end > buf_exp_avg.numel():
-                        return False
-                    if not _tensor_matches_buffer_view(t, buf_exp_avg[exp_avg_idx:end]):
-                        return False
-                    exp_avg_idx = end
+        state = optimizer.state[p]
+        momentum_key = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
+        if momentum_key:
+            if buf_exp_avg is None:
+                return False
+            t = state[momentum_key]
+            end = exp_avg_idx + t.numel()
+            if end > buf_exp_avg.numel():
+                return False
+            if not _tensor_matches_buffer_view(t, buf_exp_avg[exp_avg_idx:end]):
+                return False
+            exp_avg_idx = end
 
-                variance_key = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
-                if variance_key:
-                    if buf_exp_avg_sq is None:
-                        return False
-                    t = state[variance_key]
-                    end = exp_avg_sq_idx + t.numel()
-                    if end > buf_exp_avg_sq.numel():
-                        return False
-                    if not _tensor_matches_buffer_view(t, buf_exp_avg_sq[exp_avg_sq_idx:end]):
-                        return False
-                    exp_avg_sq_idx = end
+        variance_key = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
+        if variance_key:
+            if buf_exp_avg_sq is None:
+                return False
+            t = state[variance_key]
+            end = exp_avg_sq_idx + t.numel()
+            if end > buf_exp_avg_sq.numel():
+                return False
+            if not _tensor_matches_buffer_view(t, buf_exp_avg_sq[exp_avg_sq_idx:end]):
+                return False
+            exp_avg_sq_idx = end
 
     return matched_any
 
@@ -303,47 +323,43 @@ def _set_storage_streams(model, optimizer_list, gpu_buffers):
         model_size += ref.numel()
 
     grad_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is not None:
-                    end = grad_idx + p.grad.numel()
-                    _check_capacity(buf_grad, grad_idx, p.grad.numel(), "grad")
-                    my_ar = buf_grad[grad_idx:end]
-                    prev_shape = p.grad.size()
-                    p.grad.set_(my_ar, 0, tuple(prev_shape))
-                    grad_idx += p.grad.numel()
+    for optimizer, p in _stream_order(model, optimizer_list):
+        if p.grad is not None:
+            end = grad_idx + p.grad.numel()
+            _check_capacity(buf_grad, grad_idx, p.grad.numel(), "grad")
+            my_ar = buf_grad[grad_idx:end]
+            prev_shape = p.grad.size()
+            p.grad.set_(my_ar, 0, tuple(prev_shape))
+            grad_idx += p.grad.numel()
 
     ea_idx = 0
     eas_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p in optimizer.state:
-                    state = optimizer.state[p]
-                    mk = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
-                    if mk and buf_exp_avg is not None:
-                        t = state[mk]
-                        end = ea_idx + t.numel()
-                        _check_capacity(buf_exp_avg, ea_idx, t.numel(), mk)
-                        my_ar = buf_exp_avg[ea_idx:end]
-                        with torch.no_grad():
-                            tmp = t.clone()
-                            t.set_(my_ar, 0, tuple(t.size()))
-                            t.copy_(tmp)
-                        ea_idx += t.numel()
+    for optimizer, p in _stream_order(model, optimizer_list):
+        if p in optimizer.state:
+            state = optimizer.state[p]
+            mk = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
+            if mk and buf_exp_avg is not None:
+                t = state[mk]
+                end = ea_idx + t.numel()
+                _check_capacity(buf_exp_avg, ea_idx, t.numel(), mk)
+                my_ar = buf_exp_avg[ea_idx:end]
+                with torch.no_grad():
+                    tmp = t.clone()
+                    t.set_(my_ar, 0, tuple(t.size()))
+                    t.copy_(tmp)
+                ea_idx += t.numel()
 
-                    vk = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
-                    if vk and buf_exp_avg_sq is not None:
-                        t = state[vk]
-                        end = eas_idx + t.numel()
-                        _check_capacity(buf_exp_avg_sq, eas_idx, t.numel(), vk)
-                        my_ar = buf_exp_avg_sq[eas_idx:end]
-                        with torch.no_grad():
-                            tmp = t.clone()
-                            t.set_(my_ar, 0, tuple(t.size()))
-                            t.copy_(tmp)
-                        eas_idx += t.numel()
+            vk = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
+            if vk and buf_exp_avg_sq is not None:
+                t = state[vk]
+                end = eas_idx + t.numel()
+                _check_capacity(buf_exp_avg_sq, eas_idx, t.numel(), vk)
+                my_ar = buf_exp_avg_sq[eas_idx:end]
+                with torch.no_grad():
+                    tmp = t.clone()
+                    t.set_(my_ar, 0, tuple(t.size()))
+                    t.copy_(tmp)
+                eas_idx += t.numel()
 
     total_used = model_size + grad_idx + ea_idx + eas_idx
     total_alloc = sum(b.numel() for b in gpu_buffers.values() if b is not None)
@@ -489,56 +505,46 @@ def _initialize_streams_memory_saving(
         param_cpu_list.append((name, ref.size(), _cpu_pin_copy(ref.data)))
 
     grad_cpu_list = []
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    grad_cpu_list.append(None)
-                else:
-                    grad_cpu_list.append((p.grad.size(), _cpu_pin_copy(p.grad.data)))
+    for optimizer, p in _stream_order(model, optimizer_list):
+        if p.grad is None:
+            grad_cpu_list.append(None)
+        else:
+            grad_cpu_list.append((p.grad.size(), _cpu_pin_copy(p.grad.data)))
 
     opt_cpu_data = []
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                state = optimizer.state.get(p)
-                if not state:
-                    opt_cpu_data.append(None)
-                    continue
+    for optimizer, p in _stream_order(model, optimizer_list):
+        state = optimizer.state.get(p)
+        if not state:
+            opt_cpu_data.append(None)
+            continue
 
-                entry = {}
-                momentum_key = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
-                if momentum_key:
-                    t = state[momentum_key]
-                    entry['mk'] = momentum_key
-                    entry['exp_avg'] = (t.size(), _cpu_pin_copy(t.data))
+        entry = {}
+        momentum_key = 'exp_avg' if 'exp_avg' in state else ('next_m' if 'next_m' in state else None)
+        if momentum_key:
+            t = state[momentum_key]
+            entry['mk'] = momentum_key
+            entry['exp_avg'] = (t.size(), _cpu_pin_copy(t.data))
 
-                variance_key = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
-                if variance_key:
-                    t = state[variance_key]
-                    entry['vk'] = variance_key
-                    entry['exp_avg_sq'] = (t.size(), _cpu_pin_copy(t.data))
+        variance_key = 'exp_avg_sq' if 'exp_avg_sq' in state else ('next_v' if 'next_v' in state else None)
+        if variance_key:
+            t = state[variance_key]
+            entry['vk'] = variance_key
+            entry['exp_avg_sq'] = (t.size(), _cpu_pin_copy(t.data))
 
-                step = state.get('step', None)
-                if torch.is_tensor(step):
-                    entry['step'] = step.detach().cpu().clone()
-                else:
-                    entry['step'] = step
-                opt_cpu_data.append(entry)
+        # step 是标量，原样保留（不搬 CPU）：fused/capturable 优化器要求
+        # state['step'] 与参数同设备，搬到 CPU 后 fused AdamW 会直接报错。
+        entry['step'] = state.get('step', None)
+        opt_cpu_data.append(entry)
 
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                state = optimizer.state.get(p)
-                if state:
-                    for k in list(state.keys()):
-                        if torch.is_tensor(state[k]) and state[k].is_cuda:
-                            state[k] = torch.empty(0, device='cuda')
+    for optimizer, p in _stream_order(model, optimizer_list):
+        state = optimizer.state.get(p)
+        if state:
+            for k in list(state.keys()):
+                if torch.is_tensor(state[k]) and state[k].is_cuda:
+                    state[k] = torch.empty(0, device='cuda')
 
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                p.grad = None
+    for optimizer, p in _stream_order(model, optimizer_list):
+        p.grad = None
 
     for _, ref in model.named_parameters():
         ref.data = torch.empty(0, device='cuda')
@@ -573,68 +579,64 @@ def _initialize_streams_memory_saving(
 
     grad_idx = 0
     grad_entry_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                entry = grad_cpu_list[grad_entry_idx]
-                grad_entry_idx += 1
-                if entry is None:
-                    continue
-                orig_shape, cpu_data = entry
-                numel = cpu_data.numel()
-                end = grad_idx + numel
-                if end > reserved_grad_size:
-                    raise RuntimeError(
-                        f"Gradient stream overflow: need {end:,}, reserved {reserved_grad_size:,}"
-                    )
-                my_ar = gpu_buffers['grad'][grad_idx:end]
-                my_ar.copy_(cpu_data.view(-1))
-                p.grad = my_ar.view(orig_shape)
-                grad_idx = end
+    for optimizer, p in _stream_order(model, optimizer_list):
+        entry = grad_cpu_list[grad_entry_idx]
+        grad_entry_idx += 1
+        if entry is None:
+            continue
+        orig_shape, cpu_data = entry
+        numel = cpu_data.numel()
+        end = grad_idx + numel
+        if end > reserved_grad_size:
+            raise RuntimeError(
+                f"Gradient stream overflow: need {end:,}, reserved {reserved_grad_size:,}"
+            )
+        my_ar = gpu_buffers['grad'][grad_idx:end]
+        my_ar.copy_(cpu_data.view(-1))
+        p.grad = my_ar.view(orig_shape)
+        grad_idx = end
     del grad_cpu_list
 
     ea_idx = 0
     eas_idx = 0
     opt_idx = 0
-    for optimizer in optimizer_list:
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                entry = opt_cpu_data[opt_idx]
-                opt_idx += 1
-                if entry is None:
-                    continue
-                state = optimizer.state[p]
+    for optimizer, p in _stream_order(model, optimizer_list):
+        entry = opt_cpu_data[opt_idx]
+        opt_idx += 1
+        if entry is None:
+            continue
+        state = optimizer.state[p]
 
-                if entry.get('step') is not None:
-                    state['step'] = entry['step']
+        if entry.get('step') is not None:
+            state['step'] = entry['step']
 
-                if 'exp_avg' in entry:
-                    mk = entry['mk']
-                    orig_shape, cpu_data = entry['exp_avg']
-                    numel = cpu_data.numel()
-                    end = ea_idx + numel
-                    if end > exp_avg_size:
-                        raise RuntimeError(
-                            f"exp_avg stream overflow: need {end:,}, reserved {exp_avg_size:,}"
-                        )
-                    my_ar = gpu_buffers['exp_avg'][ea_idx:end]
-                    my_ar.copy_(cpu_data.view(-1))
-                    state[mk] = my_ar.view(orig_shape)
-                    ea_idx = end
+        if 'exp_avg' in entry:
+            mk = entry['mk']
+            orig_shape, cpu_data = entry['exp_avg']
+            numel = cpu_data.numel()
+            end = ea_idx + numel
+            if end > exp_avg_size:
+                raise RuntimeError(
+                    f"exp_avg stream overflow: need {end:,}, reserved {exp_avg_size:,}"
+                )
+            my_ar = gpu_buffers['exp_avg'][ea_idx:end]
+            my_ar.copy_(cpu_data.view(-1))
+            state[mk] = my_ar.view(orig_shape)
+            ea_idx = end
 
-                if 'exp_avg_sq' in entry:
-                    vk = entry['vk']
-                    orig_shape, cpu_data = entry['exp_avg_sq']
-                    numel = cpu_data.numel()
-                    end = eas_idx + numel
-                    if end > exp_avg_sq_size:
-                        raise RuntimeError(
-                            f"exp_avg_sq stream overflow: need {end:,}, reserved {exp_avg_sq_size:,}"
-                        )
-                    my_ar = gpu_buffers['exp_avg_sq'][eas_idx:end]
-                    my_ar.copy_(cpu_data.view(-1))
-                    state[vk] = my_ar.view(orig_shape)
-                    eas_idx = end
+        if 'exp_avg_sq' in entry:
+            vk = entry['vk']
+            orig_shape, cpu_data = entry['exp_avg_sq']
+            numel = cpu_data.numel()
+            end = eas_idx + numel
+            if end > exp_avg_sq_size:
+                raise RuntimeError(
+                    f"exp_avg_sq stream overflow: need {end:,}, reserved {exp_avg_sq_size:,}"
+                )
+            my_ar = gpu_buffers['exp_avg_sq'][eas_idx:end]
+            my_ar.copy_(cpu_data.view(-1))
+            state[vk] = my_ar.view(orig_shape)
+            eas_idx = end
     del opt_cpu_data
     gc.collect()
 

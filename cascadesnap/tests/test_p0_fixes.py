@@ -30,7 +30,7 @@ p.add_argument("--only", default="")
 p.add_argument("--pipelayer", default="/home/linzhicheng/download/pipelayer/src")
 args = p.parse_args()
 
-ALL_TESTS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+ALL_TESTS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"]
 if not args.only:
     # C++ 库的 PR_ADDR / free_space 是进程级 static：同一进程里创建多个 writer 会
     # 让空闲 slot 队列出现重复编号。生产中每进程一个 writer，因此每个测试单独起进程。
@@ -565,6 +565,60 @@ def t7():
         assert not bad, f"quant={quant}: recovered state != published step 100: {bad[:6]}"
         out.append(f"{'int8' if quant == '1' else 'fp32'}: in-flight slot{child['slots_in_flight']} "
                    f"ignored, recovered published slot{rec['slot']} step100 exact")
+    return "; ".join(out)
+
+
+# --------------------------------------------------------------------------- T8
+@run("T8")
+def t8():
+    """单卡 create_optimizer 路径、cf>1：checkpoint 步之后的普通 optimizer.step()
+    （trainer 直接调真实优化器）在 D2H 未完成时原位更新零拷贝存储 → 必须被拦住。"""
+    from checkpoint_eval.pccheck_utils import initialize
+    out = []
+    for quant in (False, True):
+        torch.manual_seed(0)
+        model = TinyGPT().to(DEV)
+        opt = torch.optim.AdamW(two_groups(model), fused=True)
+        for s_ in range(2):
+            fwd_bwd(model, opt, s_)
+            opt.step()
+        gpu_ar, _ = initialize(model, [opt], do_opt_step=False, separate_streams=True)
+        layout = msc.build_param_layout(model, opt, quant_moments=quant)
+        n = sum(li["param_size"] for li in layout)
+        fn = os.path.join(args.ckdir, f"t8_{int(quant)}.chk")
+        ck = msc.MultiStreamCheckpoint(param_layout=layout, gpu_ar=gpu_ar, total_size=n,
+                                       num_threads=4, lib_path=LIB, filename=fn,
+                                       num_streams=4, max_async=2, num_layer_groups=6,
+                                       metadata_path=fn + ".metadata.json",
+                                       quant_moments=quant)
+        try:
+            wrapped = ck.create_optimizer(opt, model)
+            real_borrow = ck.writer.borrow_chunk
+
+            def slow_borrow():
+                time.sleep(0.05)
+                return real_borrow()
+            ck.writer.borrow_chunk = slow_borrow
+            fwd_bwd(model, opt, 10)
+            wrapped.begin_checkpoint()
+            wrapped.step_with_callback()
+            torch.cuda.synchronize()
+            snap = snapshot_state(model, opt)
+            wrapped.finalize_checkpoint(wait=False)
+            for k in range(3):          # 普通步：trainer 直接调真实优化器
+                fwd_bwd(model, opt, 11 + k)
+                opt.step()
+            torch.cuda.synchronize()
+            deadline = time.time() + 120
+            while ck._checkpoint_slots and time.time() < deadline:
+                time.sleep(0.1)
+            ck.writer.borrow_chunk = real_borrow
+            bad, slot = verify_file(ck, model, opt, snapshot=snap)
+            assert not bad, (f"quant={quant}: checkpoint torn by later plain optimizer.step(): "
+                             f"{len(bad)} tensors, e.g. {bad[:4]}")
+            out.append(f"{'int8' if quant else 'fp32'} slot{slot} == step-snapshot")
+        finally:
+            ck.shutdown()
     return "; ".join(out)
 
 
