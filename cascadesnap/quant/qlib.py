@@ -191,13 +191,36 @@ def tensor_kind(name, p):
     return "other"
 
 
+def qdq_fp8_guard(x, block, sqrt_domain):
+    """fp8 e4m3 + per-block absmax scale; sqrt 域码字下限钳到最小次正规数（与 int8 防护同理）。"""
+    flat = x.detach().reshape(-1).float()
+    y = flat.sqrt() if sqrt_domain else flat
+    n = y.numel()
+    nb = (n + block - 1) // block
+    yp = torch.cat([y, y.new_zeros(nb * block - n)]).view(nb, block)
+    scale = yp.abs().amax(1, keepdim=True).clamp_min(1e-30) / 448.0
+    z = yp / scale
+    if sqrt_domain:
+        z = z.clamp(min=2.0 ** -9)
+    deq = (z.to(torch.float8_e4m3fn).float() * scale).view(-1)[:n]
+    if sqrt_domain:
+        deq = deq.square()
+    return deq.view_as(x)
+
+
+SCHEMES["fp8_guard"] = qdq_fp8_guard
+
+
 @torch.no_grad()
-def certificate(model, opt, scheme, block, step, betas, eps):
-    """Per-tensor error statistics, aggregated by kind and over the whole model."""
+def certificate(model, opt, scheme, block, step, betas, eps, scheme_v=None, block_v=None):
+    """Per-tensor error statistics, aggregated by kind and over the whole model.
+    scheme_v/block_v: 给二阶矩单独指定格式（默认与 scheme/block 相同），用于分解误差来源。"""
     b1, b2 = betas
     bc1 = 1 - b1 ** step
     bc2 = 1 - b2 ** step
     fn = SCHEMES[scheme]
+    fn_v = SCHEMES[scheme_v or scheme]
+    block_v = block_v or block
     agg = {}
 
     def acc(kind, key, v):
@@ -213,7 +236,7 @@ def certificate(model, opt, scheme, block, step, betas, eps):
             continue
         m, v = st["exp_avg"].float(), st["exp_avg_sq"].float()
         mt = fn(m, block, False)
-        vt = fn(v, block, True)
+        vt = fn_v(v, block_v, True)
         u = (m / bc1) / ((v / bc2).sqrt() + eps)
         ut = (mt / bc1) / ((vt / bc2).sqrt() + eps)
         du = ut - u
@@ -244,7 +267,8 @@ def certificate(model, opt, scheme, block, step, betas, eps):
         tot["v_err2"] += float((vt - v).pow(2).sum())
         tot["v2"] += float(v.pow(2).sum())
     out = {
-        "scheme": scheme, "block": block, "step": step,
+        "scheme": scheme if scheme_v is None else f"m:{scheme}/v:{scheme_v}", "block": block,
+        "block_v": block_v, "step": step,
         "rel_u": math.sqrt(tot["num_u"] / max(tot["den_u"], 1e-30)),
         "cos_u": tot["dot"] / math.sqrt(max(tot["nu2"] * tot["nut2"], 1e-30)),
         "rel_m": math.sqrt(tot["m_err2"] / max(tot["m2"], 1e-30)),
