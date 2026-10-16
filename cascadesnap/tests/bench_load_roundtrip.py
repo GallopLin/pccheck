@@ -92,7 +92,7 @@ def check(name, ok, detail=""):
 if args.phase == "save":
     from multistream_checkpoint import (
         MultiStreamCheckpoint, build_param_layout,
-        quantize_int8_blocks, dequantize_int8_blocks, QUANT_BLOCK_DEFAULT)
+        quantize_blocks, dequantize_blocks, QUANT_BLOCK_DEFAULT, QUANT_CODEC_DEFAULT)
 
     torch.manual_seed(0)
     model = GPT().to(dev)
@@ -155,11 +155,10 @@ if args.phase == "save":
                 for n, prm in model.named_parameters():
                     live = opt.state[prm][key].detach().float().view(-1)
                     if QUANT:
-                        q, sc = quantize_int8_blocks(live, QUANT_BLOCK_DEFAULT,
-                                                     sqrt_domain=sqrt_domain)
-                        live = dequantize_int8_blocks(q.cpu(), sc.cpu(),
-                                                      QUANT_BLOCK_DEFAULT,
-                                                      sqrt_domain=sqrt_domain)
+                        q, sc = quantize_blocks(live, QUANT_BLOCK_DEFAULT,
+                                                sqrt_domain=sqrt_domain, codec=QUANT_CODEC_DEFAULT)
+                        live = dequantize_blocks(q.cpu(), sc.cpu(), QUANT_BLOCK_DEFAULT,
+                                                 sqrt_domain=sqrt_domain, codec=QUANT_CODEC_DEFAULT)
                     out[n] = live.cpu().clone()
                 truth[key] = out
         wrapped.finalize_checkpoint(wait=False)

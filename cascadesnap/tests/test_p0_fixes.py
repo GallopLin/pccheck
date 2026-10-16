@@ -223,12 +223,22 @@ def t2():
     C = (1 - beta1) / ((1 - beta2) ** 0.5 * (1 - beta1 / beta2 ** 0.5))
     assert u_old > 100 * u_ref, f"test construction failed to trigger old blow-up ({u_old})"
     assert u_new <= 3 * C, f"guarded |u|={u_new} exceeds 3C={3 * C:.1f}"
+    # fp8 codec：sqrt 域同样不得出现 0；更新量同样有界
+    qf, sf = msc.quantize_blocks(v2, block, sqrt_domain=True, codec="fp8_e4m3")
+    vf = msc.dequantize_blocks(qf, sf, block, sqrt_domain=True, codec="fp8_e4m3")
+    assert bool((vf > 0).all()), "fp8 sqrt-domain value dequantized to 0"
+    qmf, smf = msc.quantize_blocks(m2, block, codec="fp8_e4m3")
+    mf = msc.dequantize_blocks(qmf, smf, block, codec="fp8_e4m3")
+    u_fp8 = (mf / (vf.sqrt() + eps)).abs().max().item()
+    assert u_fp8 <= 3 * C, f"fp8 guarded |u|={u_fp8} exceeds 3C"
+    rel = ((mf - m2).abs() / m2.abs()).max().item()
+    assert rel <= 2 ** -4 + 1e-6, f"fp8 relative error {rel} > 2^-4"
     # 非 sqrt 域保持对称 [-127,127] 不变
     x = torch.randn(block * 4, device=DEV)
     qx, _ = msc.quantize_int8_blocks(x, block)
     assert int(qx.min()) < 0 and int((qx == 0).sum()) >= 0
     return (f"no zero codes; max|u| exact={u_ref:.3g} old-quant={u_old:.3g} (blow-up) "
-            f"guarded={u_new:.3g} <= 3C={3 * C:.1f}")
+            f"guarded={u_new:.3g} fp8={u_fp8:.3g} <= 3C={3 * C:.1f}")
 
 
 # ------------------------------------------------------------- 文件读取工具
@@ -243,11 +253,14 @@ def read_slot(ck, slot=None):
     return mm, base, offs, meta
 
 
+CODEC = msc.QUANT_CODEC_DEFAULT  # PCCHECK_MS_QUANT_CODEC 选择 int8 / fp8_e4m3
+
+
 def expected_moment(t, quant, block, sqrt):
     if not quant:
         return t.detach().float().view(-1).cpu()
-    q, sc = msc.quantize_int8_blocks(t.detach().view(-1), block, sqrt_domain=sqrt)
-    return msc.dequantize_int8_blocks(q.cpu(), sc.cpu(), block, sqrt_domain=sqrt)
+    q, sc = msc.quantize_blocks(t.detach().view(-1), block, sqrt_domain=sqrt, codec=CODEC)
+    return msc.dequantize_blocks(q.cpu(), sc.cpu(), block, sqrt_domain=sqrt, codec=CODEC)
 
 
 def file_moment(mm, base, off, li, key, quant, block, sqrt):
@@ -259,7 +272,7 @@ def file_moment(mm, base, off, li, key, quant, block, sqrt):
     region = np.array(mm[base + off + o: base + off + o + nb * U]).reshape(nb, U)
     i8 = torch.from_numpy(region[:, :U - 1].copy()).view(torch.int8).reshape(-1)[:n]
     sc = torch.from_numpy(region[:, U - 1].copy())
-    return msc.dequantize_int8_blocks(i8, sc, block, sqrt_domain=sqrt)
+    return msc.dequantize_blocks(i8, sc, block, sqrt_domain=sqrt, codec=CODEC)
 
 
 def verify_file(ck, model, opt, snapshot=None, slot=None):

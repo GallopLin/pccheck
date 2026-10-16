@@ -26,7 +26,9 @@ import json
 
 _MS_PROFILE_LOCK = Lock()
 
-QUANT_BLOCK_DEFAULT = 2048  # moment int8 量化的默认 per-block 大小（1024 对齐的整数倍）
+QUANT_BLOCK_DEFAULT = 2048  # moment 量化的默认 per-block 大小（1024 对齐的整数倍）
+# 默认 codec：PCCHECK_MS_QUANT_CODEC 覆盖（int8 | fp8_e4m3）
+QUANT_CODEC_DEFAULT = os.environ.get("PCCHECK_MS_QUANT_CODEC", "int8")
 
 
 def _ms_profile_enabled() -> bool:
@@ -720,6 +722,8 @@ class MultiStreamCheckpoint:
         # 量化标志：param_layout 若已带量化元数据则据此推断，否则用显式参数
         self.quant_moments = bool(quant_moments or (param_layout and param_layout[0].get('quant')))
         self.quant_block = int(param_layout[0].get('quant_block') or quant_block) if param_layout else quant_block
+        self.quant_codec = ((param_layout[0].get('quant_codec') if param_layout else None)
+                            or QUANT_CODEC_DEFAULT) if self.quant_moments else None
         self.param_layout = param_layout
         self.total_size = total_size
         self.num_threads = num_threads
@@ -963,6 +967,7 @@ class MultiStreamCheckpoint:
             max_async=int(max_async),
             quant_moments=bool(self.quant_moments),
             quant_block=int(self.quant_block) if self.quant_moments else 0,
+            quant_codec=self.quant_codec,
             grouping=os.environ.get("PCCHECK_GROUPING", "split"),
             data_direct=os.environ.get("PCCHECK_DATA_DIRECT", "1"),
             native_async_direct=os.environ.get("PCCHECK_NATIVE_ASYNC_DIRECT", "1"),
@@ -1202,7 +1207,8 @@ class MultiStreamCheckpoint:
                 }
                 if q:
                     pentry["quant"] = {
-                        "format": "interleaved-block",  # v3: 每 block [int8*B | fp32 scale]
+                        "format": "interleaved-block",  # v3: 每 block [1 字节码字*B | fp32 scale]
+                        "codec": info.get("quant_codec") or "int8",
                         "block": int(info.get("quant_block", 0)),
                         "numel": int(info.get("q_numel", 0)),
                         "nblocks": int(info.get("q_nblocks", 0)),
@@ -1269,8 +1275,9 @@ class MultiStreamCheckpoint:
             "quant_moments": {
                 "enabled": bool(getattr(self, 'quant_moments', False)),
                 "block": int(getattr(self, 'quant_block', 0)),
-                "format": "per-block symmetric int8, interleaved [int8*B|fp32 scale] "
-                          "units; exp_avg_sq in sqrt domain",
+                "codec": getattr(self, 'quant_codec', None),
+                "format": "per-block absmax-scaled 1-byte codes (int8 or fp8_e4m3), interleaved "
+                          "[codes*B|fp32 scale] units; exp_avg_sq in sqrt domain with a nonzero floor",
             },
             "extra_state": {
                 "enabled": extra_floats > 0,
@@ -1366,7 +1373,8 @@ class MultiStreamCheckpoint:
                     # 期望值必须在 GPU 上量化：CPU 与 GPU 的 amax/127 与舍入并非逐位一致
                     # （实测约 1e-7 比例的码字差 1），生产路径在 GPU 上量化
                     dev = "cuda" if torch.cuda.is_available() else "cpu"
-                    qq, sc = quantize_int8_blocks(t.reshape(-1).to(dev), blk, sqrt_domain=sq)
+                    qq, sc = quantize_blocks(t.reshape(-1).to(dev), blk, sqrt_domain=sq,
+                                             codec=self.quant_codec)
                     nb, U = int(li["q_nblocks"]), _quant_unit_floats(blk)
                     oo = base + offs[sid] + int(li[f"{key}_offset"])
                     region = np.array(mm[oo:oo + nb * U]).reshape(nb, U)
@@ -2200,7 +2208,8 @@ class MultiStreamCheckpoint:
                                         else:
                                             _pack_moment_int8(bufs[2], li["exp_avg_offset"],
                                                               ea.detach().view(-1), q_block,
-                                                              sqrt=False, ps=ps, pe=pe)
+                                                              sqrt=False, ps=ps, pe=pe,
+                                                              codec=self._checkpoint.quant_codec)
                                     else:
                                         ea_off = li["exp_avg_offset"] + ps
                                         if ea is None:
@@ -2217,7 +2226,8 @@ class MultiStreamCheckpoint:
                                         else:
                                             _pack_moment_int8(bufs[3], li["exp_avg_sq_offset"],
                                                               eas.detach().view(-1), q_block,
-                                                              sqrt=True, ps=ps, pe=pe)
+                                                              sqrt=True, ps=ps, pe=pe,
+                                                              codec=self._checkpoint.quant_codec)
                                     else:
                                         eas_off = li["exp_avg_sq_offset"] + ps
                                         if eas is None:
@@ -2329,7 +2339,7 @@ class MultiStreamCheckpoint:
                     bufs[sid][off: off + sz].zero_()
                 else:
                     _pack_moment_int8(bufs[sid], li[f"{key}_offset"], t.detach().view(-1),
-                                      q_block, sqrt=sqrt, ps=ps, pe=pe)
+                                      q_block, sqrt=sqrt, ps=ps, pe=pe, codec=self.quant_codec)
 
     def save_full_checkpoint(self, sync: bool = True, stream: Optional[torch.cuda.Stream] = None) -> Tuple[int, float]:
         """
@@ -2780,16 +2790,26 @@ def piece_extent(layer_info, stream, ps, pe):
     return base + ub_s * unit, (ub_e - ub_s) * unit
 
 
-def quantize_int8_blocks(x, block, sqrt_domain=False):
-    """per-block 对称 int8 量化。返回 (int8[N], scale_fp32[nblocks])。
+QUANT_CODECS = ("int8", "fp8_e4m3")
+_FP8_MAX = 448.0          # float8_e4m3fn 最大有限值
+_FP8_MIN_SUB = 2.0 ** -9  # float8_e4m3fn 最小正次正规数
+
+
+def quantize_blocks(x, block, sqrt_domain=False, codec="int8"):
+    """per-block absmax 缩放的 1 字节量化。返回 (codes 以 int8 视图存放[N], scale_fp32[nblocks])。
+
+    codec="int8"：对称线性 int8，步长 Δ=amax/127，逐元素绝对误差 ≤ Δ/2。
+    codec="fp8_e4m3"：scale=amax/448 后转 float8_e4m3fn（3 位尾数），逐元素相对误差
+        ≤ 2^-4（正规数范围内），与块内动态范围无关——E1 实测线性 int8 的更新方向
+        误差随训练增长（块内 √v 动态范围变大），fp8 保持约 3.7%。
     sqrt_domain=True 用于非负、动态范围大的 exp_avg_sq（在 sqrt 域量化，恢复端平方还原）。
 
-    sqrt 域下溢防护：s=√v 小于半个量化步长时，普通舍入得到 0，恢复后 Adam
-    分母只剩 ε，而同一元素的 exp_avg 可能非零 → 更新量 ≈ m/ε 爆炸。
-    这里把 sqrt 域的码字下限钳到 1（还原值 = 一个量化步长 Δ），保证
-    s̃ ≥ max(s/2, Δ/2)，更新量被 Adam 自身界的常数倍约束
-    （见 THESIS_FUSED_AND_QUANT_THEORY_20261014.md 定理 1）。
-    下限只会让 v 变大（更新更保守），从不让它变小；恢复端无需改动。"""
+    sqrt 域下溢防护：s=√v 若被量化为 0，恢复后 Adam 分母只剩 ε，而同一元素的
+    exp_avg 可能非零 → 更新量 ≈ m/ε 爆炸。int8 把码字下限钳到 1（还原值 = Δ），
+    fp8 把缩放后的值下限钳到最小次正规数。下限只会让 v 变大（更新更保守），
+    从不让它变小；恢复端无需改动（见 THESIS_FUSED_AND_QUANT_THEORY_20261014.md 定理 1）。"""
+    if codec not in QUANT_CODECS:
+        raise ValueError(f"unknown quant codec {codec!r}")
     flat = x.detach().reshape(-1).float()
     n = flat.numel()
     y = flat.sqrt() if sqrt_domain else flat
@@ -2798,18 +2818,31 @@ def quantize_int8_blocks(x, block, sqrt_domain=False):
     if pad:
         y = torch.cat([y, y.new_zeros(pad)])
     yb = y.view(nb, block)
-    scale = yb.abs().amax(dim=1, keepdim=True).clamp_min(1e-30) / 127.0
-    lo = 1 if sqrt_domain else -127
-    q = torch.clamp((yb / scale).round(), lo, 127).to(torch.int8).view(-1)[:n]
+    amax = yb.abs().amax(dim=1, keepdim=True).clamp_min(1e-30)
+    if codec == "int8":
+        scale = amax / 127.0
+        lo = 1 if sqrt_domain else -127
+        q = torch.clamp((yb / scale).round(), lo, 127).to(torch.int8).view(-1)[:n]
+    else:
+        scale = amax / _FP8_MAX
+        z = (yb / scale).clamp(-_FP8_MAX, _FP8_MAX)
+        if sqrt_domain:
+            z = z.clamp(min=_FP8_MIN_SUB)
+        q = z.to(torch.float8_e4m3fn).view(torch.int8).view(-1)[:n]
     return q.contiguous(), scale.view(-1).to(torch.float32).contiguous()
 
 
-def dequantize_int8_blocks(q_i8, scale, block, sqrt_domain=False):
-    """int8 + per-block scale 还原为 fp32（供恢复端/校验使用）。"""
-    n = q_i8.numel()
+def dequantize_blocks(codes, scale, block, sqrt_domain=False, codec="int8"):
+    """codes（int8 视图）+ per-block scale 还原为 fp32（供恢复端/校验使用）。"""
+    n = codes.numel()
     nb = scale.numel()
     pad = nb * block - n
-    qf = q_i8.to(torch.float32)
+    if codec == "int8":
+        qf = codes.to(torch.float32)
+    elif codec == "fp8_e4m3":
+        qf = codes.contiguous().view(torch.float8_e4m3fn).to(torch.float32)
+    else:
+        raise ValueError(f"unknown quant codec {codec!r}")
     if pad:
         qf = torch.cat([qf, qf.new_zeros(pad)])
     deq = (qf.view(nb, block) * scale.view(nb, 1)).view(-1)[:n]
@@ -2818,7 +2851,17 @@ def dequantize_int8_blocks(q_i8, scale, block, sqrt_domain=False):
     return deq
 
 
-def _pack_moment_int8(buf, base_float, moment_flat, block, sqrt, ps=0, pe=None):
+def quantize_int8_blocks(x, block, sqrt_domain=False):
+    """兼容旧接口：int8 codec。"""
+    return quantize_blocks(x, block, sqrt_domain=sqrt_domain, codec="int8")
+
+
+def dequantize_int8_blocks(q_i8, scale, block, sqrt_domain=False):
+    """兼容旧接口：int8 codec。"""
+    return dequantize_blocks(q_i8, scale, block, sqrt_domain=sqrt_domain, codec="int8")
+
+
+def _pack_moment_int8(buf, base_float, moment_flat, block, sqrt, ps=0, pe=None, codec="int8"):
     """把 moment 张量的 [ps, pe) 片段量化写入 buf（fp32 视图）的交错单元区。
 
     交错布局 v3：每 block 一个单元 [block/4 个 float 的 int8 负载 | 1 个 fp32 scale]。
@@ -2832,7 +2875,7 @@ def _pack_moment_int8(buf, base_float, moment_flat, block, sqrt, ps=0, pe=None):
     assert ps % block == 0 and (pe == n or pe % block == 0), (
         f"_pack_moment_int8 piece [{ps},{pe}) not aligned to block {block} (numel={n})")
     unit = _quant_unit_floats(block)
-    q, sc = quantize_int8_blocks(moment_flat[ps:pe], block, sqrt_domain=sqrt)
+    q, sc = quantize_blocks(moment_flat[ps:pe], block, sqrt_domain=sqrt, codec=codec)
     seg = pe - ps
     nb = (seg + block - 1) // block
     pad = nb * block - seg
@@ -2846,7 +2889,7 @@ def _pack_moment_int8(buf, base_float, moment_flat, block, sqrt, ps=0, pe=None):
 
 
 def build_param_layout(model, optimizer, master_accessor=None,
-                       quant_moments=False, quant_block=QUANT_BLOCK_DEFAULT):
+                       quant_moments=False, quant_block=QUANT_BLOCK_DEFAULT, quant_codec=None):
     """
     构建参数布局信息。
 
@@ -2908,6 +2951,7 @@ def build_param_layout(model, optimizer, master_accessor=None,
             # 量化元数据（quant 时有效；v3 交错布局）
             'quant': bool(quant_moments),
             'quant_block': int(quant_block) if quant_moments else 0,
+            'quant_codec': (quant_codec or QUANT_CODEC_DEFAULT) if quant_moments else None,
             'q_numel': int(size),
             'q_nblocks': int(ea_nb),
             'q_unit_floats': int(ea_unit),
