@@ -41,8 +41,8 @@ toks = qlib.load_tokens("train")
 batches = qlib.Batches(toks, a.bs, a.seq, seed=a.seed)
 model = qlib.make_model(a.model, seed=a.seed)
 opt = qlib.make_opt(model, a.lr, betas, a.wd)
-configs = [("int8_guard", b) for b in (256, 1024, 2048, 4096)] + \
-          [("int8_noguard", 2048), ("fp8_e4m3", 2048), ("bf16", 0)]
+configs = [("int8_guard", b) for b in (64, 128, 256, 512, 1024, 2048, 4096)] + \
+          [("int8_noguard", 256), ("int8_noguard", 2048), ("fp8_e4m3", 256), ("fp8_e4m3", 2048), ("bf16", 0)]
 meta = vars(a)
 t0 = time.time()
 with open(a.out, "w") as f:

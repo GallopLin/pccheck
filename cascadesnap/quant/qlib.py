@@ -249,8 +249,9 @@ def certificate(model, opt, scheme, block, step, betas, eps):
         "cos_u": tot["dot"] / math.sqrt(max(tot["nu2"] * tot["nut2"], 1e-30)),
         "rel_m": math.sqrt(tot["m_err2"] / max(tot["m2"], 1e-30)),
         "rel_v": math.sqrt(tot["v_err2"] / max(tot["v2"], 1e-30)),
-        "guard_frac": tot["guard"] / max(tot["n"], 1),
-        "danger_frac": tot["danger"] / max(tot["n"], 1),
+        # 这两项按 int8 的量化步长统计，只对 int8 方案有意义
+        "guard_frac": tot["guard"] / max(tot["n"], 1) if scheme.startswith("int8") else None,
+        "danger_frac": tot["danger"] / max(tot["n"], 1) if scheme.startswith("int8") else None,
         "u_max": tot["u_max"], "ut_max": tot["ut_max"],
         "by_kind": {k: {kk: (sorted(vv)[len(vv) // 2], max(vv)) for kk, vv in d.items()}
                     for k, d in agg.items()},
