@@ -1,7 +1,7 @@
 From 6100aad813ca2acef44e2ec973ca48b488ac504d Mon Sep 17 00:00:00 2001
 From: GallopLin <1317864235@qq.com>
 Date: Thu, 15 Oct 2026 00:15:51 -0700
-Subject: [PATCH 2/3] feat: CascadeSnap / PCcheck trainer integrations and PP
+Subject: [PATCH 2/7] feat: CascadeSnap / PCcheck trainer integrations and PP
  runners (snapshot)
 
 Snapshot of the HF-transformers side used for the CascadeSnap experiments,

@@ -1,0 +1,383 @@
+From 1283e63365d036481e384ccb7aece4afca213d94 Mon Sep 17 00:00:00 2001
+From: GallopLin <1317864235@qq.com>
+Date: Thu, 15 Oct 2026 06:10:26 -0700
+Subject: [PATCH 5/7] feat(bench): single-GPU INT8 moments, ablation switches,
+ LR-scheduler fix, step timing in all trainers
+
+- trainer_multistream: PCCHECK_MS_QUANT=1 restores the single-GPU int8
+  moment path (lost in the merge tree); scheduler and grad-scaler state are
+  attached to the extra blob
+- LR scheduler is now stepped on checkpoint steps, before finalize, so the
+  captured state matches the update (it used to be skipped, so the LR
+  schedule drifted with cf)
+- ablation switches: PCCHECK_MS_SCHEDULE=progressive|after_step and
+  PCCHECK_MS_WAR=group|global
+- StepTimer in trainer_{multistream,pccheck,checkfreq,gpm}; CheckFreq/GPM
+  warmup now from PCCHECK_BENCH_WARMUP like the others
+- trainer_pccheck drains the tail checkpoint before stopping the monitor
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/transformers/trainer_checkfreq.py   |   8 +-
+ src/transformers/trainer_gpm.py         |   8 +-
+ src/transformers/trainer_multistream.py | 106 ++++++++++++++++++------
+ src/transformers/trainer_pccheck.py     |   9 ++
+ 4 files changed, 105 insertions(+), 26 deletions(-)
+
+diff --git a/src/transformers/trainer_checkfreq.py b/src/transformers/trainer_checkfreq.py
+index 21372af088..5c29b0591a 100644
+--- a/src/transformers/trainer_checkfreq.py
++++ b/src/transformers/trainer_checkfreq.py
+@@ -225,6 +225,7 @@ import torch.multiprocessing as mp
+ from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock
+ import ctypes
+ 
++from checkpoint_eval.bench_step_timer import StepTimer
+ from checkpoint_eval.checkfreq.chk_manager import CFCheckpoint
+ from checkpoint_eval.checkfreq.utils import save_checkpoint
+ 
+@@ -1784,7 +1785,8 @@ class CheckFreqTrainer:
+ 
+         steps_since_checkp = 0
+         checkpoints = 0
+-        warmup = 3  # 增加 warmup：OPT-2.7B 需要 ~50 步让 CUDA 内存分配器稳定
++        warmup = int(os.environ.get("PCCHECK_BENCH_WARMUP", "3"))  # 与其他 trainer 统一由环境变量控制
++        _step_timer = StepTimer("checkfreq", warmup=warmup)
+ 
+         # 统一计时口径：只在 warmup 结束后开始计时一次。
+         start_training = None
+@@ -1817,6 +1819,7 @@ class CheckFreqTrainer:
+             step = -1
+             starts = time.time()
+             for step, inputs in enumerate(epoch_iterator):
++                _step_is_ckpt = False
+                 if step == self.bench_total_steps:
+                     break
+ 
+@@ -1934,6 +1937,7 @@ class CheckFreqTrainer:
+                             save_checkpoint("./checkpoint-{epoch}-{it}.chk", self.path_to_pmem,filepath, additional_snapshot, chk, active_snapshot, in_progress_snapshot, lock, \
+                                     0, step, last_chk_it, change, profile_snap, sync=False)
+                             steps_since_checkp = 0
++                            _step_is_ckpt = True
+                             checkpoints += 1
+                     else:
+                         steps_since_checkp += 1
+@@ -1951,6 +1955,7 @@ class CheckFreqTrainer:
+                 if self.control.should_epoch_stop or self.control.should_training_stop:
+                     break
+ 
++                _step_timer.mark(step, _step_is_ckpt)
+                 #logger.info(f"Step {step} took {time.time()-starts}")
+                 print(f"Step {step} took {time.time()-starts}")
+                 starts = time.time()
+@@ -1966,6 +1971,7 @@ class CheckFreqTrainer:
+             total_train_time = time.time()-start_training
+             print(f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {step}, Number of checkpoints: {checkpoints}")
+             print(f"EXECUTION TIME: {total_train_time} sec")
++            _step_timer.dump({"execution_time_s": float(total_train_time), "cfreq": int(self.cfreq)})
+ 
+ 
+             if step < 0:
+diff --git a/src/transformers/trainer_gpm.py b/src/transformers/trainer_gpm.py
+index 003567c4c6..53ea1f3630 100644
+--- a/src/transformers/trainer_gpm.py
++++ b/src/transformers/trainer_gpm.py
+@@ -225,6 +225,7 @@ import torch.multiprocessing as mp
+ from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock
+ import ctypes
+ 
++from checkpoint_eval.bench_step_timer import StepTimer
+ from checkpoint_eval.gpm.gpm_manager import GPMCheckpoint
+ from checkpoint_eval.pccheck_utils import initialize, get_total_size
+ 
+@@ -1771,7 +1772,8 @@ class GPMTrainer:
+         steps_since_checkp = 0
+         checkpoints = 0
+         # 统一计时口径：各方法 warmup 对齐为 10。大模型需要更多步来让 CUDA 稳定。
+-        warmup = 3
++        warmup = int(os.environ.get("PCCHECK_BENCH_WARMUP", "3"))  # 与其他 trainer 统一由环境变量控制
++        _step_timer = StepTimer("gpm", warmup=warmup)
+ 
+         start_training = None
+         started_timing = False
+@@ -1803,6 +1805,7 @@ class GPMTrainer:
+             step = -1
+             starts = time.time()
+             for step, inputs in enumerate(epoch_iterator):
++                _step_is_ckpt = False
+                 if step == self.bench_total_steps:
+                     break
+ 
+@@ -1924,6 +1927,7 @@ class GPMTrainer:
+                                 )
+                             chk._checkpoint(iter_chk=step)
+                             steps_since_checkp = 0
++                            _step_is_ckpt = True
+                             checkpoints += 1
+                     else:
+                         steps_since_checkp += 1
+@@ -1940,6 +1944,7 @@ class GPMTrainer:
+                 if self.control.should_epoch_stop or self.control.should_training_stop:
+                     break
+ 
++                _step_timer.mark(step, _step_is_ckpt)
+                 #logger.info(f"Step {step} took {time.time()-starts}")
+                 print(f"Step {step} took {time.time()-starts}")
+                 starts = time.time()
+@@ -1955,6 +1960,7 @@ class GPMTrainer:
+                 f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {step}, Number of checkpoints: {checkpoints}"
+             )
+             print(f"EXECUTION TIME: {total_train_time} sec")
++            _step_timer.dump({"execution_time_s": float(total_train_time), "cfreq": int(self.cfreq)})
+ 
+ 
+             if step < 0:
+diff --git a/src/transformers/trainer_multistream.py b/src/transformers/trainer_multistream.py
+index ef7826c38e..7f7485f52c 100644
+--- a/src/transformers/trainer_multistream.py
++++ b/src/transformers/trainer_multistream.py
+@@ -241,6 +241,7 @@ import torch.multiprocessing as mp
+ from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock
+ import ctypes
+ 
++from checkpoint_eval.bench_step_timer import StepTimer
+ from checkpoint_eval.pccheck_utils import initialize, get_total_size, set_storage
+ from checkpoint_eval.pccheck.multistream_checkpoint import MultiStreamCheckpoint, build_param_layout
+ 
+@@ -2139,8 +2140,18 @@ class MultistreamTrainer:
+         set_storage(model, [self.optimizer], gpu_ar)
+         torch.cuda.empty_cache()
+         
++        ms_quant = os.environ.get("PCCHECK_MS_QUANT", "0") == "1"
++        ms_qblock = None
+         if self.cfreq > 0:
+-            param_layout = build_param_layout(model, self.optimizer)
++            if ms_quant:
++                # INT8 moments：布局按 packed 流计算；MultiStreamCheckpoint 发现 moment
++                # 缓冲与 packed 尺寸不符时自动改用独立暂存，参数仍零拷贝。
++                from checkpoint_eval.pccheck.multistream_checkpoint import QUANT_BLOCK_DEFAULT
++                ms_qblock = int(os.environ.get("PCCHECK_MS_QUANT_BLOCK", QUANT_BLOCK_DEFAULT))
++                param_layout = build_param_layout(model, self.optimizer,
++                                                  quant_moments=True, quant_block=ms_qblock)
++            else:
++                param_layout = build_param_layout(model, self.optimizer)
+             mp.set_start_method("spawn", force=True)
+         else:
+             param_layout = None
+@@ -2151,6 +2162,7 @@ class MultistreamTrainer:
+         # OPT-2.7B 需要 ~50 步让 set_storage 的瞬态开销收敛。
+         start_training = None
+         warmup = int(os.environ.get("PCCHECK_BENCH_WARMUP", "50"))
++        _step_timer = StepTimer("cascadesnap", warmup=warmup)
+         started_timing = False
+         torch_profiler = None
+         torch_profiler_active = False
+@@ -2278,6 +2290,7 @@ class MultistreamTrainer:
+             step = -1
+             starts = time.time()
+             for step, inputs in enumerate(epoch_iterator):
++                _step_is_ckpt = False
+                 if step == self.bench_total_steps:
+                     break
+                 _start_torch_profiler(step)
+@@ -2395,9 +2408,18 @@ class MultistreamTrainer:
+                                     filename=self.multistream_checkpoint_file,
+                                     max_async=self.max_async,
+                                     metadata_path=self.multistream_metadata_file,
++                                    quant_moments=ms_quant,
++                                    quant_block=ms_qblock or 0,
+                                 )
+                                 self._ms_checkpoint = ms_checkpoint
+                                 ms_optimizer = ms_checkpoint.create_optimizer(self.optimizer, model)
++                                # 非分层状态随 slot 原子发布：scheduler 在 finalize 之前步进，
++                                # 捕获到的是"第 step 步之后"的状态，与参数/moments 同一时刻
++                                ms_checkpoint.attach_extra_state(
++                                    scheduler=self.lr_scheduler,
++                                    scaler=self.scaler if self.do_grad_scaling else None)
++                                if ms_quant:
++                                    ms_checkpoint.attach_moment_sources(model, self.optimizer)
+                                 if os.environ.get("PCCHECK_VERBOSE", "0") == "1":
+                                     print(
+                                         f"MultiStreamCheckpoint initialized with {self.num_layer_groups} layer groups"
+@@ -2413,37 +2435,71 @@ class MultistreamTrainer:
+                                     checkpoint_index=int(checkpoints),
+                                 )
+                             
+-                            # 使用 step_with_callback 替代 optimizer.step()
+-                            # 分批更新直接调底层优化器，绕过了 GradScaler.step（Trainer 自己的
+-                            # scaler，或 fp16 下 Accelerate 包装层里的 scaler），所以要在这里
+-                            # 复刻它的语义：梯度裁剪可能已 unscale_（重复调用会抛错）；出现
+-                            # inf/nan 时跳过本次更新，本步也不做 checkpoint（steps_since_checkp
+-                            # 不清零，下一步重试）；最后必须 update()，否则下一步再 unscale_ 报错。
++                            # 消融开关（默认即 CascadeSnap 完整机制）：
++                            #   PCCHECK_MS_SCHEDULE=progressive  边更新边保存（逐组触发）
++                            #                     =after_step   整步更新后一次性提交全部组（L0 对照）
++                            #   PCCHECK_MS_WAR=group   更新每组前只等该组上一份拷贝
++                            #                =global  更新前等上一份 checkpoint 的全部拷贝
++                            ms_schedule = os.environ.get("PCCHECK_MS_SCHEDULE", "progressive")
++                            ms_war = os.environ.get("PCCHECK_MS_WAR", "group")
++
++                            def _ms_step_scheduler():
++                                if not isinstance(self.lr_scheduler,
++                                                  torch.optim.lr_scheduler.ReduceLROnPlateau):
++                                    self.lr_scheduler.step()
++
+                             optimizer_was_run = True
+-                            if self.do_grad_scaling:
+-                                scaler, scaled_opt = self.scaler, self.optimizer
++                            if ms_schedule == "after_step":
++                                # 优化器 step 前由 install_update_guard 全局等待
++                                if self.do_grad_scaling:
++                                    scale_before = self.scaler.get_scale()
++                                    self.scaler.step(self.optimizer)
++                                    self.scaler.update()
++                                    optimizer_was_run = scale_before <= self.scaler.get_scale()
++                                else:
++                                    self.optimizer.step()
++                                    optimizer_was_run = (
++                                        not self.accelerator.optimizer_step_was_skipped
++                                    )
++                                if optimizer_was_run:
++                                    _ms_step_scheduler()
++                                    ms_checkpoint.save_full_checkpoint(sync=False)
+                             else:
+-                                scaler = getattr(self.accelerator, "scaler", None)
+-                                scaled_opt = getattr(self.optimizer, "optimizer", self.optimizer)
+-                            if scaler is not None and scaler.is_enabled():
+-                                opt_state = scaler._per_optimizer_states[id(scaled_opt)]
+-                                if opt_state["stage"].name != "UNSCALED":
+-                                    scaler.unscale_(scaled_opt)
+-                                found_inf = sum(
+-                                    v.item() for v in opt_state["found_inf_per_device"].values()
+-                                )
+-                                if found_inf:
+-                                    optimizer_was_run = False
++                                if ms_war == "global":
++                                    ms_checkpoint.wait_copies_before_update()
++                                # 分批更新直接调底层优化器，绕过了 GradScaler.step（Trainer 自己的
++                                # scaler，或 fp16 下 Accelerate 包装层里的 scaler），所以要在这里
++                                # 复刻它的语义：梯度裁剪可能已 unscale_（重复调用会抛错）；出现
++                                # inf/nan 时跳过本次更新，本步也不做 checkpoint（steps_since_checkp
++                                # 不清零，下一步重试）；最后必须 update()，否则下一步再 unscale_ 报错。
++                                if self.do_grad_scaling:
++                                    scaler, scaled_opt = self.scaler, self.optimizer
+                                 else:
++                                    scaler = getattr(self.accelerator, "scaler", None)
++                                    scaled_opt = getattr(self.optimizer, "optimizer", self.optimizer)
++                                use_scaler = scaler is not None and scaler.is_enabled()
++                                if use_scaler:
++                                    opt_state = scaler._per_optimizer_states[id(scaled_opt)]
++                                    if opt_state["stage"].name != "UNSCALED":
++                                        scaler.unscale_(scaled_opt)
++                                    found_inf = sum(
++                                        v.item() for v in opt_state["found_inf_per_device"].values()
++                                    )
++                                    optimizer_was_run = not found_inf
++                                if optimizer_was_run:
+                                     ms_optimizer.begin_checkpoint()
+                                     ms_optimizer.step_with_callback()
++                                    # scheduler 先于 finalize 步进：extra blob 捕获的 LR 状态
++                                    # 与本步更新后的参数/moments 一致（旧实现在 checkpoint 步
++                                    # 跳过 scheduler，学习率曲线随 cf 漂移）
++                                    _ms_step_scheduler()
+                                     ms_optimizer.finalize_checkpoint(wait=False)
+-                                scaler.update()
+-                            else:
+-                                ms_optimizer.step_with_checkpoint(wait=False)
++                                if use_scaler:
++                                    scaler.update()
+ 
+                             if optimizer_was_run:
+                                 steps_since_checkp = 0
++                                _step_is_ckpt = True
+                                 checkpoints += 1
+                         else:
+                             # cfreq == 0: 不做 checkpoint，执行普通 step
+@@ -2496,7 +2552,7 @@ class MultistreamTrainer:
+                         start_training = time.time()
+                         started_timing = True
+ 
+-                    # Learning rate scheduler step (only when not checkpointing with multistream)
++                    # Learning rate scheduler step（checkpoint 步已在 finalize 之前步进过）
+                     if not (should_enter_checkpoint_block and self.cfreq > 0):
+                         if optimizer_was_run:
+                             if not isinstance(
+@@ -2532,6 +2588,7 @@ class MultistreamTrainer:
+                 if self.control.should_epoch_stop or self.control.should_training_stop:
+                     break
+ 
++                _step_timer.mark(step, _step_is_ckpt)
+                 # Printing every step is extremely expensive and can dominate short benchmarks.
+                 # Enable detailed step timing with: PCCHECK_STEP_LOG_EVERY=N (e.g. 10)
+                 step_log_every = int(os.environ.get("PCCHECK_STEP_LOG_EVERY", "0") or "0")
+@@ -2555,6 +2612,7 @@ class MultistreamTrainer:
+                 f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {step}, Number of checkpoints: {checkpoints}"
+             )
+             print(f"EXECUTION TIME: {total_train_time} sec")
++            _step_timer.dump({"execution_time_s": float(total_train_time), "cfreq": int(self.cfreq)})
+ 
+ 
+             if step < 0:
+diff --git a/src/transformers/trainer_pccheck.py b/src/transformers/trainer_pccheck.py
+index c91ce5acea..831628deda 100644
+--- a/src/transformers/trainer_pccheck.py
++++ b/src/transformers/trainer_pccheck.py
+@@ -241,6 +241,7 @@ import torch.multiprocessing as mp
+ from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock
+ import ctypes
+ 
++from checkpoint_eval.bench_step_timer import StepTimer
+ from checkpoint_eval.pccheck.chk_monitor import Chk_monitor
+ from checkpoint_eval.pccheck_utils import initialize, get_total_size, set_storage
+ 
+@@ -2116,6 +2117,7 @@ class PCcheckTrainer:
+         # OPT-2.7B 需要 ~50 步让 set_storage 的瞬态开销收敛（step 50+ 稳态差异 <7%）。
+         start_training = None
+         warmup = int(os.environ.get("PCCHECK_BENCH_WARMUP", "50"))
++        _step_timer = StepTimer("pccheck", warmup=warmup)
+         started_timing = False
+ 
+         for epoch in range(1):  # range(epochs_trained, num_train_epochs):
+@@ -2154,6 +2156,7 @@ class PCcheckTrainer:
+             step = -1
+             starts = time.time()
+             for step, inputs in enumerate(epoch_iterator):
++                _step_is_ckpt = False
+                 if step == self.bench_total_steps:
+                     break
+ 
+@@ -2289,6 +2292,7 @@ class PCcheckTrainer:
+                             print("save checkpoint!!!")
+                             chk_monitor.save()
+                             steps_since_checkp = 0
++                            _step_is_ckpt = True
+                             checkpoints += 1
+                         # 注意：不再在 checkpoint 次数上重置计时。
+                         # 计时在 warmup 结束后统一开始。
+@@ -2313,11 +2317,15 @@ class PCcheckTrainer:
+                 if self.control.should_epoch_stop or self.control.should_training_stop:
+                     break
+ 
++                _step_timer.mark(step, _step_is_ckpt)
+                 # logger.info(f"Step {step} took {time.time()-starts}")
+                 print(f"Step {step} took {time.time()-starts}")
+                 starts = time.time()
+ 
+             if chk_monitor is not None:
++                # 先等尾部 checkpoint 写完（计入 EXECUTION TIME），再停后台进程
++                _drain_s = chk_monitor.drain()
++                print(f"[pccheck] tail drain {_drain_s:.2f}s")
+                 chk_monitor.kill_checkpoint()
+             # 如果 bench_total_steps <= warmup，可能没有进入统一计时点；此时降级为完整 epoch 时间。
+             if start_training is None:
+@@ -2328,6 +2336,7 @@ class PCcheckTrainer:
+                 f"-- BENCHMARK ENDED: Total time: {total_train_time} sec, Number of iterations: {step}, Number of checkpoints: {checkpoints}"
+             )
+             print(f"EXECUTION TIME: {total_train_time} sec")
++            _step_timer.dump({"execution_time_s": float(total_train_time), "cfreq": int(self.cfreq)})
+ 
+ 
+             if step < 0:
+-- 
+2.34.1
+

@@ -1,0 +1,136 @@
+From 7d28a4731e28049de55c32348f35bdf20ee87ea4 Mon Sep 17 00:00:00 2001
+From: GallopLin <1317864235@qq.com>
+Date: Thu, 15 Oct 2026 07:15:09 -0700
+Subject: [PATCH 7/7] feat(bench): PCCHECK_VERIFY=1 end-to-end checkpoint
+ verification; DCP_STAGING=pinned best-case DCP variant
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/transformers/trainer_multistream.py | 55 ++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/src/transformers/trainer_multistream.py b/src/transformers/trainer_multistream.py
+index 936cf3c6d0..44883865f3 100644
+--- a/src/transformers/trainer_multistream.py
++++ b/src/transformers/trainer_multistream.py
+@@ -282,6 +282,15 @@ class _DcpBaseline:
+         self.max_async = max(1, int(os.environ.get("DCP_MAX_ASYNC", "1")))
+         self.thread_count = max(1, int(os.environ.get("DCP_THREAD_COUNT", "1")))
+         self.cache_staged = os.environ.get("DCP_CACHE_STAGED", "1") == "1"
++        # DCP_STAGING=native：torch 原生 async_save（2.4 的同步 staging 只有 ~1.5 GB/s）
++        #            =pinned：预分配 pinned 缓冲 + 一次性非阻塞 D2H，再在后台线程 dcp.save
++        #                     （“给 DCP 最好条件”的变体，staging 接近 PCIe 带宽）
++        self.staging = os.environ.get("DCP_STAGING", "native")
++        self._pinned_sets = []
++        self._pool = None
++        if self.staging == "pinned":
++            from concurrent.futures import ThreadPoolExecutor
++            self._pool = ThreadPoolExecutor(max_workers=self.max_async)
+         self.inflight = []  # (future, start_time, slot, step)
+         self.seq = 0
+         self.writers = {}
+@@ -292,7 +301,7 @@ class _DcpBaseline:
+         print(f"[dcp] async DCP baseline: dir={self.root} max_async={self.max_async} "
+               f"threads={self.thread_count} cache_staged={self.cache_staged} "
+               f"payload={self.payload_bytes / 1e9:.2f} GB")
+-        self._profile("config", backend="dcp", max_async=self.max_async,
++        self._profile("config", backend="dcp", staging=self.staging, max_async=self.max_async,
+                       thread_count=self.thread_count, cache_staged=self.cache_staged,
+                       payload_bytes=int(self.payload_bytes))
+ 
+@@ -335,7 +344,19 @@ class _DcpBaseline:
+         writer = self.dcp.FileSystemWriter(path, thread_count=self.thread_count, sync_files=True,
+                                            cache_staged_state_dict=self.cache_staged)
+         t0 = time.time()
+-        fut = self.dcp.async_save(self._state_dict(), storage_writer=writer)
++        if self.staging == "pinned":
++            live = self._state_dict()["state"]
++            idx = self.seq % self.max_async  # 在途上限保证这套缓冲已写完
++            while len(self._pinned_sets) <= idx:
++                self._pinned_sets.append({k: torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
++                                          for k, v in live.items()})
++            cpu = self._pinned_sets[idx]
++            for k, v in live.items():
++                cpu[k].copy_(v, non_blocking=True)
++            torch.cuda.current_stream().synchronize()
++            fut = self._pool.submit(self.dcp.save, {"state": cpu}, storage_writer=writer)
++        else:
++            fut = self.dcp.async_save(self._state_dict(), storage_writer=writer)
+         stage_ms = (time.time() - t0) * 1000.0  # 同步 staging（D2H）= 训练可见的主要开销
+         self._profile("begin_checkpoint", checkpoint_id=int(self.seq), parall_iter=int(slot),
+                       training_step=int(step), slot_wait_ms=slot_wait_ms, stage_ms=stage_ms)
+@@ -345,6 +366,8 @@ class _DcpBaseline:
+     def drain(self):
+         while self.inflight:
+             self._retire(self.inflight.pop(0))
++        if self._pool is not None:
++            self._pool.shutdown(wait=True)
+ 
+ 
+ class MultistreamTrainer:
+@@ -2235,6 +2258,9 @@ class MultistreamTrainer:
+         # PCCHECK_BACKEND=dcp：同一 trainer、同一 3N 状态下的 async DCP 基线
+         # （torch.distributed.checkpoint.async_save；FileSystemWriter sync_files=True）
+         ckpt_backend = os.environ.get("PCCHECK_BACKEND", "cascadesnap")
++        # PCCHECK_VERIFY=1：校验运行，结束时把最新已发布版本与对应时刻的真值逐张量比对
++        ms_verify = os.environ.get("PCCHECK_VERIFY", "0") == "1"
++        ms_verify_snaps = {}
+         dcp_ctx = _DcpBaseline(model, self.optimizer) if (ckpt_backend == "dcp" and self.cfreq > 0) else None
+         if self.cfreq > 0:
+             if ms_quant:
+@@ -2556,6 +2582,20 @@ class MultistreamTrainer:
+                             ms_schedule = os.environ.get("PCCHECK_MS_SCHEDULE", "progressive")
+                             ms_war = os.environ.get("PCCHECK_MS_WAR", "group")
+ 
++                            def _ms_verify_snapshot():
++                                # 校验运行（不计时）：记下本 checkpoint 时刻的真值
++                                torch.cuda.synchronize()
++                                _cid = ms_checkpoint._profile_checkpoint_seq - 1
++                                _base_opt = getattr(self.optimizer, "optimizer", self.optimizer)
++                                _plist = ms_checkpoint._pending_param_list
++                                ms_verify_snaps[_cid] = {
++                                    lid: (p_.detach().float().cpu(),
++                                          _base_opt.state[p_]["exp_avg"].detach().float().cpu(),
++                                          _base_opt.state[p_]["exp_avg_sq"].detach().float().cpu())
++                                    for lid, p_ in enumerate(_plist)}
++                                for _old in sorted(ms_verify_snaps)[:-(self.max_async + 2)]:
++                                    ms_verify_snaps.pop(_old)
++
+                             def _ms_step_scheduler():
+                                 if not isinstance(self.lr_scheduler,
+                                                   torch.optim.lr_scheduler.ReduceLROnPlateau):
+@@ -2577,6 +2617,9 @@ class MultistreamTrainer:
+                                 if optimizer_was_run:
+                                     _ms_step_scheduler()
+                                     ms_checkpoint.save_full_checkpoint(sync=False)
++                                    if ms_verify:
++                                        # 下一次 optimizer.step 前状态不变（守卫保证），此刻取真值
++                                        _ms_verify_snapshot()
+                             else:
+                                 if ms_war == "global":
+                                     ms_checkpoint.wait_copies_before_update()
+@@ -2606,6 +2649,8 @@ class MultistreamTrainer:
+                                     # 与本步更新后的参数/moments 一致（旧实现在 checkpoint 步
+                                     # 跳过 scheduler，学习率曲线随 cf 漂移）
+                                     _ms_step_scheduler()
++                                    if ms_verify:
++                                        _ms_verify_snapshot()
+                                     ms_optimizer.finalize_checkpoint(wait=False)
+                                 if use_scaler:
+                                     scaler.update()
+@@ -2714,6 +2759,12 @@ class MultistreamTrainer:
+             # 且后台线程会持续抢占 CPU/SSD 带宽，导致吞吐统计出现反直觉波动。
+             if ms_checkpoint is not None:
+                 ms_checkpoint.drain()
++                if ms_verify:
++                    _deadline = time.time() + 600
++                    while ms_checkpoint._checkpoint_slots and time.time() < _deadline:
++                        time.sleep(0.2)
++                    _res = ms_checkpoint.verify_published(ms_verify_snaps)
++                    print(f"[verify] {'PASS' if _res.get('ok') else 'FAIL'} {_res}")
+                 ms_checkpoint.shutdown()
+             if dcp_ctx is not None:
+                 dcp_ctx.drain()
+-- 
+2.34.1
+

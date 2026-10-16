@@ -1,7 +1,7 @@
 From 7d16b7005bf6b224fe9cfe85cb1cc85765ab6f11 Mon Sep 17 00:00:00 2001
 From: GallopLin <1317864235@qq.com>
 Date: Thu, 15 Oct 2026 00:15:51 -0700
-Subject: [PATCH 3/3] fix(P0): GradScaler semantics on checkpoint steps;
+Subject: [PATCH 3/7] fix(P0): GradScaler semantics on checkpoint steps;
  race-free WAR guard in PP runners
 
 - trainer_multistream: the grouped update bypasses GradScaler.step, so the

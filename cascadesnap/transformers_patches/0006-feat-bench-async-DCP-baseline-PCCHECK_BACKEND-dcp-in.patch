@@ -1,0 +1,168 @@
+From 8e4823e04c9374c28f6bff2ab113afe553afff2c Mon Sep 17 00:00:00 2001
+From: GallopLin <1317864235@qq.com>
+Date: Thu, 15 Oct 2026 06:12:45 -0700
+Subject: [PATCH 6/7] feat(bench): async DCP baseline (PCCHECK_BACKEND=dcp) in
+ the same trainer with the same 3N state
+
+torch.distributed.checkpoint.async_save + FileSystemWriter(sync_files=True),
+bounded in-flight saves (DCP_MAX_ASYNC), rotating slot dirs, optional cached
+pinned staging (DCP_CACHE_STAGED, default on), DCP_THREAD_COUNT; profile
+events aligned with CascadeSnap (stage_ms, durability_latency_ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/transformers/trainer_multistream.py | 117 +++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/src/transformers/trainer_multistream.py b/src/transformers/trainer_multistream.py
+index 7f7485f52c..936cf3c6d0 100644
+--- a/src/transformers/trainer_multistream.py
++++ b/src/transformers/trainer_multistream.py
+@@ -257,6 +257,96 @@ SCHEDULER_NAME = "scheduler.pt"
+ SCALER_NAME = "scaler.pt"
+ 
+ 
++class _DcpBaseline:
++    """async DCP 基线：保存 3N 状态（参数 + exp_avg + exp_avg_sq），与 CascadeSnap 同 payload。
++
++    - 在途上限 DCP_MAX_ASYNC（默认 1）：提交新的一份前等待最老的一份写完；
++    - slot 目录轮换（DCP_MAX_ASYNC+1 个），最近一份完成的 checkpoint 不被覆盖；
++    - FileSystemWriter(sync_files=True)：每个文件 fsync，耐久语义与 CascadeSnap 对齐；
++    - DCP_CACHE_STAGED=1（默认）复用 pinned staging（更强的基线）；DCP_THREAD_COUNT 写线程数。
++    profile 事件写到同一个 PCCHECK_MS_PROFILE_PATH，字段与 CascadeSnap 对齐。"""
++
++    def __init__(self, model, optimizer):
++        import torch.distributed as dist
++        import torch.distributed.checkpoint as dcp
++
++        self.dcp = dcp
++        if not dist.is_initialized():
++            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
++            os.environ.setdefault("MASTER_PORT", str(29500 + os.getpid() % 2000))
++            dist.init_process_group("gloo", rank=0, world_size=1)
++        self.model = model
++        self.optimizer = optimizer
++        self.base_opt = getattr(optimizer, "optimizer", optimizer)
++        self.root = os.environ.get("DCP_CHECKPOINT_DIR", os.path.abspath("dcp_checkpoints"))
++        self.max_async = max(1, int(os.environ.get("DCP_MAX_ASYNC", "1")))
++        self.thread_count = max(1, int(os.environ.get("DCP_THREAD_COUNT", "1")))
++        self.cache_staged = os.environ.get("DCP_CACHE_STAGED", "1") == "1"
++        self.inflight = []  # (future, start_time, slot, step)
++        self.seq = 0
++        self.writers = {}
++        os.makedirs(self.root, exist_ok=True)
++        self.payload_bytes = 0
++        for _, t in self._state_dict()["state"].items():
++            self.payload_bytes += t.numel() * t.element_size()
++        print(f"[dcp] async DCP baseline: dir={self.root} max_async={self.max_async} "
++              f"threads={self.thread_count} cache_staged={self.cache_staged} "
++              f"payload={self.payload_bytes / 1e9:.2f} GB")
++        self._profile("config", backend="dcp", max_async=self.max_async,
++                      thread_count=self.thread_count, cache_staged=self.cache_staged,
++                      payload_bytes=int(self.payload_bytes))
++
++    def _profile(self, event, **fields):
++        try:
++            from checkpoint_eval.pccheck.multistream_checkpoint import _ms_profile_event
++            _ms_profile_event(event, **fields)
++        except Exception:  # noqa: BLE001
++            pass
++
++    def _state_dict(self):
++        state = {}
++        for name, p in self.model.named_parameters():
++            if not p.requires_grad:
++                continue
++            state[f"param.{name}"] = p
++            st = self.base_opt.state.get(p, {})
++            for k in ("exp_avg", "exp_avg_sq"):
++                if k in st:
++                    state[f"{k}.{name}"] = st[k]
++        return {"state": state}
++
++    def _retire(self, entry):
++        fut, t0, slot, step, seq = entry
++        fut.result()
++        total = time.time() - t0
++        self._profile("checkpoint_finalize", checkpoint_id=int(seq), parall_iter=int(slot),
++                      training_step=int(step), wait=False, total_ms=total * 1000.0,
++                      durability_latency_ms=total * 1000.0,
++                      throughput_gbps=self.payload_bytes / 1e9 / total,
++                      payload_bytes=int(self.payload_bytes))
++
++    def save(self, step):
++        wait_t0 = time.time()
++        while len(self.inflight) >= self.max_async:
++            self._retire(self.inflight.pop(0))
++        slot_wait_ms = (time.time() - wait_t0) * 1000.0
++        slot = self.seq % (self.max_async + 1)
++        path = os.path.join(self.root, f"slot_{slot}")
++        writer = self.dcp.FileSystemWriter(path, thread_count=self.thread_count, sync_files=True,
++                                           cache_staged_state_dict=self.cache_staged)
++        t0 = time.time()
++        fut = self.dcp.async_save(self._state_dict(), storage_writer=writer)
++        stage_ms = (time.time() - t0) * 1000.0  # 同步 staging（D2H）= 训练可见的主要开销
++        self._profile("begin_checkpoint", checkpoint_id=int(self.seq), parall_iter=int(slot),
++                      training_step=int(step), slot_wait_ms=slot_wait_ms, stage_ms=stage_ms)
++        self.inflight.append((fut, t0, slot, step, self.seq))
++        self.seq += 1
++
++    def drain(self):
++        while self.inflight:
++            self._retire(self.inflight.pop(0))
++
++
+ class MultistreamTrainer:
+     """
+     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
+@@ -2142,6 +2232,10 @@ class MultistreamTrainer:
+         
+         ms_quant = os.environ.get("PCCHECK_MS_QUANT", "0") == "1"
+         ms_qblock = None
++        # PCCHECK_BACKEND=dcp：同一 trainer、同一 3N 状态下的 async DCP 基线
++        # （torch.distributed.checkpoint.async_save；FileSystemWriter sync_files=True）
++        ckpt_backend = os.environ.get("PCCHECK_BACKEND", "cascadesnap")
++        dcp_ctx = _DcpBaseline(model, self.optimizer) if (ckpt_backend == "dcp" and self.cfreq > 0) else None
+         if self.cfreq > 0:
+             if ms_quant:
+                 # INT8 moments：布局按 packed 流计算；MultiStreamCheckpoint 发现 moment
+@@ -2391,7 +2485,26 @@ class MultistreamTrainer:
+                         (self.cfreq > 0) and steps_since_checkp == self.cfreq - 1
+                     )
+                     
+-                    if should_enter_checkpoint_block:
++                    if should_enter_checkpoint_block and dcp_ctx is not None:
++                        # async DCP 基线：整步更新后提交（staging 同步 D2H，写盘在后台）
++                        optimizer_was_run = True
++                        if self.do_grad_scaling:
++                            scale_before = self.scaler.get_scale()
++                            self.scaler.step(self.optimizer)
++                            self.scaler.update()
++                            optimizer_was_run = scale_before <= self.scaler.get_scale()
++                        else:
++                            self.optimizer.step()
++                            optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
++                        if optimizer_was_run:
++                            if not isinstance(self.lr_scheduler,
++                                              torch.optim.lr_scheduler.ReduceLROnPlateau):
++                                self.lr_scheduler.step()
++                            dcp_ctx.save(step)
++                            steps_since_checkp = 0
++                            _step_is_ckpt = True
++                            checkpoints += 1
++                    elif should_enter_checkpoint_block:
+                         if self.cfreq > 0:
+                             # 初始化 MultiStreamCheckpoint（如果还没初始化）
+                             if ms_checkpoint is None:
+@@ -2602,6 +2715,8 @@ class MultistreamTrainer:
+             if ms_checkpoint is not None:
+                 ms_checkpoint.drain()
+                 ms_checkpoint.shutdown()
++            if dcp_ctx is not None:
++                dcp_ctx.drain()
+             if torch_profiler_active:
+                 _stop_torch_profiler("after_drain", step=step if step >= 0 else None)
+             if start_training is None:
+-- 
+2.34.1
+
