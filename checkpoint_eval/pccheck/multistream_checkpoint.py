@@ -26,9 +26,13 @@ import json
 
 _MS_PROFILE_LOCK = Lock()
 
-QUANT_BLOCK_DEFAULT = 2048  # moment 量化的默认 per-block 大小（1024 对齐的整数倍）
-# 默认 codec：PCCHECK_MS_QUANT_CODEC 覆盖（int8 | fp8_e4m3）
-QUANT_CODEC_DEFAULT = os.environ.get("PCCHECK_MS_QUANT_CODEC", "int8")
+# 默认量化格式由 E1/E1b 的误差证书决定（2026-10-15，GPT-2/GPT-2-large/OPT-1.3B 共 4 个场景）：
+# fp8_e4m3 + block 256 的更新方向误差 rel_u 稳定在 0.037，各类张量最差 ≤ 0.042；
+# 线性 int8 随模型/训练阶段在 0.04–0.40 之间变化（block 2048 在 OPT-1.3B 上为 0.23–0.33）。
+# block 256 的 scale 开销为 1/256 个 float/元素（payload 约 1.016 字节/元素）。
+QUANT_BLOCK_DEFAULT = int(os.environ.get("PCCHECK_MS_QUANT_BLOCK", "256"))
+# 默认 codec：PCCHECK_MS_QUANT_CODEC 覆盖（fp8_e4m3 | int8）
+QUANT_CODEC_DEFAULT = os.environ.get("PCCHECK_MS_QUANT_CODEC", "fp8_e4m3")
 
 
 def _ms_profile_enabled() -> bool:

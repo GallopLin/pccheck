@@ -259,7 +259,8 @@ def create_stage_checkpoint(
     quant_moments = os.environ.get("PCCHECK_MS_QUANT", "0") == "1"
     quant_kwargs = {}
     if quant_moments:
-        quant_block = int(os.environ.get("PCCHECK_MS_QUANT_BLOCK", "2048"))
+        from .multistream_checkpoint import QUANT_BLOCK_DEFAULT
+        quant_block = int(os.environ.get("PCCHECK_MS_QUANT_BLOCK", QUANT_BLOCK_DEFAULT))
         quant_kwargs = {"quant_moments": True, "quant_block": quant_block}
         print(f"[multistream] PCCHECK_MS_QUANT=1: int8 moment quantization "
               f"enabled (block={quant_block})")
